@@ -34,6 +34,7 @@ import {
   runShellTool,
   writeFileTool,
 } from "./pi-tools.js";
+import { safeRenameFile } from "./safe-rename.js";
 import { SingleUserOAuthProvider } from "./oauth-provider.js";
 import { createReviewCheckpointManager } from "./review-checkpoints.js";
 import { formatPathForPrompt } from "./skills.js";
@@ -1257,6 +1258,82 @@ function createMcpServer(
         },
         structuredContent: {
           result: contentText(response.content),
+        },
+      };
+    },
+  );
+
+  registerAppTool(
+    server,
+    "safe_rename_file",
+    {
+      title: "Safe Rename File",
+      description:
+        "Safely rename or move a regular file to its final location in the workspace.",
+      inputSchema: {
+        workspaceId: z
+          .string()
+          .describe("Workspace identifier returned by open_workspace."),
+        sourcePath: z
+          .string()
+          .describe("Source file path relative to the workspace root."),
+        targetPath: z
+          .string()
+          .describe("Target file path relative to the workspace root."),
+      },
+      outputSchema: resultOutputSchema(),
+      _meta: {},
+      annotations: {
+        readOnlyHint: false,
+        destructiveHint: true,
+        idempotentHint: false,
+        openWorldHint: false,
+      },
+    },
+    async ({ workspaceId, sourcePath, targetPath }) => {
+      const startedAt = performance.now();
+      const workspace = workspaces.getWorkspace(workspaceId);
+
+      try {
+        await safeRenameFile(workspace.root, sourcePath, targetPath);
+      } catch (err: unknown) {
+        logFailedToolResponse(
+          config,
+          {
+            tool: "safe_rename_file",
+            workspaceId,
+            path: sourcePath,
+          },
+          [textBlock(err instanceof Error ? err.message : String(err))],
+          startedAt,
+        );
+        throw err;
+      }
+
+      logToolCall(config, {
+        tool: "safe_rename_file",
+        workspaceId,
+        path: sourcePath,
+        success: true,
+        durationMs: Math.round(performance.now() - startedAt),
+      });
+
+      return {
+        content: [
+          textBlock(`Successfully renamed ${sourcePath} to ${targetPath}`),
+        ],
+        _meta: {
+          tool: "safe_rename_file",
+          card: {
+            workspaceId,
+            summary: {
+              source: sourcePath,
+              target: targetPath,
+            },
+          },
+        },
+        structuredContent: {
+          result: `Successfully renamed ${sourcePath} to ${targetPath}`,
         },
       };
     },
