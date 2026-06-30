@@ -30,4 +30,28 @@ if (process.platform === "win32") {
     () => assertAllowedPath("C:\\Users\\Administrator", ["G:\\Projects\\Dev\\Github\\devspace"]),
     /Path is outside allowed roots/,
   );
+
+  // Test casing mismatch normalization
+  assert.equal(
+    assertAllowedPath("E:\\code\\meta-harness", ["E:\\Code"]),
+    "E:\\code\\meta-harness",
+  );
+
+  // Test forward slash normalization
+  assert.equal(
+    assertAllowedPath("E:/code/meta-harness", ["E:\\Code"]),
+    "E:\\code\\meta-harness",
+  );
+
+  // Test WSL path translation
+  assert.equal(
+    assertAllowedPath("/mnt/e/code/meta-harness", ["E:\\Code"]),
+    "E:\\code\\meta-harness",
+  );
+
+  // Test WSL path translation before cwd resolution
+  assert.equal(
+    resolveAllowedPath("/mnt/e/code/meta-harness", "E:\\Code\\devspace", ["E:\\Code"]),
+    "E:\\code\\meta-harness",
+  );
 }

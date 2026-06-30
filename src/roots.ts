@@ -17,9 +17,28 @@ export function expandHomePath(path: string): string {
   return path;
 }
 
+export function translateWslPath(path: string): string {
+  if (process.platform !== "win32") {
+    return path;
+  }
+  const wslMatch = path.match(/^\/mnt\/([a-zA-Z])(\/|$)(.*)/);
+  if (wslMatch) {
+    const drive = wslMatch[1].toUpperCase();
+    const rest = wslMatch[3].replace(/\//g, "\\");
+    return `${drive}:\\${rest}`;
+  }
+  return path;
+}
+
 export function isPathInsideRoot(path: string, root: string): boolean {
-  const resolvedPath = resolve(expandHomePath(path));
-  const resolvedRoot = resolve(expandHomePath(root));
+  let resolvedPath = resolve(translateWslPath(expandHomePath(path)));
+  let resolvedRoot = resolve(translateWslPath(expandHomePath(root)));
+
+  if (process.platform === "win32") {
+    resolvedPath = resolvedPath.toLowerCase();
+    resolvedRoot = resolvedRoot.toLowerCase();
+  }
+
   const relationship = relative(resolvedRoot, resolvedPath);
 
   return (
@@ -32,7 +51,7 @@ export function isPathInsideRoot(path: string, root: string): boolean {
 }
 
 export function assertAllowedPath(path: string, allowedRoots: string[]): string {
-  const resolvedPath = resolve(expandHomePath(path));
+  const resolvedPath = resolve(translateWslPath(expandHomePath(path)));
   if (allowedRoots.some((root) => isPathInsideRoot(resolvedPath, root))) {
     return resolvedPath;
   }
@@ -41,6 +60,7 @@ export function assertAllowedPath(path: string, allowedRoots: string[]): string 
 }
 
 export function resolveAllowedPath(inputPath: string, cwd: string, allowedRoots: string[]): string {
-  const absolutePath = resolve(cwd, inputPath);
+  const translatedInputPath = translateWslPath(inputPath);
+  const absolutePath = resolve(cwd, translatedInputPath);
   return assertAllowedPath(absolutePath, allowedRoots);
 }
