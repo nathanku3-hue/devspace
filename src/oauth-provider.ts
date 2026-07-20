@@ -10,7 +10,11 @@ import type {
   OAuthTokens,
 } from "@modelcontextprotocol/sdk/shared/auth.js";
 import { checkResourceAllowed, resourceUrlFromServerUrl } from "@modelcontextprotocol/sdk/shared/auth-utils.js";
-import { SqliteOAuthClientsStore, SqliteOAuthStore } from "./oauth-store.js";
+import {
+  SqliteOAuthClientsStore,
+  SqliteOAuthStore,
+  type RedirectUriAlias,
+} from "./oauth-store.js";
 
 export interface OAuthConfig {
   ownerToken: string;
@@ -18,6 +22,7 @@ export interface OAuthConfig {
   refreshTokenTtlSeconds: number;
   scopes: string[];
   allowedRedirectHosts: string[];
+  redirectUriAliases?: RedirectUriAlias[];
 }
 
 interface AuthorizationCodeRecord {
@@ -124,7 +129,11 @@ export class SingleUserOAuthProvider implements OAuthServerProvider {
   ) {
     this.resourceServerUrl = resourceUrlFromServerUrl(resourceServerUrl);
     this.oauthStore = new SqliteOAuthStore(stateDir);
-    this.clientsStore = new SqliteOAuthClientsStore(this.oauthStore, config.allowedRedirectHosts);
+    this.clientsStore = new SqliteOAuthClientsStore(
+      this.oauthStore,
+      config.allowedRedirectHosts,
+      config.redirectUriAliases ?? [],
+    );
   }
 
   async authorize(
@@ -132,21 +141,24 @@ export class SingleUserOAuthProvider implements OAuthServerProvider {
     params: AuthorizationParams,
     res: Response,
   ): Promise<void> {
-    if (!params.resource || !checkResourceAllowed({ requestedResource: params.resource, configuredResource: this.resourceServerUrl })) {
-      throw new InvalidRequestError("Invalid or missing OAuth resource");
+    const resource = params.resource ?? this.resourceServerUrl;
+    if (!checkResourceAllowed({ requestedResource: resource, configuredResource: this.resourceServerUrl })) {
+      throw new InvalidRequestError("Invalid OAuth resource");
     }
     if (!requestedScopesAllowed(params.scopes ?? [], this.config.scopes)) {
       throw new InvalidRequestError("Requested scope is not supported");
     }
+
+    const normalizedParams: AuthorizationParams = { ...params, resource };
 
     if (res.req.method !== "POST") {
       res.status(200).setHeader("Content-Type", "text/html; charset=utf-8");
       res.send(
         formHtml({
           clientName: client.client_name ?? client.client_id,
-          scopes: params.scopes ?? this.config.scopes,
-          resource: params.resource,
-          fields: authorizationFormFields(client, params),
+          scopes: normalizedParams.scopes ?? this.config.scopes,
+          resource,
+          fields: authorizationFormFields(client, normalizedParams),
         }),
       );
       return;
@@ -159,9 +171,9 @@ export class SingleUserOAuthProvider implements OAuthServerProvider {
         formHtml({
           error: "The Owner password was not accepted.",
           clientName: client.client_name ?? client.client_id,
-          scopes: params.scopes ?? this.config.scopes,
-          resource: params.resource,
-          fields: authorizationFormFields(client, params),
+          scopes: normalizedParams.scopes ?? this.config.scopes,
+          resource,
+          fields: authorizationFormFields(client, normalizedParams),
         }),
       );
       return;
@@ -170,13 +182,13 @@ export class SingleUserOAuthProvider implements OAuthServerProvider {
     const code = `code-${randomUUID()}`;
     this.codes.set(code, {
       clientId: client.client_id,
-      params,
+      params: normalizedParams,
       expiresAtMs: Date.now() + CODE_TTL_MS,
     });
 
-    const redirectUrl = new URL(params.redirectUri);
+    const redirectUrl = new URL(normalizedParams.redirectUri);
     redirectUrl.searchParams.set("code", code);
-    if (params.state !== undefined) redirectUrl.searchParams.set("state", params.state);
+    if (normalizedParams.state !== undefined) redirectUrl.searchParams.set("state", normalizedParams.state);
     res.redirect(302, redirectUrl.href);
   }
 

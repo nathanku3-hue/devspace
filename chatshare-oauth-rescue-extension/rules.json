@@ -1,0 +1,34 @@
+[
+  {
+    "id": 1,
+    "priority": 1,
+    "action": {
+      "type": "redirect",
+      "redirect": {
+        "regexSubstitution": "https://chatshare.xyz/#cs_oauth_callback=/connector/oauth/\\1?\\2"
+      }
+    },
+    "condition": {
+      "regexFilter": "^https://chatshare\\.xyz/connector/oauth/([^?#]+)\\?(.+)$",
+      "resourceTypes": [
+        "main_frame"
+      ]
+    }
+  },
+  {
+    "id": 2,
+    "priority": 1,
+    "action": {
+      "type": "redirect",
+      "redirect": {
+        "regexSubstitution": "https://chatshare.xyz/#cs_oauth_callback=/connector_platform_oauth_redirect?\\1"
+      }
+    },
+    "condition": {
+      "regexFilter": "^https://chatshare\\.xyz/connector_platform_oauth_redirect\\?(.+)$",
+      "resourceTypes": [
+        "main_frame"
+      ]
+    }
+  }
+]

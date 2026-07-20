@@ -90,6 +90,7 @@ assert.deepEqual(loadConfig(baseEnv).oauth.allowedRedirectHosts, [
   "localhost",
   "127.0.0.1",
 ]);
+assert.deepEqual(loadConfig(baseEnv).oauth.redirectUriAliases, []);
 assert.equal(loadConfig(baseEnv).oauth.accessTokenTtlSeconds, 3600);
 assert.equal(loadConfig(baseEnv).oauth.refreshTokenTtlSeconds, 2592000);
 
@@ -101,6 +102,28 @@ assert.deepEqual(
   loadConfig({ ...baseEnv, DEVSPACE_OAUTH_ALLOWED_REDIRECT_HOSTS: "chatgpt.com,example.com" }).oauth
     .allowedRedirectHosts,
   ["chatgpt.com", "example.com"],
+);
+assert.deepEqual(
+  loadConfig({
+    ...baseEnv,
+    DEVSPACE_OAUTH_REDIRECT_URI_ALIASES:
+      "https://chatgpt.com/connector/oauth/=https://chatshare.xyz/connector/oauth/",
+  }).oauth.redirectUriAliases,
+  [
+    {
+      registeredBase: "https://chatgpt.com/connector/oauth/",
+      requestedBase: "https://chatshare.xyz/connector/oauth/",
+    },
+  ],
+);
+assert.throws(
+  () =>
+    loadConfig({
+      ...baseEnv,
+      DEVSPACE_OAUTH_REDIRECT_URI_ALIASES:
+        "http://chatgpt.com/connector/oauth/=https://chatshare.xyz/connector/oauth/",
+    }),
+  /Invalid DEVSPACE_OAUTH_REDIRECT_URI_ALIASES entry/,
 );
 assert.equal(
   loadConfig({ ...baseEnv, DEVSPACE_OAUTH_ACCESS_TOKEN_TTL_SECONDS: "120" }).oauth

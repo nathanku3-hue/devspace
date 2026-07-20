@@ -3,6 +3,7 @@ import { join, resolve } from "node:path";
 import { expandHomePath } from "./roots.js";
 import type { LoggingConfig, LogFormat, LogLevel } from "./logger.js";
 import type { OAuthConfig } from "./oauth-provider.js";
+import type { RedirectUriAlias } from "./oauth-store.js";
 import { loadDevspaceFiles } from "./user-config.js";
 
 export type ToolNamingMode = "legacy" | "short";
@@ -122,6 +123,43 @@ function parseStringList(value: string | undefined, fallback: string[]): string[
   return entries && entries.length > 0 ? entries : fallback;
 }
 
+function parseRedirectUriAliases(value: string | undefined): RedirectUriAlias[] {
+  return parseStringList(value, []).map((entry) => {
+    const separator = entry.indexOf("=");
+    if (separator <= 0 || separator === entry.length - 1 || entry.indexOf("=", separator + 1) !== -1) {
+      throw new Error(`Invalid DEVSPACE_OAUTH_REDIRECT_URI_ALIASES entry: ${entry}`);
+    }
+
+    return {
+      registeredBase: normalizeRedirectUriAliasBase(entry.slice(0, separator), entry),
+      requestedBase: normalizeRedirectUriAliasBase(entry.slice(separator + 1), entry),
+    };
+  });
+}
+
+function normalizeRedirectUriAliasBase(value: string, entry: string): string {
+  let parsed: URL;
+  try {
+    parsed = new URL(value.trim());
+  } catch {
+    throw new Error(`Invalid DEVSPACE_OAUTH_REDIRECT_URI_ALIASES entry: ${entry}`);
+  }
+
+  if (
+    parsed.protocol !== "https:" ||
+    parsed.username ||
+    parsed.password ||
+    parsed.search ||
+    parsed.hash ||
+    !parsed.pathname.endsWith("/")
+  ) {
+    throw new Error(`Invalid DEVSPACE_OAUTH_REDIRECT_URI_ALIASES entry: ${entry}`);
+  }
+
+  parsed.hostname = parsed.hostname.toLowerCase();
+  return parsed.href;
+}
+
 function parsePositiveInteger(value: string | undefined, fallback: number, name: string): number {
   if (!value) return fallback;
 
@@ -189,6 +227,7 @@ function parseOAuthConfig(env: NodeJS.ProcessEnv, ownerToken: string | undefined
       "localhost",
       "127.0.0.1",
     ]),
+    redirectUriAliases: parseRedirectUriAliases(env.DEVSPACE_OAUTH_REDIRECT_URI_ALIASES),
   };
 }
 

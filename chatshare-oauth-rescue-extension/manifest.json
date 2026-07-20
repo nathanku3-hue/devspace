@@ -1,0 +1,33 @@
+{
+  "manifest_version": 3,
+  "name": "Chatshare OAuth Callback Rescue",
+  "version": "1.2.0",
+  "description": "Redirects missing Chatshare OAuth callbacks into the authenticated app and disables the callback route's broken server loader before navigation.",
+  "permissions": [
+    "declarativeNetRequest"
+  ],
+  "host_permissions": [
+    "https://chatshare.xyz/*"
+  ],
+  "declarative_net_request": {
+    "rule_resources": [
+      {
+        "id": "chatshare_oauth_callback_rules",
+        "enabled": true,
+        "path": "rules.json"
+      }
+    ]
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "https://chatshare.xyz/*"
+      ],
+      "js": [
+        "callback-bootstrap.js"
+      ],
+      "run_at": "document_start",
+      "world": "MAIN"
+    }
+  ]
+}

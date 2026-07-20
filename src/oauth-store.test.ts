@@ -21,6 +21,8 @@ const redirectUri = "https://chatgpt.com/connector_platform_oauth_redirect";
 
 try {
   await testDatabaseConfiguration(join(root, "database-configuration"));
+  testRedirectHostPolicy(join(root, "redirect-host-policy"));
+  await testAuthorizationResourceCompatibility(join(root, "authorization-resource"));
   testPersistenceAndTokenHashing(join(root, "persistence"));
   testExpiredTokenCleanup(join(root, "expiration"));
   testTransactionalTokenRotation(join(root, "rotation"));
@@ -51,6 +53,131 @@ async function testDatabaseConfiguration(stateDir: string): Promise<void> {
   if (process.platform !== "win32") {
     assert.equal((await stat(stateDir)).mode & 0o777, 0o700);
     assert.equal((await stat(databasePath(stateDir))).mode & 0o777, 0o600);
+  }
+}
+
+function testRedirectHostPolicy(stateDir: string): void {
+  const store = new SqliteOAuthStore(stateDir);
+  const clients = new SqliteOAuthClientsStore(
+    store,
+    ["perplexity.ai", "*.perplexity.ai", "chatgpt.com", "chatshare.xyz"],
+    [
+      {
+        registeredBase: "https://chatgpt.com/connector/oauth/",
+        requestedBase: "https://chatshare.xyz/connector/oauth/",
+      },
+    ],
+  );
+
+  try {
+    const rootClient = clients.registerClient({
+      redirect_uris: ["https://perplexity.ai/oauth/callback"],
+    });
+    assert.equal(rootClient.redirect_uris[0], "https://perplexity.ai/oauth/callback");
+
+    const subdomainClient = clients.registerClient({
+      redirect_uris: ["https://mcp.perplexity.ai/oauth/callback"],
+    });
+    assert.equal(subdomainClient.redirect_uris[0], "https://mcp.perplexity.ai/oauth/callback");
+
+    const chatshareClient = clients.registerClient({
+      redirect_uris: ["https://chatgpt.com/connector/oauth/TeAhvdjRY7qD?tenant=one"],
+    });
+    assert.deepEqual(chatshareClient.redirect_uris, [
+      "https://chatgpt.com/connector/oauth/TeAhvdjRY7qD?tenant=one",
+    ]);
+    assert.deepEqual(clients.getClient(chatshareClient.client_id)?.redirect_uris, [
+      "https://chatgpt.com/connector/oauth/TeAhvdjRY7qD?tenant=one",
+      "https://chatshare.xyz/connector/oauth/TeAhvdjRY7qD?tenant=one",
+    ]);
+
+    const unrelatedPathClient = clients.registerClient({
+      redirect_uris: ["https://chatgpt.com/connector/oauth-evil/TeAhvdjRY7qD"],
+    });
+    assert.deepEqual(clients.getClient(unrelatedPathClient.client_id)?.redirect_uris, [
+      "https://chatgpt.com/connector/oauth-evil/TeAhvdjRY7qD",
+    ]);
+
+    const reverseClient = clients.registerClient({
+      redirect_uris: ["https://chatshare.xyz/connector/oauth/TeAhvdjRY7qD"],
+    });
+    assert.deepEqual(clients.getClient(reverseClient.client_id)?.redirect_uris, [
+      "https://chatshare.xyz/connector/oauth/TeAhvdjRY7qD",
+    ]);
+
+    for (const [redirectUri, rejectedIdentity] of [
+      ["https://evilperplexity.ai/oauth/callback", "evilperplexity.ai"],
+      ["https://perplexity.ai.evil.example/oauth/callback", "perplexity.ai.evil.example"],
+      ["perplexity://oauth/callback", "perplexity:"],
+    ]) {
+      assert.throws(
+        () => clients.registerClient({ redirect_uris: [redirectUri] }),
+        new RegExp(
+          `Client redirect_uri is not allowed for this DevSpace server: ${rejectedIdentity.replace(
+            /[.*+?^${}()|[\]\\]/g,
+            "\\$&",
+          )}`,
+        ),
+      );
+    }
+  } finally {
+    store.close();
+  }
+}
+
+async function testAuthorizationResourceCompatibility(stateDir: string): Promise<void> {
+  const provider = new SingleUserOAuthProvider(oauthConfig, mcpUrl, stateDir);
+  const client = await provider.clientsStore.registerClient?.({
+    redirect_uris: [redirectUri],
+    client_name: "Perplexity",
+  });
+  assert.ok(client);
+
+  let statusCode = 0;
+  let responseBody = "";
+  const response = {
+    req: { method: "GET" },
+    status(code: number) {
+      statusCode = code;
+      return this;
+    },
+    setHeader() {
+      return this;
+    },
+    send(body: unknown) {
+      responseBody = String(body);
+      return this;
+    },
+  } as unknown as Parameters<SingleUserOAuthProvider["authorize"]>[2];
+
+  try {
+    await provider.authorize(
+      client,
+      {
+        redirectUri,
+        codeChallenge: "challenge",
+        scopes: ["devspace"],
+      },
+      response,
+    );
+    assert.equal(statusCode, 200);
+    assert.match(responseBody, /name="resource" value="https:\/\/agent\.example\.com\/mcp"/);
+
+    await assert.rejects(
+      provider.authorize(
+        client,
+        {
+          redirectUri,
+          codeChallenge: "challenge",
+          scopes: ["devspace"],
+          resource: new URL("https://other.example/mcp"),
+        },
+        response,
+      ),
+      /Invalid OAuth resource/,
+    );
+  } finally {
+    provider.close();
   }
 }
 
