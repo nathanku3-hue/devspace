@@ -17,6 +17,11 @@ const migrations: Migration[] = [
     name: "oauth-state",
     up: migrateOAuthState,
   },
+  {
+    version: 3,
+    name: "oauth-device-bound-tokens",
+    up: migrateOAuthDeviceBoundTokens,
+  },
 ];
 
 export function migrateDatabase(sqlite: Database.Database): void {
@@ -112,6 +117,7 @@ function migrateOAuthState(sqlite: Database.Database): void {
       scopes_json text not null,
       expires_at integer not null,
       resource text,
+      device_bound integer not null default 0,
       foreign key (client_id) references oauth_clients(client_id) on delete cascade
     );
 
@@ -127,6 +133,7 @@ function migrateOAuthState(sqlite: Database.Database): void {
       scopes_json text not null,
       expires_at integer not null,
       resource text,
+      device_bound integer not null default 0,
       foreign key (client_id) references oauth_clients(client_id) on delete cascade
     );
 
@@ -138,9 +145,14 @@ function migrateOAuthState(sqlite: Database.Database): void {
   `);
 }
 
+function migrateOAuthDeviceBoundTokens(sqlite: Database.Database): void {
+  addColumnIfMissing(sqlite, "oauth_access_tokens", "device_bound", "integer not null default 0");
+  addColumnIfMissing(sqlite, "oauth_refresh_tokens", "device_bound", "integer not null default 0");
+}
+
 function addColumnIfMissing(
   sqlite: Database.Database,
-  table: "workspace_sessions",
+  table: "workspace_sessions" | "oauth_access_tokens" | "oauth_refresh_tokens",
   column: string,
   definition: string,
 ): void {

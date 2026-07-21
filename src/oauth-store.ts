@@ -9,6 +9,7 @@ export interface PersistedAccessTokenRecord {
   scopes: string[];
   expiresAt: number;
   resource?: string;
+  deviceBound?: boolean;
 }
 
 export interface PersistedRefreshTokenRecord {
@@ -16,6 +17,7 @@ export interface PersistedRefreshTokenRecord {
   scopes: string[];
   expiresAt: number;
   resource?: string;
+  deviceBound?: boolean;
 }
 
 export interface PersistedTokenPair {
@@ -161,13 +163,14 @@ export class SqliteOAuthStore {
   saveAccessToken(tokenHash: string, record: PersistedAccessTokenRecord): void {
     this.database.sqlite
       .prepare(
-        `insert into oauth_access_tokens (token_hash, client_id, scopes_json, expires_at, resource)
-         values (?, ?, ?, ?, ?)
+        `insert into oauth_access_tokens (token_hash, client_id, scopes_json, expires_at, resource, device_bound)
+         values (?, ?, ?, ?, ?, ?)
          on conflict(token_hash) do update set
            client_id = excluded.client_id,
            scopes_json = excluded.scopes_json,
            expires_at = excluded.expires_at,
-           resource = excluded.resource`,
+           resource = excluded.resource,
+           device_bound = excluded.device_bound`,
       )
       .run(
         tokenHash,
@@ -175,13 +178,14 @@ export class SqliteOAuthStore {
         JSON.stringify(record.scopes),
         record.expiresAt,
         record.resource ?? null,
+        record.deviceBound ? 1 : 0,
       );
   }
 
   getAccessToken(tokenHash: string): PersistedAccessTokenRecord | undefined {
     const row = this.database.sqlite
       .prepare(
-        "select client_id, scopes_json, expires_at, resource from oauth_access_tokens where token_hash = ?",
+        "select client_id, scopes_json, expires_at, resource, device_bound from oauth_access_tokens where token_hash = ?",
       )
       .get(tokenHash) as
       | {
@@ -189,6 +193,7 @@ export class SqliteOAuthStore {
           scopes_json: string;
           expires_at: number;
           resource: string | null;
+          device_bound: number;
         }
       | undefined;
 
@@ -202,13 +207,14 @@ export class SqliteOAuthStore {
   saveRefreshToken(tokenHash: string, record: PersistedRefreshTokenRecord): void {
     this.database.sqlite
       .prepare(
-        `insert into oauth_refresh_tokens (token_hash, client_id, scopes_json, expires_at, resource)
-         values (?, ?, ?, ?, ?)
+        `insert into oauth_refresh_tokens (token_hash, client_id, scopes_json, expires_at, resource, device_bound)
+         values (?, ?, ?, ?, ?, ?)
          on conflict(token_hash) do update set
            client_id = excluded.client_id,
            scopes_json = excluded.scopes_json,
            expires_at = excluded.expires_at,
-           resource = excluded.resource`,
+           resource = excluded.resource,
+           device_bound = excluded.device_bound`,
       )
       .run(
         tokenHash,
@@ -216,6 +222,7 @@ export class SqliteOAuthStore {
         JSON.stringify(record.scopes),
         record.expiresAt,
         record.resource ?? null,
+        record.deviceBound ? 1 : 0,
       );
   }
 
@@ -239,7 +246,7 @@ export class SqliteOAuthStore {
   getRefreshToken(tokenHash: string): PersistedRefreshTokenRecord | undefined {
     const row = this.database.sqlite
       .prepare(
-        "select client_id, scopes_json, expires_at, resource from oauth_refresh_tokens where token_hash = ?",
+        "select client_id, scopes_json, expires_at, resource, device_bound from oauth_refresh_tokens where token_hash = ?",
       )
       .get(tokenHash) as
       | {
@@ -247,6 +254,7 @@ export class SqliteOAuthStore {
           scopes_json: string;
           expires_at: number;
           resource: string | null;
+          device_bound: number;
         }
       | undefined;
 
@@ -293,12 +301,14 @@ function rowToAccessTokenRecord(row: {
   scopes_json: string;
   expires_at: number;
   resource: string | null;
+  device_bound: number;
 }): PersistedAccessTokenRecord {
   return {
     clientId: row.client_id,
     scopes: JSON.parse(row.scopes_json) as string[],
     expiresAt: row.expires_at,
     resource: row.resource ?? undefined,
+    deviceBound: row.device_bound === 1,
   };
 }
 
@@ -307,11 +317,13 @@ function rowToRefreshTokenRecord(row: {
   scopes_json: string;
   expires_at: number;
   resource: string | null;
+  device_bound: number;
 }): PersistedRefreshTokenRecord {
   return {
     clientId: row.client_id,
     scopes: JSON.parse(row.scopes_json) as string[],
     expiresAt: row.expires_at,
     resource: row.resource ?? undefined,
+    deviceBound: row.device_bound === 1,
   };
 }

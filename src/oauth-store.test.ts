@@ -1,6 +1,9 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
+import { once } from "node:events";
 import { mkdtemp, rm, stat } from "node:fs/promises";
+import { createServer as createHttpServer } from "node:http";
+import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { InvalidGrantError, InvalidTokenError } from "@modelcontextprotocol/sdk/server/auth/errors.js";
@@ -15,6 +18,14 @@ const oauthConfig = {
   refreshTokenTtlSeconds: 2592000,
   scopes: ["devspace"],
   allowedRedirectHosts: ["chatgpt.com"],
+  deviceAuthorization: {
+    enabled: false,
+    required: false,
+    loopbackPort: 7677,
+    extensionId: "aaoelopmdnhifffjefciagfmhjanbaoc",
+    allowedRedirectPrefixes: ["https://chatshare.xyz/connector/oauth/"],
+    challengeTtlSeconds: 60,
+  },
 };
 const mcpUrl = new URL("https://agent.example.com/mcp");
 const redirectUri = "https://chatgpt.com/connector_platform_oauth_redirect";
@@ -23,6 +34,7 @@ try {
   await testDatabaseConfiguration(join(root, "database-configuration"));
   testRedirectHostPolicy(join(root, "redirect-host-policy"));
   await testAuthorizationResourceCompatibility(join(root, "authorization-resource"));
+  await testDeviceBoundAuthorization(join(root, "device-bound-authorization"));
   testPersistenceAndTokenHashing(join(root, "persistence"));
   testExpiredTokenCleanup(join(root, "expiration"));
   testTransactionalTokenRotation(join(root, "rotation"));
@@ -45,6 +57,7 @@ async function testDatabaseConfiguration(stateDir: string): Promise<void> {
     assert.deepEqual(migrations, [
       { version: 1, name: "workspace-state" },
       { version: 2, name: "oauth-state" },
+      { version: 3, name: "oauth-device-bound-tokens" },
     ]);
   } finally {
     database.close();
@@ -175,6 +188,104 @@ async function testAuthorizationResourceCompatibility(stateDir: string): Promise
         response,
       ),
       /Invalid OAuth resource/,
+    );
+  } finally {
+    provider.close();
+  }
+}
+
+async function testDeviceBoundAuthorization(stateDir: string): Promise<void> {
+  const loopbackPort = await reservePort();
+  const deviceRedirectUri = "https://chatshare.xyz/connector/oauth/device-test";
+  const provider = new SingleUserOAuthProvider(
+    {
+      ...oauthConfig,
+      allowedRedirectHosts: ["chatshare.xyz"],
+      deviceAuthorization: {
+        ...oauthConfig.deviceAuthorization,
+        enabled: true,
+        required: true,
+        loopbackPort,
+        allowedRedirectPrefixes: ["https://chatshare.xyz/connector/oauth/"],
+      },
+    },
+    mcpUrl,
+    stateDir,
+  );
+  const listener = provider["deviceAuthorization"]?.["listener"];
+  assert.ok(listener);
+  if (!listener.listening) await once(listener, "listening");
+
+  try {
+    const client = await provider.clientsStore.registerClient?.({
+      redirect_uris: [deviceRedirectUri],
+      client_name: "Chatshare",
+    });
+    assert.ok(client);
+
+    const params = {
+      redirectUri: deviceRedirectUri,
+      codeChallenge: "D".repeat(43),
+      scopes: ["devspace"],
+      state: "device-state",
+      resource: mcpUrl,
+    };
+    const getResponse = fakeAuthorizationResponse("GET");
+    await provider.authorize(client, params, getResponse.response);
+    assert.equal(getResponse.statusCode(), 200);
+    assert.match(getResponse.body(), /data-devspace-device-auth="required"/);
+    assert.doesNotMatch(getResponse.body(), /name="owner_token"/);
+
+    const challenge = hiddenInputValue(getResponse.body(), "device_challenge");
+    const binding = hiddenInputValue(getResponse.body(), "device_binding");
+    const proof = provider["deviceAuthorization"]?.["sign"](challenge, binding);
+    assert.ok(proof);
+
+    const postResponse = fakeAuthorizationResponse("POST", {
+      device_challenge: challenge,
+      device_binding: binding,
+      device_proof: proof,
+    });
+    await provider.authorize(client, params, postResponse.response);
+    assert.equal(postResponse.statusCode(), 302);
+    const redirectLocation = postResponse.redirectLocation();
+    assert.ok(redirectLocation);
+    const authorizationCode = new URL(redirectLocation).searchParams.get("code");
+    assert.ok(authorizationCode);
+
+    const issued = await provider.exchangeAuthorizationCode(
+      client,
+      authorizationCode,
+      undefined,
+      deviceRedirectUri,
+      mcpUrl,
+    );
+    const verified = await provider.verifyAccessToken(issued.access_token);
+    assert.equal(verified.clientId, client.client_id);
+
+    const now = Math.floor(Date.now() / 1000);
+    provider["oauthStore"].saveTokenPair({
+      accessTokenHash: hashToken("unbound-access-token"),
+      accessToken: {
+        clientId: client.client_id,
+        scopes: ["devspace"],
+        expiresAt: now + 3600,
+        resource: mcpUrl.href,
+        deviceBound: false,
+      },
+      refreshTokenHash: hashToken("unbound-refresh-token"),
+      refreshToken: {
+        clientId: client.client_id,
+        scopes: ["devspace"],
+        expiresAt: now + 3600,
+        resource: mcpUrl.href,
+        deviceBound: false,
+      },
+    });
+    await assert.rejects(provider.verifyAccessToken("unbound-access-token"), InvalidTokenError);
+    await assert.rejects(
+      provider.exchangeRefreshToken(client, "unbound-refresh-token", ["devspace"], mcpUrl),
+      InvalidGrantError,
     );
   } finally {
     provider.close();
@@ -327,6 +438,7 @@ async function testProviderRestartRotationAndRevocation(stateDir: string): Promi
       resource: mcpUrl,
     },
     expiresAtMs: Date.now() + 60_000,
+    deviceBound: false,
   });
   const issued = await firstProvider.exchangeAuthorizationCode(
     client,
@@ -368,6 +480,63 @@ async function testProviderRestartRotationAndRevocation(stateDir: string): Promi
   } finally {
     secondProvider.close();
   }
+}
+
+function fakeAuthorizationResponse(
+  method: "GET" | "POST",
+  requestBody: Record<string, string> = {},
+): {
+  response: Parameters<SingleUserOAuthProvider["authorize"]>[2];
+  statusCode(): number;
+  body(): string;
+  redirectLocation(): string;
+} {
+  let currentStatusCode = 0;
+  let responseBody = "";
+  let location = "";
+  const response = {
+    req: { method, body: requestBody },
+    status(code: number) {
+      currentStatusCode = code;
+      return this;
+    },
+    setHeader() {
+      return this;
+    },
+    send(body: unknown) {
+      responseBody = String(body);
+      return this;
+    },
+    redirect(code: number, url: string) {
+      currentStatusCode = code;
+      location = url;
+      return this;
+    },
+  } as unknown as Parameters<SingleUserOAuthProvider["authorize"]>[2];
+
+  return {
+    response,
+    statusCode: () => currentStatusCode,
+    body: () => responseBody,
+    redirectLocation: () => location,
+  };
+}
+
+function hiddenInputValue(html: string, name: string): string {
+  const match = html.match(new RegExp(`name="${name}" value="([^"]*)"`));
+  assert.ok(match, `Expected hidden input ${name}`);
+  return match[1];
+}
+
+async function reservePort(): Promise<number> {
+  const server = createHttpServer();
+  server.listen(0, "127.0.0.1");
+  await once(server, "listening");
+  const port = (server.address() as AddressInfo).port;
+  await new Promise<void>((resolve, reject) => {
+    server.close((error) => (error ? reject(error) : resolve()));
+  });
+  return port;
 }
 
 function hashToken(token: string): string {

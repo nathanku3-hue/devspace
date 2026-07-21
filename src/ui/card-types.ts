@@ -3,6 +3,7 @@ import type { App } from "@modelcontextprotocol/ext-apps";
 export type ToolName =
   | "open_workspace"
   | "read_file"
+  | "read_files"
   | "write_file"
   | "edit_file"
   | "grep_files"
@@ -68,6 +69,7 @@ export function isToolName(value: unknown): value is ToolName {
   return (
     value === "open_workspace" ||
     value === "read_file" ||
+    value === "read_files" ||
     value === "write_file" ||
     value === "edit_file" ||
     value === "grep_files" ||
@@ -86,7 +88,7 @@ export function isToolName(value: unknown): value is ToolName {
 }
 
 export function isReadTool(tool: ToolName): boolean {
-  return tool === "read_file" || tool === "read";
+  return tool === "read_file" || tool === "read_files" || tool === "read";
 }
 
 export function isWriteTool(tool: ToolName): boolean {

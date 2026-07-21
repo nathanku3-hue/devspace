@@ -38,12 +38,38 @@ import { safeRenameFile } from "./safe-rename.js";
 import { SingleUserOAuthProvider } from "./oauth-provider.js";
 import { createReviewCheckpointManager } from "./review-checkpoints.js";
 import { formatPathForPrompt } from "./skills.js";
+import { publishGitChanges } from "./git-publish.js";
+import {
+  DEFAULT_BATCH_READ_LIMIT,
+  MAX_BATCH_READ_CHARACTERS,
+  MAX_BATCH_READ_FILES,
+  MAX_BATCH_READ_LIMIT,
+  readWorkspaceFiles,
+} from "./read-files.js";
 import { createWorkspaceStore } from "./workspace-store.js";
 import { formatAgentsPath, WorkspaceRegistry } from "./workspaces.js";
 
 type Transport = StreamableHTTPServerTransport;
 const WORKSPACE_APP_URI = "ui://devspace/workspace-app.html";
 const WORKSPACE_APP_MANIFEST_ENTRY = "workspace-app.html";
+const READ_ONLY_TOOL_ANNOTATIONS = {
+  readOnlyHint: true,
+  destructiveHint: false,
+  idempotentHint: true,
+  openWorldHint: false,
+};
+const OPEN_WORKSPACE_TOOL_ANNOTATIONS = {
+  readOnlyHint: false,
+  destructiveHint: false,
+  idempotentHint: false,
+  openWorldHint: false,
+};
+const REVIEW_TOOL_ANNOTATIONS = {
+  readOnlyHint: true,
+  destructiveHint: false,
+  idempotentHint: false,
+  openWorldHint: false,
+};
 const WRITE_TOOL_ANNOTATIONS = {
   readOnlyHint: false,
   destructiveHint: true,
@@ -141,6 +167,7 @@ function toolWidgetDescriptorMeta(
 interface ToolNames {
   openWorkspace: "open_workspace";
   read: "read_file" | "read";
+  readBatch: "read_files";
   write: "write_file" | "write";
   edit: "edit_file" | "edit";
   grep: "grep_files" | "grep";
@@ -166,6 +193,7 @@ function toolNamesFor(config: ServerConfig): ToolNames {
     ? {
         openWorkspace: "open_workspace",
         read: "read",
+        readBatch: "read_files",
         write: "write",
         edit: "edit",
         grep: "grep",
@@ -176,6 +204,7 @@ function toolNamesFor(config: ServerConfig): ToolNames {
     : {
         openWorkspace: "open_workspace",
         read: "read_file",
+        readBatch: "read_files",
         write: "write_file",
         edit: "edit_file",
         grep: "grep_files",
@@ -188,20 +217,20 @@ function toolNamesFor(config: ServerConfig): ToolNames {
 function serverInstructions(config: ServerConfig, toolNames: ToolNames): string {
   const inspection = config.minimalTools
     ? `In minimal tool mode, ${toolNames.grep}, ${toolNames.glob}, and ${toolNames.ls} are disabled; use ${toolNames.shell} with command-line tools such as grep, rg, find, ls, and tree for search and directory inspection. `
-    : `Prefer ${toolNames.read}, ${toolNames.grep}, ${toolNames.glob}, and ${toolNames.ls} for file inspection. `;
+    : `Prefer ${toolNames.readBatch} when two or more known text files are needed in the same reasoning step; use ${toolNames.read}, ${toolNames.grep}, ${toolNames.glob}, and ${toolNames.ls} for single-file or discovery work. `;
 
   const skills = config.skillsEnabled
-    ? `When ${toolNames.openWorkspace} returns available skills and a task matches a skill, use ${toolNames.read} to read that skill's path before proceeding. Skill paths may be outside the workspace, but ${toolNames.read} only permits advertised SKILL.md files and files under already-loaded skill directories. `
+    ? `When ${toolNames.openWorkspace} returns available skills and a task matches a skill, use ${toolNames.read} or ${toolNames.readBatch} to read that skill's path before proceeding. Skill paths may be outside the workspace, but read tools only permit advertised SKILL.md files and files under already-loaded skill directories. `
     : "";
 
-  const agentsMd = `Follow instructions returned by ${toolNames.openWorkspace}. Before working under a path listed in availableAgentsFiles, use ${toolNames.read} to inspect that instruction file and follow it. `;
+  const agentsMd = `Follow instructions returned by ${toolNames.openWorkspace}. Before working under paths listed in availableAgentsFiles, use ${toolNames.readBatch} to load multiple relevant instruction files in one call, or ${toolNames.read} for one file, and follow them. `;
 
   const showChanges =
     config.widgets === "changes"
       ? " After creating, editing, or overwriting files, call show_changes once after the related file changes are complete so the user can see the aggregate diff."
       : "";
 
-  return `Use DevSpace as a local coding workspace. Call ${toolNames.openWorkspace} once per project folder or worktree to obtain a workspaceId. Reuse that same workspaceId for all later file, search, edit, write, show-changes, and shell tools in that folder; do not call ${toolNames.openWorkspace} again unless switching folders/worktrees, changing checkout/worktree mode, the workspaceId is rejected as unknown, or the user explicitly asks to reopen. ${agentsMd}${skills}${inspection}Prefer ${toolNames.edit} for targeted modifications, ${toolNames.write} only for new files or complete rewrites, and ${toolNames.shell} for tests, builds, git inspection, package scripts, and commands that are better executed by the shell. Do not create or modify files with ${toolNames.shell}; avoid shell redirection, heredocs, tee, sed -i, perl -i, node/python/ruby scripts, or any command whose purpose is to write project files.${showChanges}`;
+  return `Use DevSpace as a local coding workspace. Call ${toolNames.openWorkspace} once per project folder or worktree to obtain a workspaceId. Reuse that same workspaceId for all later file, search, edit, write, show-changes, shell, and Git publication tools in that folder; do not call ${toolNames.openWorkspace} again unless switching folders/worktrees, changing checkout/worktree mode, the workspaceId is rejected as unknown, or the user explicitly asks to reopen. ${agentsMd}${skills}${inspection}Batch known context reads with ${toolNames.readBatch} to reduce host approval prompts. Prefer ${toolNames.edit} for targeted modifications, ${toolNames.write} only for new files or complete rewrites, and ${toolNames.shell} for tests, builds, Git inspection, package scripts, and commands that are better executed by the shell. When the user explicitly requests a commit or push, use publish_git_changes with the existing workspaceId, a workingDirectory relative to the workspace root, and exact file paths. Do not construct /mnt paths, Windows absolute paths, or shell cd commands for workspace navigation; use the workingDirectory field. Do not use ${toolNames.shell} to edit working-tree contents or mutate the Git index, history, remotes, or branches. Avoid shell redirection, heredocs, tee, sed -i, perl -i, node/python/ruby scripts, generated scripts, or other commands whose purpose is to write project files. Use ${toolNames.edit} or ${toolNames.write} for content changes.${showChanges}`;
 }
 function resultOutputSchema(extra: z.ZodRawShape = {}): z.ZodRawShape {
   return {
@@ -549,7 +578,7 @@ function createMcpServer(
         instruction: z.string(),
       },
       ...toolWidgetDescriptorMeta(config, "workspace"),
-      annotations: { readOnlyHint: true },
+      annotations: OPEN_WORKSPACE_TOOL_ANNOTATIONS,
     },
     async ({ path, mode, baseRef }) => {
       const startedAt = performance.now();
@@ -575,8 +604,8 @@ function createMcpServer(
         path: formatAgentsPath(file.path, workspace.root),
       }));
       const instruction = config.skillsEnabled
-        ? "Use this workspaceId in all subsequent tool calls for this project. Do not call open_workspace again for this same folder unless this workspaceId stops working, the user asks to reopen, or you switch to a different folder/worktree. Follow loaded agentsFiles instructions. Before working under a path listed in availableAgentsFiles, read that instruction file. When a task matches an available skill in skills, read its path before proceeding."
-        : "Use this workspaceId in all subsequent tool calls for this project. Do not call open_workspace again for this same folder unless this workspaceId stops working, the user asks to reopen, or you switch to a different folder/worktree. Follow loaded agentsFiles instructions. Before working under a path listed in availableAgentsFiles, read that instruction file.";
+        ? "Use this workspaceId in all subsequent tool calls for this project. Do not call open_workspace again for this same folder unless this workspaceId stops working, the user asks to reopen, or you switch to a different folder/worktree. Follow loaded agentsFiles instructions. Use read_files to load multiple known context or instruction files in one approval; use the single-file read tool only when one file is needed. When a task matches an available skill in skills, read its path before proceeding."
+        : "Use this workspaceId in all subsequent tool calls for this project. Do not call open_workspace again for this same folder unless this workspaceId stops working, the user asks to reopen, or you switch to a different folder/worktree. Follow loaded agentsFiles instructions. Use read_files to load multiple known context or instruction files in one approval; use the single-file read tool only when one file is needed.";
       const resultContent: ToolContent[] = [
         {
           type: "text" as const,
@@ -644,7 +673,7 @@ function createMcpServer(
       title: "Read file",
       description:
         [
-          "Read a file inside an open workspace. Use this for file inspection instead of shell commands like cat or sed. Call open_workspace first and pass workspaceId.",
+          `Read one file inside an open workspace. Use ${toolNames.readBatch} instead when two or more known text files are needed, so approval-gated hosts can authorize one bounded call. Use this tool instead of shell commands like cat or sed. Call open_workspace first and pass workspaceId.`,
           "Use this tool to inspect relevant AGENTS.md or CLAUDE.md files listed by open_workspace before working in nested directories.",
           config.skillsEnabled
             ? "If available skills were returned and a task matches one, read that skill's path before proceeding. Skill paths may be outside the workspace; only advertised SKILL.md files and files under already-loaded skill directories are readable."
@@ -678,7 +707,7 @@ function createMcpServer(
       },
       outputSchema: resultOutputSchema(),
       ...toolWidgetDescriptorMeta(config, "read"),
-      annotations: { readOnlyHint: true },
+      annotations: READ_ONLY_TOOL_ANNOTATIONS,
     },
     async ({ workspaceId, ...input }) => {
       const startedAt = performance.now();
@@ -736,6 +765,114 @@ function createMcpServer(
 
   registerAppTool(
     server,
+    toolNames.readBatch,
+    {
+      title: "Read files",
+      description:
+        `Batch-read 1 to ${MAX_BATCH_READ_FILES} known text files or file ranges inside one open workspace. Prefer this over repeated ${toolNames.read} calls when multiple context, instruction, code, or documentation files are already known, especially in approval-gated MCP hosts. Results preserve input order, continue after individual file errors, default to ${DEFAULT_BATCH_READ_LIMIT} lines per file, and cap the combined response at ${MAX_BATCH_READ_CHARACTERS} characters. Images are not supported by this batch tool.`,
+      inputSchema: {
+        workspaceId: z
+          .string()
+          .describe("Workspace identifier returned by open_workspace."),
+        files: z
+          .array(
+            z.object({
+              path: z
+                .string()
+                .min(1)
+                .describe(
+                  config.skillsEnabled
+                    ? "Text-file path relative to the workspace root, or an advertised skill path returned by open_workspace."
+                    : "Text-file path relative to the workspace root.",
+                ),
+              offset: z
+                .number()
+                .int()
+                .positive()
+                .optional()
+                .describe("1-indexed line number to start reading from. Defaults to 1."),
+              limit: z
+                .number()
+                .int()
+                .positive()
+                .max(MAX_BATCH_READ_LIMIT)
+                .optional()
+                .describe(
+                  `Maximum lines to read from this file. Defaults to ${DEFAULT_BATCH_READ_LIMIT}; maximum ${MAX_BATCH_READ_LIMIT}.`,
+                ),
+            }),
+          )
+          .min(1)
+          .max(MAX_BATCH_READ_FILES)
+          .describe("Known text files or ranges to read in one approval-gated call."),
+      },
+      outputSchema: resultOutputSchema({
+        files: z.array(
+          z.object({
+            path: z.string(),
+            status: z.enum(["ok", "error", "skipped"]),
+            offset: z.number().int().positive(),
+            limit: z.number().int().positive(),
+            charactersReturned: z.number().int().nonnegative(),
+            truncated: z.boolean(),
+            error: z.string().optional(),
+          }),
+        ),
+        summary: z.object({
+          requested: z.number().int().nonnegative(),
+          succeeded: z.number().int().nonnegative(),
+          failed: z.number().int().nonnegative(),
+          skipped: z.number().int().nonnegative(),
+          characters: z.number().int().nonnegative(),
+          truncated: z.boolean(),
+        }),
+      }),
+      ...toolWidgetDescriptorMeta(config, "read"),
+      annotations: READ_ONLY_TOOL_ANNOTATIONS,
+    },
+    async ({ workspaceId, files }) => {
+      const startedAt = performance.now();
+      const workspace = workspaces.getWorkspace(workspaceId);
+      const result = await readWorkspaceFiles(workspaces, workspace, files);
+      const content = [textBlock(result.text)];
+      const summary = {
+        requested: files.length,
+        succeeded: result.succeeded,
+        failed: result.failed,
+        skipped: result.skipped,
+        characters: result.characters,
+        truncated: result.truncated,
+      };
+
+      logToolCall(config, {
+        tool: toolNames.readBatch,
+        workspaceId,
+        path: files.map((file) => file.path).join(","),
+        success: true,
+        durationMs: Math.round(performance.now() - startedAt),
+      });
+
+      return {
+        content,
+        _meta: {
+          tool: toolNames.readBatch,
+          card: {
+            workspaceId,
+            summary,
+            payload: { content },
+          },
+        },
+        structuredContent: {
+          result: result.text,
+          files: result.files,
+          summary,
+        },
+      };
+    },
+  );
+
+  registerAppTool(
+    server,
     toolNames.write,
     {
       title: "Write file",
@@ -761,6 +898,7 @@ function createMcpServer(
       const response = await writeFileTool(input, {
         cwd: workspace.root,
         root: workspace.root,
+        allowedRoots: config.allowedRoots,
       });
 
       if (response.isError) {
@@ -848,6 +986,7 @@ function createMcpServer(
       const response = await editFileTool(input, {
         cwd: workspace.root,
         root: workspace.root,
+        allowedRoots: config.allowedRoots,
       });
 
       if (response.isError) {
@@ -921,7 +1060,7 @@ function createMcpServer(
         },
         outputSchema: resultOutputSchema(),
         ...toolWidgetDescriptorMeta(config, "show_changes"),
-        annotations: { readOnlyHint: true },
+        annotations: REVIEW_TOOL_ANNOTATIONS,
       },
       async ({ workspaceId, since, markReviewed }) => {
         const startedAt = performance.now();
@@ -985,7 +1124,7 @@ function createMcpServer(
         },
         outputSchema: resultOutputSchema(),
         ...toolWidgetDescriptorMeta(config, "search"),
-        annotations: { readOnlyHint: true },
+        annotations: READ_ONLY_TOOL_ANNOTATIONS,
       },
       async ({ workspaceId, ...input }) => {
         const startedAt = performance.now();
@@ -994,6 +1133,7 @@ function createMcpServer(
         const response = await grepFilesTool(input, {
           cwd: workspace.root,
           root: workspace.root,
+          allowedRoots: config.allowedRoots,
         });
 
         if (response.isError) {
@@ -1055,7 +1195,7 @@ function createMcpServer(
         },
         outputSchema: resultOutputSchema(),
         ...toolWidgetDescriptorMeta(config, "search"),
-        annotations: { readOnlyHint: true },
+        annotations: READ_ONLY_TOOL_ANNOTATIONS,
       },
       async ({ workspaceId, ...input }) => {
         const startedAt = performance.now();
@@ -1064,6 +1204,7 @@ function createMcpServer(
         const response = await findFilesTool(input, {
           cwd: workspace.root,
           root: workspace.root,
+          allowedRoots: config.allowedRoots,
         });
 
         if (response.isError) {
@@ -1125,7 +1266,7 @@ function createMcpServer(
         },
         outputSchema: resultOutputSchema(),
         ...toolWidgetDescriptorMeta(config, "directory"),
-        annotations: { readOnlyHint: true },
+        annotations: READ_ONLY_TOOL_ANNOTATIONS,
       },
       async ({ workspaceId, ...input }) => {
         const startedAt = performance.now();
@@ -1134,6 +1275,7 @@ function createMcpServer(
         const response = await listDirectoryTool(input, {
           cwd: workspace.root,
           root: workspace.root,
+          allowedRoots: config.allowedRoots,
         });
 
         if (response.isError) {
@@ -1175,12 +1317,129 @@ function createMcpServer(
 
   registerAppTool(
     server,
+    "publish_git_changes",
+    {
+      title: "Publish Git changes",
+      description:
+        "Stage exactly the listed files, reject unrelated staged files, run Git whitespace checks, create a normal commit, and optionally push the checked-out branch without force. Use only when the user explicitly requests a commit or push. Pass workingDirectory relative to the opened workspace root; do not construct absolute Windows or /mnt paths and do not run cd commands.",
+      inputSchema: {
+        workspaceId: z
+          .string()
+          .describe("Workspace identifier returned by open_workspace."),
+        workingDirectory: z
+          .string()
+          .optional()
+          .describe(
+            "Git repository directory relative to the opened workspace root. Do not pass an absolute path. Defaults to the workspace root.",
+          ),
+        paths: z
+          .array(z.string().min(1))
+          .min(1)
+          .max(100)
+          .describe(
+            "Exact file paths to stage, relative to workingDirectory. Directories and broad pathspecs are not accepted as implicit authorization.",
+          ),
+        message: z
+          .string()
+          .trim()
+          .min(1)
+          .max(500)
+          .describe("Commit message for the new normal commit."),
+        remote: z
+          .string()
+          .trim()
+          .min(1)
+          .optional()
+          .describe("Configured Git remote to push to. Defaults to origin."),
+        branch: z
+          .string()
+          .trim()
+          .min(1)
+          .optional()
+          .describe(
+            "Target branch. When supplied, it must match the currently checked-out branch.",
+          ),
+        push: z
+          .boolean()
+          .optional()
+          .describe("Whether to push after committing. Defaults to true."),
+      },
+      outputSchema: resultOutputSchema(),
+      _meta: {},
+      annotations: {
+        readOnlyHint: false,
+        destructiveHint: true,
+        idempotentHint: false,
+        openWorldHint: true,
+      },
+    },
+    async ({ workspaceId, workingDirectory, paths, message, remote, branch, push }) => {
+      const startedAt = performance.now();
+      const workspace = workspaces.getWorkspace(workspaceId);
+      const cwd = workspaces.resolveWorkingDirectory(workspace, workingDirectory);
+
+      try {
+        const result = await publishGitChanges({
+          cwd,
+          workspaceRoot: workspace.root,
+          allowedRoots: config.allowedRoots,
+          paths,
+          message,
+          remote,
+          branch,
+          push,
+        });
+        const resultText = [
+          `Created commit ${result.commit} on ${result.branch}.`,
+          result.pushed
+            ? `Pushed without force to ${result.remote}/${result.branch}.`
+            : "Push was not requested.",
+          `Published paths: ${result.paths.join(", ")}`,
+          result.stat ? `Staged diff summary:\n${result.stat}` : "",
+          result.pushOutput ? `Push output:\n${result.pushOutput}` : "",
+        ]
+          .filter(Boolean)
+          .join("\n");
+
+        logToolCall(config, {
+          tool: "publish_git_changes",
+          workspaceId,
+          workingDirectory: workingDirectory ?? ".",
+          path: paths.join(","),
+          success: true,
+          durationMs: Math.round(performance.now() - startedAt),
+        });
+
+        return {
+          content: [textBlock(resultText)],
+          structuredContent: { result: resultText },
+        };
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        logFailedToolResponse(
+          config,
+          {
+            tool: "publish_git_changes",
+            workspaceId,
+            workingDirectory: workingDirectory ?? ".",
+            path: paths.join(","),
+          },
+          [textBlock(message)],
+          startedAt,
+        );
+        throw error;
+      }
+    },
+  );
+
+  registerAppTool(
+    server,
     toolNames.shell,
     {
       title: config.toolNaming === "short" ? "Bash" : "Run shell",
       description: config.minimalTools
-        ? `Run a shell command inside an open workspace. Use only for tests, builds, git inspection, package scripts, search, file discovery, and directory inspection. In minimal tool mode, ${toolNames.grep}, ${toolNames.glob}, and ${toolNames.ls} are disabled; use command-line tools such as grep, rg, find, ls, and tree for those read-only inspection actions. Do not use ${toolNames.shell} to create or modify files. Do not use shell redirection, heredocs, tee, sed -i, perl -i, node/python/ruby scripts, or generated scripts to write project files; use ${toolNames.edit} for targeted changes and ${toolNames.write} for new files or full rewrites. Prefer ${toolNames.read} for direct file reads. Call open_workspace first and pass workspaceId. This is powerful local execution and should only be exposed behind strong authentication.`
-        : `Run a shell command inside an open workspace. Use only for tests, builds, git inspection, package scripts, and commands that are better executed by the shell. Do not use ${toolNames.shell} to create or modify files. Do not use shell redirection, heredocs, tee, sed -i, perl -i, node/python/ruby scripts, or generated scripts to write project files; use ${toolNames.edit} for targeted changes and ${toolNames.write} for new files or full rewrites. Prefer ${toolNames.read}, ${toolNames.grep}, ${toolNames.glob}, and ${toolNames.ls} for file inspection. Call open_workspace first and pass workspaceId. This is powerful local execution and should only be exposed behind strong authentication.`,
+        ? `Run a shell command inside an open workspace. Use for tests, builds, Git inspection, package scripts, search, file discovery, and directory inspection. In minimal tool mode, ${toolNames.grep}, ${toolNames.glob}, and ${toolNames.ls} are disabled; use command-line tools such as grep, rg, find, ls, and tree for those read-only inspection actions. Use publish_git_changes, not ${toolNames.shell}, when the user explicitly requests staging, commit, or push. Do not use ${toolNames.shell} to edit working-tree file contents or mutate the Git index, history, remotes, or branches. Do not use shell redirection, heredocs, tee, sed -i, perl -i, node/python/ruby scripts, generated scripts, or other commands to write project files; use ${toolNames.edit} for targeted changes and ${toolNames.write} for new files or full rewrites. Prefer ${toolNames.read} for direct file reads. Use the workingDirectory field instead of cd or translated absolute paths. Call open_workspace first and pass workspaceId. This is powerful local execution and should only be exposed behind strong authentication.`
+        : `Run a shell command inside an open workspace. Use for tests, builds, Git inspection, package scripts, and commands that are better executed by the shell. Use publish_git_changes, not ${toolNames.shell}, when the user explicitly requests staging, commit, or push. Do not use ${toolNames.shell} to edit working-tree file contents or mutate the Git index, history, remotes, or branches. Do not use shell redirection, heredocs, tee, sed -i, perl -i, node/python/ruby scripts, generated scripts, or other commands to write project files; use ${toolNames.edit} for targeted changes and ${toolNames.write} for new files or full rewrites. Prefer ${toolNames.read}, ${toolNames.grep}, ${toolNames.glob}, and ${toolNames.ls} for file inspection. Use the workingDirectory field instead of cd or translated absolute paths. Call open_workspace first and pass workspaceId. This is powerful local execution and should only be exposed behind strong authentication.`,
       inputSchema: {
         workspaceId: z
           .string()
@@ -1188,7 +1447,7 @@ function createMcpServer(
         command: z
           .string()
           .describe(
-            `Shell command to run. Must not create or modify project files; use ${toolNames.edit} or ${toolNames.write} for file changes.`,
+            `Shell command to run for tests, builds, package scripts, and Git inspection. It must not edit working-tree contents or mutate the Git index, history, remotes, or branches. Use publish_git_changes for explicitly authorized staging, commit, and push operations, and use ${toolNames.edit} or ${toolNames.write} for content changes.`,
           ),
         workingDirectory: z
           .string()
@@ -1295,7 +1554,7 @@ function createMcpServer(
       const workspace = workspaces.getWorkspace(workspaceId);
 
       try {
-        await safeRenameFile(workspace.root, sourcePath, targetPath);
+        await safeRenameFile([workspace.root, ...config.allowedRoots], sourcePath, targetPath);
       } catch (err: unknown) {
         logFailedToolResponse(
           config,
@@ -1364,7 +1623,7 @@ export function createServer(config = loadConfig()): RunningServer {
   const reviewCheckpoints = createReviewCheckpointManager();
 
   if (config.logging.trustProxy) {
-    app.set("trust proxy", true);
+    app.set("trust proxy", () => true);
   }
 
   app.use((req, res, next) => {
@@ -1532,7 +1791,11 @@ if (await isMainModule()) {
       `devspace listening on http://${config.host}:${config.port}/mcp`,
     );
     console.log(`allowed roots: ${config.allowedRoots.join(", ")}`);
-    console.log("auth: oauth owner-token flow required");
+    console.log(
+      config.oauth.deviceAuthorization.required
+        ? "auth: enrolled-PC device proof required"
+        : "auth: oauth owner-token flow required",
+    );
     console.log(`logging: ${config.logging.level} ${config.logging.format}`);
     console.log(`request logging: ${config.logging.requests ? "enabled" : "disabled"}`);
     console.log(`asset logging: ${config.logging.assets ? "enabled" : "disabled"}`);

@@ -28,6 +28,7 @@ export type ToolResponse<TDetails = unknown> = {
 interface ToolContext {
   cwd: string;
   root: string;
+  allowedRoots?: string[];
   readRoots?: string[];
 }
 
@@ -78,7 +79,7 @@ export async function readFileTool(input: ReadToolInput, context: ToolContext): 
 }
 
 export async function writeFileTool(input: WriteToolInput, context: ToolContext): Promise<ToolResponse> {
-  const path = resolveAllowedPath(input.path, context.cwd, [context.root]);
+  const path = resolveAllowedPath(input.path, context.cwd, context.allowedRoots ?? [context.root]);
   const tool = createWriteTool(context.cwd);
 
   return runTool((params) => tool.execute("write_file", params), {
@@ -88,7 +89,7 @@ export async function writeFileTool(input: WriteToolInput, context: ToolContext)
 }
 
 export async function editFileTool(input: EditToolInput, context: ToolContext): Promise<ToolResponse<EditToolDetails>> {
-  const path = resolveAllowedPath(input.path, context.cwd, [context.root]);
+  const path = resolveAllowedPath(input.path, context.cwd, context.allowedRoots ?? [context.root]);
   const tool = createEditTool(context.cwd);
 
   return runTool((params) => tool.execute("edit_file", params), {
@@ -98,24 +99,30 @@ export async function editFileTool(input: EditToolInput, context: ToolContext): 
 }
 
 export async function grepFilesTool(input: GrepToolInput, context: ToolContext): Promise<ToolResponse> {
-  if (input.path) resolveAllowedPath(input.path, context.cwd, [context.root]);
+  if (input.path) resolveAllowedPath(input.path, context.cwd, context.allowedRoots ?? [context.root]);
   const tool = createGrepTool(context.cwd);
 
   return runTool((params) => tool.execute("grep_files", params), input, context);
 }
 
 export async function findFilesTool(input: FindToolInput, context: ToolContext): Promise<ToolResponse> {
-  if (input.path) resolveAllowedPath(input.path, context.cwd, [context.root]);
+  if (input.path) resolveAllowedPath(input.path, context.cwd, context.allowedRoots ?? [context.root]);
   const tool = createFindTool(context.cwd);
 
   return runTool((params) => tool.execute("find_files", params), input, context);
 }
 
 export async function listDirectoryTool(input: LsToolInput, context: ToolContext): Promise<ToolResponse> {
-  if (input.path) resolveAllowedPath(input.path, context.cwd, [context.root]);
+  if (input.path) resolveAllowedPath(input.path, context.cwd, context.allowedRoots ?? [context.root]);
   const tool = createLsTool(context.cwd);
 
   return runTool((params) => tool.execute("list_directory", params), input, context);
+}
+
+function shellCommand(command: string): string {
+  if (process.platform !== "win32") return command;
+
+  return `git() { command git.exe "$@"; }\n${command}`;
 }
 
 export async function runShellTool(input: BashToolInput, context: ToolContext): Promise<ToolResponse> {
@@ -123,7 +130,7 @@ export async function runShellTool(input: BashToolInput, context: ToolContext): 
   const timeout = input.timeout === undefined ? 30 : Math.min(input.timeout, 300);
 
   return runTool((params) => tool.execute("run_shell", params), {
-    command: input.command,
+    command: shellCommand(input.command),
     timeout,
   }, context);
 }

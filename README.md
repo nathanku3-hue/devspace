@@ -134,8 +134,10 @@ and show you what changed.
 DevSpace gives ChatGPT tools to:
 
 - read, write, and edit files inside the opened workspace
+- batch-read multiple known text files in one bounded MCP call to reduce approval prompts
 - search code and inspect directories
-- run shell commands for tests, builds, git, and package scripts
+- run shell commands for tests, builds, Git inspection, and package scripts
+- publish exact listed files through a bounded commit-and-push tool when explicitly requested
 - use isolated Git worktrees for parallel coding sessions
 - follow project instructions from `AGENTS.md` and `CLAUDE.md`
 - discover local agent skills from your skill folders

@@ -3,6 +3,7 @@ import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 
 const execFileAsync = promisify(execFile);
+const gitExecutable = process.platform === "win32" ? "git.exe" : "git";
 
 export interface GitCommandResult {
   stdout: string;
@@ -21,7 +22,7 @@ export async function git(
   args: string[],
   options: { env?: NodeJS.ProcessEnv; maxBuffer?: number } = {},
 ): Promise<GitCommandResult> {
-  const { stdout, stderr } = await execFileAsync("git", args, {
+  const { stdout, stderr } = await execFileAsync(gitExecutable, args, {
     cwd,
     env: options.env ? { ...process.env, ...options.env } : process.env,
     maxBuffer: options.maxBuffer ?? 10 * 1024 * 1024,

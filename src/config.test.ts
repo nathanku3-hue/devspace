@@ -93,6 +93,39 @@ assert.deepEqual(loadConfig(baseEnv).oauth.allowedRedirectHosts, [
 assert.deepEqual(loadConfig(baseEnv).oauth.redirectUriAliases, []);
 assert.equal(loadConfig(baseEnv).oauth.accessTokenTtlSeconds, 3600);
 assert.equal(loadConfig(baseEnv).oauth.refreshTokenTtlSeconds, 2592000);
+assert.deepEqual(loadConfig(baseEnv).oauth.deviceAuthorization, {
+  enabled: false,
+  required: false,
+  loopbackPort: 7677,
+  extensionId: "aaoelopmdnhifffjefciagfmhjanbaoc",
+  allowedRedirectPrefixes: [
+    "https://chatshare.xyz/connector/oauth/",
+    "https://chatshare.xyz/connector_platform_oauth_redirect",
+  ],
+  challengeTtlSeconds: 60,
+});
+assert.deepEqual(
+  loadConfig({ ...baseEnv, DEVSPACE_DEVICE_AUTH: "1" }).oauth.deviceAuthorization,
+  {
+    enabled: true,
+    required: true,
+    loopbackPort: 7677,
+    extensionId: "aaoelopmdnhifffjefciagfmhjanbaoc",
+    allowedRedirectPrefixes: [
+      "https://chatshare.xyz/connector/oauth/",
+      "https://chatshare.xyz/connector_platform_oauth_redirect",
+    ],
+    challengeTtlSeconds: 60,
+  },
+);
+assert.equal(
+  loadConfig({
+    ...baseEnv,
+    DEVSPACE_DEVICE_AUTH: "1",
+    DEVSPACE_DEVICE_AUTH_REQUIRED: "0",
+  }).oauth.deviceAuthorization.required,
+  false,
+);
 
 assert.deepEqual(
   loadConfig({ ...baseEnv, DEVSPACE_OAUTH_SCOPES: "devspace,admin" }).oauth.scopes,
@@ -147,6 +180,18 @@ assert.throws(
 assert.throws(
   () => loadConfig({ ...baseEnv, DEVSPACE_OAUTH_ACCESS_TOKEN_TTL_SECONDS: "0" }),
   /Invalid DEVSPACE_OAUTH_ACCESS_TOKEN_TTL_SECONDS: 0/,
+);
+assert.throws(
+  () => loadConfig({ ...baseEnv, DEVSPACE_DEVICE_AUTH_LOOPBACK_PORT: "70000" }),
+  /Invalid DEVSPACE_DEVICE_AUTH_LOOPBACK_PORT: 70000/,
+);
+assert.throws(
+  () =>
+    loadConfig({
+      ...baseEnv,
+      DEVSPACE_DEVICE_AUTH_ALLOWED_REDIRECT_PREFIXES: "http://chatshare.xyz/connector/oauth/",
+    }),
+  /Invalid DEVSPACE_DEVICE_AUTH_ALLOWED_REDIRECT_PREFIXES entry/,
 );
 
 assert.equal(loadConfig(baseEnv).publicBaseUrl, "http://127.0.0.1:7676");

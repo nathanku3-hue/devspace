@@ -10,6 +10,13 @@ export type ToolNamingMode = "legacy" | "short";
 export type WidgetMode = "off" | "changes" | "full";
 const DEFAULT_OAUTH_ACCESS_TOKEN_TTL_SECONDS = 60 * 60;
 const DEFAULT_OAUTH_REFRESH_TOKEN_TTL_SECONDS = 30 * 24 * 60 * 60;
+const DEFAULT_DEVICE_AUTH_LOOPBACK_PORT = 7677;
+const DEFAULT_DEVICE_AUTH_CHALLENGE_TTL_SECONDS = 60;
+const DEFAULT_DEVICE_AUTH_EXTENSION_ID = "aaoelopmdnhifffjefciagfmhjanbaoc";
+const DEFAULT_DEVICE_AUTH_REDIRECT_PREFIXES = [
+  "https://chatshare.xyz/connector/oauth/",
+  "https://chatshare.xyz/connector_platform_oauth_redirect",
+];
 
 export interface ServerConfig {
   host: string;
@@ -208,6 +215,59 @@ function parseRequiredSecret(value: string | undefined, name: string): string {
   return secret;
 }
 
+function parseDeviceAuthorization(env: NodeJS.ProcessEnv): OAuthConfig["deviceAuthorization"] {
+  const enabled = parseBoolean(env.DEVSPACE_DEVICE_AUTH);
+  const loopbackPort = parsePositiveInteger(
+    env.DEVSPACE_DEVICE_AUTH_LOOPBACK_PORT,
+    DEFAULT_DEVICE_AUTH_LOOPBACK_PORT,
+    "DEVSPACE_DEVICE_AUTH_LOOPBACK_PORT",
+  );
+  if (loopbackPort > 65535) {
+    throw new Error(`Invalid DEVSPACE_DEVICE_AUTH_LOOPBACK_PORT: ${loopbackPort}`);
+  }
+
+  return {
+    enabled,
+    required:
+      env.DEVSPACE_DEVICE_AUTH_REQUIRED === undefined
+        ? enabled
+        : parseBoolean(env.DEVSPACE_DEVICE_AUTH_REQUIRED),
+    loopbackPort,
+    extensionId: env.DEVSPACE_DEVICE_AUTH_EXTENSION_ID?.trim() || DEFAULT_DEVICE_AUTH_EXTENSION_ID,
+    allowedRedirectPrefixes: parseStringList(
+      env.DEVSPACE_DEVICE_AUTH_ALLOWED_REDIRECT_PREFIXES,
+      DEFAULT_DEVICE_AUTH_REDIRECT_PREFIXES,
+    ).map(normalizeDeviceRedirectPrefix),
+    challengeTtlSeconds: parsePositiveInteger(
+      env.DEVSPACE_DEVICE_AUTH_CHALLENGE_TTL_SECONDS,
+      DEFAULT_DEVICE_AUTH_CHALLENGE_TTL_SECONDS,
+      "DEVSPACE_DEVICE_AUTH_CHALLENGE_TTL_SECONDS",
+    ),
+  };
+}
+
+function normalizeDeviceRedirectPrefix(value: string): string {
+  let parsed: URL;
+  try {
+    parsed = new URL(value);
+  } catch {
+    throw new Error(`Invalid DEVSPACE_DEVICE_AUTH_ALLOWED_REDIRECT_PREFIXES entry: ${value}`);
+  }
+
+  if (
+    parsed.protocol !== "https:" ||
+    parsed.username ||
+    parsed.password ||
+    parsed.hash ||
+    parsed.origin === "null"
+  ) {
+    throw new Error(`Invalid DEVSPACE_DEVICE_AUTH_ALLOWED_REDIRECT_PREFIXES entry: ${value}`);
+  }
+
+  parsed.hostname = parsed.hostname.toLowerCase();
+  return parsed.href;
+}
+
 function parseOAuthConfig(env: NodeJS.ProcessEnv, ownerToken: string | undefined): OAuthConfig {
   return {
     ownerToken: parseRequiredSecret(env.DEVSPACE_OAUTH_OWNER_TOKEN ?? ownerToken, "DEVSPACE_OAUTH_OWNER_TOKEN"),
@@ -228,6 +288,7 @@ function parseOAuthConfig(env: NodeJS.ProcessEnv, ownerToken: string | undefined
       "127.0.0.1",
     ]),
     redirectUriAliases: parseRedirectUriAliases(env.DEVSPACE_OAUTH_REDIRECT_URI_ALIASES),
+    deviceAuthorization: parseDeviceAuthorization(env),
   };
 }
 

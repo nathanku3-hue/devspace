@@ -495,6 +495,8 @@ function getToolDisplay(card: ToolResultCard): ToolDisplay {
     case "read_file":
     case "read":
       return { icon: fileIcon(), title: "Read File", label, tone: "read" };
+    case "read_files":
+      return { icon: filesIcon(), title: "Read Files", label, tone: "read" };
     case "write_file":
     case "write":
       return { icon: filePlusIcon(), title: "Write File", label, tone: "write" };
@@ -525,6 +527,10 @@ function getToolLabel(card: ToolResultCard): string {
   if (isReviewTool(card.tool)) {
     const count = Number(card.summary?.files ?? card.files?.length ?? 0);
     return count === 0 ? "No changes since last review" : `${count} changed ${count === 1 ? "file" : "files"}`;
+  }
+  if (card.tool === "read_files") {
+    const count = Number(card.summary?.requested ?? 0);
+    return `${count} context ${count === 1 ? "file" : "files"}`;
   }
   if (card.path) return card.path;
   if (card.root) return card.root;

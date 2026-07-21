@@ -6,7 +6,7 @@ to your development machine.
 The security model is simple:
 
 - you choose a narrow filesystem allowlist
-- the MCP endpoint requires OAuth approval with your Owner password
+- the MCP endpoint requires OAuth approval with your Owner password or an enrolled-PC proof
 - Host headers are allowlisted from the configured public URL
 - every coding action happens through explicit MCP tool calls
 
@@ -49,6 +49,32 @@ For env-driven deployments, set a long random value:
 DEVSPACE_OAUTH_OWNER_TOKEN="$(openssl rand -base64 32)"
 ```
 
+## Silent Enrolled-PC Proof
+
+The optional device authorization mode replaces the approval password with a
+silent, one-time proof from the PC running DevSpace:
+
+1. DevSpace creates an in-memory secret each time it starts and listens only on
+   `127.0.0.1` for proof requests.
+2. The bundled Chrome extension is pinned to a stable extension ID and only
+   relays challenges from the configured DevSpace authorization origin.
+3. The proof is an HMAC over a one-time challenge and a SHA-256 binding of the
+   OAuth client, redirect URI, PKCE challenge, scopes, state, and resource.
+4. Each accepted challenge is deleted, so a captured proof cannot be replayed.
+5. Device-bound access and refresh tokens are marked in SQLite. When device
+   authorization is required, old or manually issued unbound tokens are denied.
+
+This deliberately does not use a local IP address, MAC address, hostname,
+cookie, or browser fingerprint. Those values are either unstable, unavailable
+to web code, or spoofable.
+
+The mode proves that the authorization browser can reach the enrolled PC's
+currently running DevSpace process. It does not prove that a particular person
+is present. Malware already running as the same local user, a compromised
+browser profile, or theft of an already issued bearer token remain separate
+threats. Hardware-backed user presence would require TPM-backed client
+certificates or WebAuthn and would add setup or interaction.
+
 ## Public URL And Host Allowlist
 
 DevSpace needs `DEVSPACE_PUBLIC_BASE_URL` so MCP clients can discover OAuth
@@ -84,7 +110,8 @@ package scripts.
 
 Filesystem path containment applies to DevSpace file tools. Shell commands run
 as local commands and can do what your user account can do. This is why the MCP
-client must be trusted and the Owner password must stay private.
+client and the local machine must be trusted, and authentication material must
+stay private.
 
 ## Worktrees
 

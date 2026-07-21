@@ -35,13 +35,15 @@ npx @waishnav/devspace config set publicBaseUrl https://devspace.example.com
 | `DEVSPACE_ALLOWED_ROOTS` | Comma-separated local roots that workspaces may open. |
 | `DEVSPACE_PUBLIC_BASE_URL` | Public origin for the server, without `/mcp`. |
 | `DEVSPACE_ALLOWED_HOSTS` | Optional Host header allowlist override. |
-| `DEVSPACE_OAUTH_OWNER_TOKEN` | Owner password for OAuth approval. Must be at least 16 characters. |
+| `DEVSPACE_OAUTH_OWNER_TOKEN` | Owner password for OAuth approval when enrolled-PC authorization is disabled. Must be at least 16 characters. |
+| `DEVSPACE_DEVICE_AUTH` | Enables silent enrolled-PC OAuth authorization through a loopback signer. |
 | `DEVSPACE_WORKTREE_ROOT` | Directory for managed Git worktrees. Defaults to `~/.devspace/worktrees`. |
 | `DEVSPACE_STATE_DIR` | Directory for SQLite state. Defaults to `~/.local/share/devspace`. |
 
 ## OAuth
 
-DevSpace uses a single-user OAuth approval flow.
+DevSpace uses a single-user OAuth approval flow. It can use either the Owner
+password or a silent proof from the enrolled PC.
 
 | Variable | Default |
 | --- | --- |
@@ -49,6 +51,26 @@ DevSpace uses a single-user OAuth approval flow.
 | `DEVSPACE_OAUTH_REFRESH_TOKEN_TTL_SECONDS` | `2592000` |
 | `DEVSPACE_OAUTH_SCOPES` | `devspace` |
 | `DEVSPACE_OAUTH_ALLOWED_REDIRECT_HOSTS` | `chatgpt.com,localhost,127.0.0.1` |
+
+### Silent Enrolled-PC Authorization
+
+| Variable | Default |
+| --- | --- |
+| `DEVSPACE_DEVICE_AUTH` | `0` |
+| `DEVSPACE_DEVICE_AUTH_REQUIRED` | Same value as `DEVSPACE_DEVICE_AUTH` |
+| `DEVSPACE_DEVICE_AUTH_LOOPBACK_PORT` | `7677` |
+| `DEVSPACE_DEVICE_AUTH_EXTENSION_ID` | Bundled extension ID |
+| `DEVSPACE_DEVICE_AUTH_ALLOWED_REDIRECT_PREFIXES` | Chatshare OAuth callback prefixes |
+| `DEVSPACE_DEVICE_AUTH_CHALLENGE_TTL_SECONDS` | `60` |
+
+When enabled, DevSpace starts a signer on `127.0.0.1` only. The bundled Chrome
+extension relays a one-time authorization challenge to that signer. The proof is
+bound to the complete OAuth request and cannot be replayed. No local IP, MAC
+address, cookie, or browser fingerprint is used as the identity.
+
+When `DEVSPACE_DEVICE_AUTH_REQUIRED=1`, authorization requests outside the
+configured redirect prefixes are rejected, and access or refresh tokens issued
+without device proof are rejected. This is intentionally fail closed.
 
 MCP clients discover metadata from:
 
@@ -66,11 +88,13 @@ MCP clients discover metadata from:
 | `short` | Default. Uses `read`, `edit`, `bash`, and related names. |
 | `legacy` | Uses `read_file`, `edit_file`, `run_shell`, and related names. |
 
+The batched text reader is always named `read_files` in both naming modes.
+
 `DEVSPACE_TOOL_MODE` controls the tool surface.
 
 | Value | Behavior |
 | --- | --- |
-| `minimal` | Default. Disables dedicated search and list tools. Clients use the shell tool with `rg`, `grep`, `find`, `ls`, or `tree` for inspection. |
+| `minimal` | Default. Disables dedicated search and list tools. `read_files` remains available for bounded multi-file context reads; clients use the shell tool with `rg`, `grep`, `find`, `ls`, or `tree` for discovery. |
 | `full` | Enables dedicated `grep`, `glob`, and `ls` tools. |
 
 ## Widgets

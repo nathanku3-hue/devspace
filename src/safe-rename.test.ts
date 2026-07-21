@@ -139,12 +139,12 @@ const mockRoot = resolve("/mock/workspace");
 
   await assert.rejects(
     safeRenameFile(mockRoot, "../source.txt", "target.txt", fsOps),
-    /Source path resolves outside workspace root/
+    /Source path resolves outside allowed roots/
   );
 
   await assert.rejects(
     safeRenameFile(mockRoot, "source.txt", "../target.txt", fsOps),
-    /Target path resolves outside workspace root/
+    /Target path resolves outside allowed roots/
   );
 }
 

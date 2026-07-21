@@ -57,12 +57,28 @@ try {
   await mkdir(gitRoot);
   await writeFile(join(gitRoot, "AGENTS.md"), "git root instructions\n");
   await writeFile(join(gitRoot, "README.md"), "hello\n");
+  await writeFile(join(gitRoot, ".gitignore"), "tmp/\n");
+  await mkdir(join(gitRoot, "tracked", "nested"), { recursive: true });
+  await writeFile(join(gitRoot, "tracked", "nested", "AGENTS.md"), "tracked nested instructions\n");
   await git(gitRoot, ["init"]);
   await git(gitRoot, ["config", "user.email", "devspace@example.com"]);
   await git(gitRoot, ["config", "user.name", "DevSpace Test"]);
   await git(gitRoot, ["add", "."]);
   await git(gitRoot, ["commit", "-m", "Initial commit"]);
+  await mkdir(join(gitRoot, "untracked", "active"), { recursive: true });
+  await writeFile(join(gitRoot, "untracked", "active", "AGENTS.md"), "untracked active instructions\n");
+  await mkdir(join(gitRoot, "tmp", "replay"), { recursive: true });
+  await writeFile(join(gitRoot, "tmp", "replay", "AGENTS.md"), "ignored replay instructions\n");
   await writeFile(join(gitRoot, "dirty.txt"), "not copied\n");
+
+  const gitCheckoutWorkspace = await registry.openWorkspace(gitRoot);
+  assert.deepEqual(
+    gitCheckoutWorkspace.availableAgentsFiles.map((file) => file.path),
+    [
+      join(gitRoot, "tracked", "nested", "AGENTS.md"),
+      join(gitRoot, "untracked", "active", "AGENTS.md"),
+    ],
+  );
 
   const worktreeWorkspace = await registry.openWorkspace({
     path: gitRoot,

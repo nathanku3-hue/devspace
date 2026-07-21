@@ -5,6 +5,7 @@ import { dirname, join, relative, resolve, sep } from "node:path";
 import { loadProjectContextFiles } from "@earendil-works/pi-coding-agent";
 import type { ServerConfig } from "./config.js";
 import { createManagedWorktree } from "./git-worktrees.js";
+import { git } from "./git.js";
 import { assertAllowedPath, isPathInsideRoot, resolveAllowedPath } from "./roots.js";
 import {
   loadWorkspaceSkills,
@@ -119,9 +120,9 @@ export class WorkspaceRegistry {
   }
 
   resolvePath(workspace: Workspace, inputPath: string): string {
-    const absolutePath = resolveAllowedPath(inputPath, workspace.root, [workspace.root]);
-    if (!isPathInsideRoot(absolutePath, workspace.root)) {
-      throw new Error(`Path is outside workspace root: ${inputPath}`);
+    const absolutePath = resolveAllowedPath(inputPath, workspace.root, this.config.allowedRoots);
+    if (!this.config.allowedRoots.some((root) => isPathInsideRoot(absolutePath, root))) {
+      throw new Error(`Path is outside allowed roots: ${inputPath}`);
     }
 
     return absolutePath;
@@ -131,7 +132,7 @@ export class WorkspaceRegistry {
     try {
       return {
         absolutePath: this.resolvePath(workspace, inputPath),
-        readRoots: [workspace.root],
+        readRoots: [workspace.root, ...this.config.allowedRoots],
       };
     } catch (workspaceError) {
       const skillRead = resolveSkillReadPath(
@@ -143,7 +144,7 @@ export class WorkspaceRegistry {
 
       return {
         absolutePath: skillRead.absolutePath,
-        readRoots: [workspace.root, skillRead.skill.baseDir],
+        readRoots: [workspace.root, skillRead.skill.baseDir, ...this.config.allowedRoots],
         skillRead,
       };
     }
@@ -157,7 +158,7 @@ export class WorkspaceRegistry {
 
   resolveWorkingDirectory(workspace: Workspace, workingDirectory: string | undefined): string {
     const directory = workingDirectory ? this.resolvePath(workspace, workingDirectory) : workspace.root;
-    return assertAllowedPath(directory, [workspace.root]);
+    return assertAllowedPath(directory, this.config.allowedRoots);
   }
 
   private async openCheckoutWorkspace(path: string): Promise<WorkspaceContext> {
@@ -258,22 +259,41 @@ export class WorkspaceRegistry {
     root: string,
     loadedFiles: LoadedAgentsFile[],
   ): Promise<AvailableAgentsFile[]> {
-    const loadedPaths = new Set(loadedFiles.map((file) => resolve(file.path)));
+    const loadedPaths = new Set(loadedFiles.map((file) => contextPathKey(resolve(file.path))));
+    const gitPaths = await findGitContextFiles(root);
     const discovered: AvailableAgentsFile[] = [];
 
-    await walkWorkspace(root, async (path, entry) => {
-      if (!entry.isFile()) return;
-      if (!CONTEXT_FILE_NAMES.has(entry.name)) return;
-      if (loadedPaths.has(path)) return;
+    if (gitPaths) {
+      for (const path of gitPaths) {
+        if (!loadedPaths.has(contextPathKey(path))) discovered.push({ path });
+      }
+    } else {
+      await walkWorkspace(root, async (path, entry) => {
+        if (!entry.isFile()) return;
+        if (!CONTEXT_FILE_NAMES.has(entry.name)) return;
+        if (loadedPaths.has(contextPathKey(path))) return;
 
-      discovered.push({ path });
-    });
+        discovered.push({ path });
+      });
+    }
 
     return discovered.sort((a, b) => a.path.localeCompare(b.path));
   }
 }
 
 const CONTEXT_FILE_NAMES = new Set(["AGENTS.md", "AGENTS.MD", "CLAUDE.md", "CLAUDE.MD"]);
+const CONTEXT_GIT_PATHS = [
+  "AGENTS.md",
+  "AGENTS.MD",
+  "CLAUDE.md",
+  "CLAUDE.MD",
+  "**/AGENTS.md",
+  "**/AGENTS.MD",
+  "**/CLAUDE.md",
+  "**/CLAUDE.MD",
+];
+const MAX_FALLBACK_CONTEXT_DEPTH = 8;
+const MAX_FALLBACK_CONTEXT_DIRECTORIES = 1_000;
 const SKIPPED_CONTEXT_DIRS = new Set([
   ".git",
   ".hg",
@@ -285,7 +305,44 @@ const SKIPPED_CONTEXT_DIRS = new Set([
   ".next",
   ".turbo",
   ".cache",
+  ".pytest_cache",
+  ".mypy_cache",
+  ".ruff_cache",
+  ".venv",
+  "venv",
+  "__pycache__",
+  "tmp",
+  "temp",
 ]);
+
+function contextPathKey(path: string): string {
+  const resolved = resolve(path);
+  return process.platform === "win32" ? resolved.toLowerCase() : resolved;
+}
+
+async function findGitContextFiles(root: string): Promise<string[] | undefined> {
+  try {
+    const gitRoot = (await git(root, ["rev-parse", "--show-toplevel"])).stdout.trim();
+    const { stdout } = await git(
+      gitRoot,
+      ["ls-files", "-z", "-c", "-o", "--exclude-standard", "--", ...CONTEXT_GIT_PATHS],
+      { maxBuffer: 4 * 1024 * 1024 },
+    );
+
+    return Array.from(
+      new Map(
+        stdout
+          .split("\0")
+          .filter(Boolean)
+          .map((path) => resolve(gitRoot, path))
+          .filter((path) => isPathInsideRoot(path, root))
+          .map((path) => [contextPathKey(path), path] as const),
+      ).values(),
+    );
+  } catch {
+    return undefined;
+  }
+}
 
 export function formatAgentsPath(path: string, workspaceRoot: string | undefined): string {
   if (!workspaceRoot) return path.split(sep).join("/");
@@ -306,7 +363,13 @@ export function formatAgentsPath(path: string, workspaceRoot: string | undefined
 async function walkWorkspace(
   directory: string,
   visit: (path: string, entry: { name: string; isFile(): boolean; isDirectory(): boolean }) => Promise<void> | void,
+  depth = 0,
+  state = { directories: 0 },
 ): Promise<void> {
+  if (depth > MAX_FALLBACK_CONTEXT_DEPTH) return;
+  if (state.directories >= MAX_FALLBACK_CONTEXT_DIRECTORIES) return;
+  state.directories += 1;
+
   let entries;
   try {
     entries = await opendir(directory);
@@ -318,7 +381,7 @@ async function walkWorkspace(
     const path = join(directory, entry.name);
     if (entry.isDirectory()) {
       if (!SKIPPED_CONTEXT_DIRS.has(entry.name)) {
-        await walkWorkspace(path, visit);
+        await walkWorkspace(path, visit, depth + 1, state);
       }
       continue;
     }

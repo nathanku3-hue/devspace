@@ -36,21 +36,23 @@ const defaultFsOps: FileSystemOps = {
 };
 
 export async function safeRenameFile(
-  workspaceRoot: string,
+  workspaceRoot: string | string[],
   sourcePath: string,
   targetPath: string,
   fsOps: FileSystemOps = defaultFsOps
 ): Promise<void> {
-  const realWorkspaceRoot = await fsOps.realpath(workspaceRoot);
+  const allowedRoots = Array.isArray(workspaceRoot) ? workspaceRoot : [workspaceRoot];
+  const realRoots = await Promise.all(allowedRoots.map((root) => fsOps.realpath(root)));
+  const baseRoot = realRoots[0];
 
-  const absSource = resolve(realWorkspaceRoot, sourcePath);
-  if (!isPathInsideRoot(absSource, realWorkspaceRoot)) {
-    throw new Error(`Source path resolves outside workspace root: ${sourcePath}`);
+  const absSource = resolve(baseRoot, sourcePath);
+  if (!realRoots.some((root) => isPathInsideRoot(absSource, root))) {
+    throw new Error(`Source path resolves outside allowed roots: ${sourcePath}`);
   }
 
-  const absTarget = resolve(realWorkspaceRoot, targetPath);
-  if (!isPathInsideRoot(absTarget, realWorkspaceRoot)) {
-    throw new Error(`Target path resolves outside workspace root: ${targetPath}`);
+  const absTarget = resolve(baseRoot, targetPath);
+  if (!realRoots.some((root) => isPathInsideRoot(absTarget, root))) {
+    throw new Error(`Target path resolves outside allowed roots: ${targetPath}`);
   }
 
   let originalSourceStats;
@@ -69,8 +71,8 @@ export async function safeRenameFile(
   }
 
   const realSource = await fsOps.realpath(absSource);
-  if (!isPathInsideRoot(realSource, realWorkspaceRoot)) {
-    throw new Error(`Source path resolves outside workspace root: ${sourcePath}`);
+  if (!realRoots.some((root) => isPathInsideRoot(realSource, root))) {
+    throw new Error(`Source path resolves outside allowed roots: ${sourcePath}`);
   }
 
   const targetParent = dirname(absTarget);
@@ -85,8 +87,8 @@ export async function safeRenameFile(
     throw error;
   }
 
-  if (!isPathInsideRoot(realTargetParent, realWorkspaceRoot)) {
-    throw new Error(`Target path resolves outside workspace root: ${targetPath}`);
+  if (!realRoots.some((root) => isPathInsideRoot(realTargetParent, root))) {
+    throw new Error(`Target path resolves outside allowed roots: ${targetPath}`);
   }
 
   const targetParentStats = await fsOps.lstat(realTargetParent);

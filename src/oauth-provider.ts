@@ -10,6 +10,7 @@ import type {
   OAuthTokens,
 } from "@modelcontextprotocol/sdk/shared/auth.js";
 import { checkResourceAllowed, resourceUrlFromServerUrl } from "@modelcontextprotocol/sdk/shared/auth-utils.js";
+import { DeviceAuthorization, type DeviceAuthorizationConfig } from "./device-authorization.js";
 import {
   SqliteOAuthClientsStore,
   SqliteOAuthStore,
@@ -23,12 +24,14 @@ export interface OAuthConfig {
   scopes: string[];
   allowedRedirectHosts: string[];
   redirectUriAliases?: RedirectUriAlias[];
+  deviceAuthorization: DeviceAuthorizationConfig;
 }
 
 interface AuthorizationCodeRecord {
   clientId: string;
   params: AuthorizationParams;
   expiresAtMs: number;
+  deviceBound: boolean;
 }
 
 const CODE_TTL_MS = 5 * 60 * 1000;
@@ -59,6 +62,7 @@ function formHtml(params: {
   scopes: string[];
   resource?: URL;
   fields: Record<string, string | undefined>;
+  deviceAuthorization: boolean;
 }): string {
   const scopeText = params.scopes.length > 0 ? params.scopes.join(" ") : "devspace";
   const resourceText = params.resource?.href ?? "DevSpace MCP endpoint";
@@ -69,6 +73,12 @@ function formHtml(params: {
     .filter((entry): entry is [string, string] => entry[1] !== undefined)
     .map(([name, value]) => `        <input type="hidden" name="${htmlEscape(name)}" value="${htmlEscape(value)}" />`)
     .join("\n");
+  const approvalControls = params.deviceAuthorization
+    ? `        <p id="devspace-device-status" class="status">Checking this enrolled PC…</p>\n        <button id="devspace-device-retry" type="button">Retry device check</button>`
+    : `        <label for="owner_token">Owner password</label>\n        <input id="owner_token" name="owner_token" type="password" autocomplete="current-password" autofocus required />\n        <button type="submit">Authorize DevSpace</button>`;
+  const formAttributes = params.deviceAuthorization
+    ? ` data-devspace-device-auth="required"`
+    : "";
 
   return `<!doctype html>
 <html lang="en">
@@ -89,6 +99,7 @@ function formHtml(params: {
       button { margin-top: 18px; width: 100%; border: 0; border-radius: 10px; padding: 12px 14px; font-weight: 700; color: #020617; background: #38bdf8; cursor: pointer; }
       .error { color: #fecaca; background: #7f1d1d; border-radius: 10px; padding: 10px 12px; }
       .warning { color: #fde68a; }
+      .status { color: #bae6fd; background: #082f49; border-radius: 10px; padding: 10px 12px; }
     </style>
   </head>
   <body>
@@ -101,11 +112,9 @@ function formHtml(params: {
         <dt>Scope</dt><dd>${htmlEscape(scopeText)}</dd>
         <dt>Resource</dt><dd>${htmlEscape(resourceText)}</dd>
       </dl>
-      <form method="post">
+      <form method="post"${formAttributes}>
 ${hiddenFields}
-        <label for="owner_token">Owner password</label>
-        <input id="owner_token" name="owner_token" type="password" autocomplete="current-password" autofocus required />
-        <button type="submit">Authorize DevSpace</button>
+${approvalControls}
       </form>
     </main>
   </body>
@@ -121,6 +130,7 @@ export class SingleUserOAuthProvider implements OAuthServerProvider {
   private readonly codes = new Map<string, AuthorizationCodeRecord>();
   private readonly oauthStore: SqliteOAuthStore;
   private readonly resourceServerUrl: URL;
+  private readonly deviceAuthorization?: DeviceAuthorization;
 
   constructor(
     private readonly config: OAuthConfig,
@@ -129,6 +139,10 @@ export class SingleUserOAuthProvider implements OAuthServerProvider {
   ) {
     this.resourceServerUrl = resourceUrlFromServerUrl(resourceServerUrl);
     this.oauthStore = new SqliteOAuthStore(stateDir);
+    if (config.deviceAuthorization.enabled) {
+      this.deviceAuthorization = new DeviceAuthorization(config.deviceAuthorization);
+      this.deviceAuthorization.start();
+    }
     this.clientsStore = new SqliteOAuthClientsStore(
       this.oauthStore,
       config.allowedRedirectHosts,
@@ -150,33 +164,84 @@ export class SingleUserOAuthProvider implements OAuthServerProvider {
     }
 
     const normalizedParams: AuthorizationParams = { ...params, resource };
+    const redirectUsesDeviceAuthorization = Boolean(
+      this.deviceAuthorization?.isRedirectAllowed(normalizedParams.redirectUri),
+    );
+    if (
+      this.config.deviceAuthorization.enabled &&
+      this.config.deviceAuthorization.required &&
+      !redirectUsesDeviceAuthorization
+    ) {
+      throw new AccessDeniedError("This DevSpace server only authorizes the enrolled Chatshare device");
+    }
+
+    const binding = redirectUsesDeviceAuthorization
+      ? authorizationBinding(client, normalizedParams)
+      : undefined;
 
     if (res.req.method !== "POST") {
+      const challenge = binding ? this.deviceAuthorization?.createChallenge(binding) : undefined;
       res.status(200).setHeader("Content-Type", "text/html; charset=utf-8");
+      res.setHeader("Cache-Control", "no-store");
       res.send(
         formHtml({
           clientName: client.client_name ?? client.client_id,
           scopes: normalizedParams.scopes ?? this.config.scopes,
           resource,
-          fields: authorizationFormFields(client, normalizedParams),
+          fields: authorizationFormFields(client, normalizedParams, challenge, binding),
+          deviceAuthorization: Boolean(challenge),
         }),
       );
       return;
     }
 
-    const providedToken = String(res.req.body?.owner_token ?? "");
-    if (!safeEquals(providedToken, this.config.ownerToken)) {
-      res.status(401).setHeader("Content-Type", "text/html; charset=utf-8");
-      res.send(
-        formHtml({
-          error: "The Owner password was not accepted.",
-          clientName: client.client_name ?? client.client_id,
-          scopes: normalizedParams.scopes ?? this.config.scopes,
-          resource,
-          fields: authorizationFormFields(client, normalizedParams),
-        }),
-      );
-      return;
+    let deviceBound = false;
+    if (binding && this.deviceAuthorization) {
+      const challenge = String(res.req.body?.device_challenge ?? "");
+      const submittedBinding = String(res.req.body?.device_binding ?? "");
+      const proof = String(res.req.body?.device_proof ?? "");
+      if (
+        submittedBinding !== binding ||
+        !this.deviceAuthorization.verifyProof(challenge, binding, proof)
+      ) {
+        const replacementChallenge = this.deviceAuthorization.createChallenge(binding);
+        res.status(401).setHeader("Content-Type", "text/html; charset=utf-8");
+        res.setHeader("Cache-Control", "no-store");
+        res.send(
+          formHtml({
+            error: "This authorization was not signed by the enrolled PC.",
+            clientName: client.client_name ?? client.client_id,
+            scopes: normalizedParams.scopes ?? this.config.scopes,
+            resource,
+            fields: authorizationFormFields(
+              client,
+              normalizedParams,
+              replacementChallenge,
+              binding,
+            ),
+            deviceAuthorization: true,
+          }),
+        );
+        return;
+      }
+      deviceBound = true;
+    } else {
+      const providedToken = String(res.req.body?.owner_token ?? "");
+      if (!safeEquals(providedToken, this.config.ownerToken)) {
+        res.status(401).setHeader("Content-Type", "text/html; charset=utf-8");
+        res.setHeader("Cache-Control", "no-store");
+        res.send(
+          formHtml({
+            error: "The Owner password was not accepted.",
+            clientName: client.client_name ?? client.client_id,
+            scopes: normalizedParams.scopes ?? this.config.scopes,
+            resource,
+            fields: authorizationFormFields(client, normalizedParams),
+            deviceAuthorization: false,
+          }),
+        );
+        return;
+      }
     }
 
     const code = `code-${randomUUID()}`;
@@ -184,6 +249,7 @@ export class SingleUserOAuthProvider implements OAuthServerProvider {
       clientId: client.client_id,
       params: normalizedParams,
       expiresAtMs: Date.now() + CODE_TTL_MS,
+      deviceBound,
     });
 
     const redirectUrl = new URL(normalizedParams.redirectUri);
@@ -216,7 +282,12 @@ export class SingleUserOAuthProvider implements OAuthServerProvider {
     }
 
     this.codes.delete(authorizationCode);
-    return this.issueTokens(client.client_id, record.params.scopes ?? this.config.scopes, record.params.resource);
+    return this.issueTokens(
+      client.client_id,
+      record.params.scopes ?? this.config.scopes,
+      record.params.resource,
+      record.deviceBound,
+    );
   }
 
   async exchangeRefreshToken(
@@ -227,7 +298,12 @@ export class SingleUserOAuthProvider implements OAuthServerProvider {
   ): Promise<OAuthTokens> {
     const refreshTokenHash = hashToken(refreshToken);
     const record = this.oauthStore.getRefreshToken(refreshTokenHash);
-    if (!record || record.clientId !== client.client_id || record.expiresAt < Math.floor(Date.now() / 1000)) {
+    if (
+      !record ||
+      record.clientId !== client.client_id ||
+      record.expiresAt < Math.floor(Date.now() / 1000) ||
+      (this.config.deviceAuthorization.required && !record.deviceBound)
+    ) {
       throw new InvalidGrantError("Invalid refresh token");
     }
     if (resource && !checkResourceAllowed({ requestedResource: resource, configuredResource: this.resourceServerUrl })) {
@@ -243,13 +319,18 @@ export class SingleUserOAuthProvider implements OAuthServerProvider {
       client.client_id,
       requestedScopes,
       resource ?? (record.resource ? new URL(record.resource) : undefined),
+      Boolean(record.deviceBound),
       refreshTokenHash,
     );
   }
 
   async verifyAccessToken(token: string): Promise<AuthInfo> {
     const record = this.oauthStore.getAccessToken(hashToken(token));
-    if (!record || record.expiresAt < Math.floor(Date.now() / 1000)) {
+    if (
+      !record ||
+      record.expiresAt < Math.floor(Date.now() / 1000) ||
+      (this.config.deviceAuthorization.required && !record.deviceBound)
+    ) {
       throw new InvalidTokenError("Invalid or expired access token");
     }
 
@@ -269,6 +350,7 @@ export class SingleUserOAuthProvider implements OAuthServerProvider {
   }
 
   close(): void {
+    this.deviceAuthorization?.close();
     this.oauthStore.close();
   }
 
@@ -286,7 +368,8 @@ export class SingleUserOAuthProvider implements OAuthServerProvider {
   private issueTokens(
     clientId: string,
     scopes: string[],
-    resource?: URL,
+    resource: URL | undefined,
+    deviceBound: boolean,
     consumedRefreshTokenHash?: string,
   ): OAuthTokens {
     const now = Math.floor(Date.now() / 1000);
@@ -303,6 +386,7 @@ export class SingleUserOAuthProvider implements OAuthServerProvider {
           scopes,
           expiresAt: accessExpiresAt,
           resource: resource?.href,
+          deviceBound,
         },
         refreshTokenHash: hashToken(refreshToken),
         refreshToken: {
@@ -310,6 +394,7 @@ export class SingleUserOAuthProvider implements OAuthServerProvider {
           scopes,
           expiresAt: refreshExpiresAt,
           resource: resource?.href,
+          deviceBound,
         },
       },
       consumedRefreshTokenHash,
@@ -331,6 +416,8 @@ export class SingleUserOAuthProvider implements OAuthServerProvider {
 function authorizationFormFields(
   client: OAuthClientInformationFull,
   params: AuthorizationParams,
+  deviceChallenge?: string,
+  deviceBinding?: string,
 ): Record<string, string | undefined> {
   return {
     response_type: "code",
@@ -341,7 +428,25 @@ function authorizationFormFields(
     scope: params.scopes?.join(" "),
     state: params.state,
     resource: params.resource?.href,
+    device_challenge: deviceChallenge,
+    device_binding: deviceBinding,
+    device_proof: deviceChallenge ? "" : undefined,
   };
+}
+
+function authorizationBinding(
+  client: OAuthClientInformationFull,
+  params: AuthorizationParams,
+): string {
+  const canonical = JSON.stringify({
+    clientId: client.client_id,
+    redirectUri: params.redirectUri,
+    codeChallenge: params.codeChallenge,
+    scopes: params.scopes ?? [],
+    state: params.state ?? null,
+    resource: params.resource?.href ?? null,
+  });
+  return createHash("sha256").update(canonical).digest("base64url");
 }
 
 function hashToken(token: string): string {

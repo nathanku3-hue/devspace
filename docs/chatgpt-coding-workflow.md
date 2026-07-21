@@ -75,6 +75,28 @@ should read the relevant nested file before working under that directory.
 This keeps instructions explicit and inspectable instead of silently injecting
 new context during later tool calls.
 
+## Batch Context Reads
+
+Use `read_files` when two or more known text files are needed in the same
+reasoning step. It combines multiple file ranges into one bounded MCP call, which
+reduces approval prompts in hosts that confirm every tool invocation.
+
+```json
+{
+  "workspaceId": "ws_example",
+  "files": [
+    { "path": "AGENTS.md" },
+    { "path": "docs/current_context.md", "limit": 600 },
+    { "path": "docs/top_level_roadmap.md", "offset": 1, "limit": 800 }
+  ]
+}
+```
+
+The tool accepts up to 20 text files, defaults to 400 lines per file, caps each
+file at 2,000 lines, and caps the combined response at 120,000 characters. It
+preserves request order and reports individual errors without discarding other
+successful reads. Use the single-file read tool for images.
+
 ## Skills
 
 Skills are enabled by default for coding-agent workflows.
@@ -101,6 +123,7 @@ Short names are the default:
 
 - `open_workspace`
 - `read`
+- `read_files`
 - `write`
 - `edit`
 - `bash`
@@ -113,6 +136,7 @@ Legacy names are available with `DEVSPACE_TOOL_NAMING=legacy`:
 
 - `open_workspace`
 - `read_file`
+- `read_files`
 - `write_file`
 - `edit_file`
 - `run_shell`
@@ -141,3 +165,8 @@ The shell tool is for commands that belong in a terminal:
 
 File writes should go through the edit/write tools rather than shell
 redirection, heredocs, `tee`, `sed -i`, or generated scripts.
+
+When the user explicitly requests a commit or push, use
+`publish_git_changes` with exact file paths. The tool refuses unrelated staged
+files, runs the cached whitespace check, creates a normal commit, and pushes the
+checked-out branch without force.

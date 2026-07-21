@@ -57,6 +57,7 @@ export const oauthAccessTokens = sqliteTable(
     scopesJson: text("scopes_json").notNull(),
     expiresAt: integer("expires_at").notNull(),
     resource: text("resource"),
+    deviceBound: integer("device_bound").notNull().default(0),
   },
 );
 
@@ -70,6 +71,7 @@ export const oauthRefreshTokens = sqliteTable(
     scopesJson: text("scopes_json").notNull(),
     expiresAt: integer("expires_at").notNull(),
     resource: text("resource"),
+    deviceBound: integer("device_bound").notNull().default(0),
   },
 );
 
