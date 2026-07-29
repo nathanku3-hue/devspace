@@ -10,6 +10,8 @@ export const workspaceSessions = sqliteTable(
     sourceRoot: text("source_root"),
     baseRef: text("base_ref"),
     baseSha: text("base_sha"),
+    headSha: text("head_sha"),
+    branch: text("branch"),
     managed: text("managed").notNull().default("false"),
     createdAt: text("created_at").notNull(),
     lastUsedAt: text("last_used_at").notNull(),

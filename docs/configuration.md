@@ -37,7 +37,6 @@ npx @waishnav/devspace config set publicBaseUrl https://devspace.example.com
 | `DEVSPACE_ALLOWED_HOSTS` | Optional Host header allowlist override. |
 | `DEVSPACE_OAUTH_OWNER_TOKEN` | Owner password for OAuth approval when enrolled-PC authorization is disabled. Must be at least 16 characters. |
 | `DEVSPACE_DEVICE_AUTH` | Enables silent enrolled-PC OAuth authorization through a loopback signer. |
-| `DEVSPACE_WORKTREE_ROOT` | Directory for managed Git worktrees. Defaults to `~/.devspace/worktrees`. |
 | `DEVSPACE_STATE_DIR` | Directory for SQLite state. Defaults to `~/.local/share/devspace`. |
 
 ## OAuth
@@ -70,7 +69,9 @@ address, cookie, or browser fingerprint is used as the identity.
 
 When `DEVSPACE_DEVICE_AUTH_REQUIRED=1`, authorization requests outside the
 configured redirect prefixes are rejected, and access or refresh tokens issued
-without device proof are rejected. This is intentionally fail closed.
+without device proof are rejected. When it is `0`, the configured redirect
+prefixes still use the enrolled-PC proof, while other allowed OAuth callbacks
+use the normal Owner password approval flow.
 
 MCP clients discover metadata from:
 
@@ -145,7 +146,6 @@ previews in logs.
 DEVSPACE_OAUTH_OWNER_TOKEN="$(openssl rand -base64 32)" \
 DEVSPACE_ALLOWED_ROOTS="$HOME/personal,$HOME/work" \
 DEVSPACE_PUBLIC_BASE_URL="https://devspace.example.com" \
-DEVSPACE_WORKTREE_ROOT="$HOME/.devspace/worktrees" \
 DEVSPACE_TOOL_MODE="minimal" \
 DEVSPACE_TOOL_NAMING="short" \
 DEVSPACE_WIDGETS="full" \
@@ -154,3 +154,26 @@ npx @waishnav/devspace serve
 
 The environment assignments must be part of the same command invocation, or
 exported first.
+
+## Managed Worktrees
+
+DevSpace does not use a global worktree directory. Each managed worktree is
+created below the owning repository at:
+
+```text
+<repository>/.worktrees/devspace-<random-id>
+```
+
+Before worktree mode can be used, the repository-local Git exclude must ignore
+that directory. Add this line to the owning repository's common
+`.git/info/exclude` file:
+
+```text
+/.worktrees/
+```
+
+DevSpace fails closed when `.worktrees` is not ignored, resolves outside the
+repository through a symlink or Windows junction, or is already registered to a
+conflicting worktree. Use `close_workspace` to retire sessions. It removes clean
+managed worktrees through Git, refuses dirty worktrees, and requires explicit
+confirmation before pruning Git-validated stale metadata for a missing path.

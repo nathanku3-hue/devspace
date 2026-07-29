@@ -64,6 +64,12 @@ const OPEN_WORKSPACE_TOOL_ANNOTATIONS = {
   idempotentHint: false,
   openWorldHint: false,
 };
+const CLOSE_WORKSPACE_TOOL_ANNOTATIONS = {
+  readOnlyHint: false,
+  destructiveHint: true,
+  idempotentHint: false,
+  openWorldHint: false,
+};
 const REVIEW_TOOL_ANNOTATIONS = {
   readOnlyHint: true,
   destructiveHint: false,
@@ -166,6 +172,7 @@ function toolWidgetDescriptorMeta(
 
 interface ToolNames {
   openWorkspace: "open_workspace";
+  closeWorkspace: "close_workspace";
   read: "read_file" | "read";
   readBatch: "read_files";
   write: "write_file" | "write";
@@ -192,6 +199,7 @@ function toolNamesFor(config: ServerConfig): ToolNames {
   return config.toolNaming === "short"
     ? {
         openWorkspace: "open_workspace",
+        closeWorkspace: "close_workspace",
         read: "read",
         readBatch: "read_files",
         write: "write",
@@ -203,6 +211,7 @@ function toolNamesFor(config: ServerConfig): ToolNames {
       }
     : {
         openWorkspace: "open_workspace",
+        closeWorkspace: "close_workspace",
         read: "read_file",
         readBatch: "read_files",
         write: "write_file",
@@ -230,7 +239,7 @@ function serverInstructions(config: ServerConfig, toolNames: ToolNames): string 
       ? " After creating, editing, or overwriting files, call show_changes once after the related file changes are complete so the user can see the aggregate diff."
       : "";
 
-  return `Use DevSpace as a local coding workspace. Call ${toolNames.openWorkspace} once per project folder or worktree to obtain a workspaceId. Reuse that same workspaceId for all later file, search, edit, write, show-changes, shell, and Git publication tools in that folder; do not call ${toolNames.openWorkspace} again unless switching folders/worktrees, changing checkout/worktree mode, the workspaceId is rejected as unknown, or the user explicitly asks to reopen. ${agentsMd}${skills}${inspection}Batch known context reads with ${toolNames.readBatch} to reduce host approval prompts. Prefer ${toolNames.edit} for targeted modifications, ${toolNames.write} only for new files or complete rewrites, and ${toolNames.shell} for tests, builds, Git inspection, package scripts, and commands that are better executed by the shell. When the user explicitly requests a commit or push, use publish_git_changes with the existing workspaceId, a workingDirectory relative to the workspace root, and exact file paths. Do not construct /mnt paths, Windows absolute paths, or shell cd commands for workspace navigation; use the workingDirectory field. Do not use ${toolNames.shell} to edit working-tree contents or mutate the Git index, history, remotes, or branches. Avoid shell redirection, heredocs, tee, sed -i, perl -i, node/python/ruby scripts, generated scripts, or other commands whose purpose is to write project files. Use ${toolNames.edit} or ${toolNames.write} for content changes.${showChanges}`;
+  return `Use DevSpace as a local coding workspace. Call ${toolNames.openWorkspace} once per project folder or worktree to obtain a workspaceId. Reuse that same workspaceId for all later file, search, edit, write, show-changes, shell, and Git publication tools in that folder; do not call ${toolNames.openWorkspace} again unless switching folders/worktrees, changing checkout/worktree mode, the workspaceId is rejected as unknown, or the user explicitly asks to reopen. Close managed worktree sessions with ${toolNames.closeWorkspace}; it refuses dirty worktrees and removes clean worktrees through Git. ${agentsMd}${skills}${inspection}Batch known context reads with ${toolNames.readBatch} to reduce host approval prompts. Prefer ${toolNames.edit} for targeted modifications, ${toolNames.write} only for new files or complete rewrites, and ${toolNames.shell} for tests, builds, Git inspection, package scripts, and commands that are better executed by the shell. When the user explicitly requests a commit or push, use publish_git_changes with the existing workspaceId, a workingDirectory relative to the workspace root, and exact file paths. Do not construct /mnt paths, Windows absolute paths, or shell cd commands for workspace navigation; use the workingDirectory field. Do not use ${toolNames.shell} to edit working-tree contents or mutate the Git index, history, remotes, or branches. Avoid shell redirection, heredocs, tee, sed -i, perl -i, node/python/ruby scripts, generated scripts, or other commands whose purpose is to write project files. Use ${toolNames.edit} or ${toolNames.write} for content changes.${showChanges}`;
 }
 function resultOutputSchema(extra: z.ZodRawShape = {}): z.ZodRawShape {
   return {
@@ -538,7 +547,7 @@ function createMcpServer(
     {
       title: "Open workspace",
       description:
-        "Open a local project directory as a coding workspace. Call this once per project folder or worktree before reading, editing, searching, writing, showing changes, or running commands. Reuse the returned workspaceId for later calls in the same folder; do not call open_workspace again unless switching folders/worktrees, changing checkout/worktree mode, the workspaceId is rejected as unknown, or the user explicitly asks to reopen. By default this opens the actual checkout; set mode=\"worktree\" when the user asks for an isolated or parallel coding session. Returns a workspaceId, loaded root project instructions, and nested instruction file paths the model should read before working in those directories.",
+        "Open a local project directory as a coding workspace. Call this once per project folder or worktree before reading, editing, searching, writing, showing changes, or running commands. Reuse the returned workspaceId for later calls in the same folder; do not call open_workspace again unless switching folders/worktrees, changing checkout/worktree mode, the workspaceId is rejected as unknown, or the user explicitly asks to reopen. By default this opens the actual checkout. Worktree mode is detached by default; pass branch to attach an existing local branch, or pass branch with createBranch=true to create it from baseRef. Returns a workspaceId, loaded root project instructions, and nested instruction file paths the model should read before working in those directories.",
       inputSchema: {
         path: z
           .string()
@@ -554,7 +563,17 @@ function createMcpServer(
         baseRef: z
           .string()
           .optional()
-          .describe("Git ref to base a worktree on. Only used with mode=\"worktree\". Defaults to HEAD."),
+          .describe("Git ref to use for a detached worktree or as the starting point for a new branch. Only used with mode=\"worktree\". Defaults to HEAD."),
+        branch: z
+          .string()
+          .trim()
+          .min(1)
+          .optional()
+          .describe("Local branch to attach to the managed worktree, or to create when createBranch=true."),
+        createBranch: z
+          .boolean()
+          .optional()
+          .describe("Create branch from baseRef before attaching it. Requires branch. Defaults to false."),
       },
       outputSchema: {
         workspaceId: z.string(),
@@ -566,6 +585,7 @@ function createMcpServer(
             path: z.string(),
             baseRef: z.string(),
             baseSha: z.string(),
+            branch: z.string().optional(),
             dirtySource: z.boolean(),
             detached: z.boolean(),
             managed: z.boolean(),
@@ -580,9 +600,15 @@ function createMcpServer(
       ...toolWidgetDescriptorMeta(config, "workspace"),
       annotations: OPEN_WORKSPACE_TOOL_ANNOTATIONS,
     },
-    async ({ path, mode, baseRef }) => {
+    async ({ path, mode, baseRef, branch, createBranch }) => {
       const startedAt = performance.now();
-      const { workspace, agentsFiles, availableAgentsFiles } = await workspaces.openWorkspace({ path, mode, baseRef });
+      const { workspace, agentsFiles, availableAgentsFiles } = await workspaces.openWorkspace({
+        path,
+        mode,
+        baseRef,
+        branch,
+        createBranch,
+      });
       if (config.widgets === "changes") {
         void reviewCheckpoints.initializeWorkspace({
           workspaceId: workspace.id,
@@ -662,6 +688,64 @@ function createMcpServer(
           skillDiagnostics: workspace.skillDiagnostics,
           instruction,
         },
+      };
+    },
+  );
+
+  registerAppTool(
+    server,
+    toolNames.closeWorkspace,
+    {
+      title: "Close workspace",
+      description:
+        "Close a workspace session. Checkout sessions are retired without deleting files. Clean managed worktrees are removed through git worktree remove; dirty managed worktrees are refused. If a managed directory is already missing, stale Git metadata is pruned only when Git marks it prunable and pruneStaleMetadata=true is explicitly supplied.",
+      inputSchema: {
+        workspaceId: z
+          .string()
+          .describe("Workspace identifier returned by open_workspace."),
+        pruneStaleMetadata: z
+          .boolean()
+          .optional()
+          .describe("Explicitly allow pruning Git-validated stale metadata when the managed worktree directory is already missing. Defaults to false."),
+      },
+      outputSchema: {
+        workspaceId: z.string(),
+        root: z.string(),
+        sourceRoot: z.string().optional(),
+        mode: z.enum(["checkout", "worktree"]),
+        managed: z.boolean(),
+        removed: z.boolean(),
+        staleMetadataPruned: z.boolean(),
+        headSha: z.string().optional(),
+        branch: z.string().optional(),
+      },
+      _meta: {},
+      annotations: CLOSE_WORKSPACE_TOOL_ANNOTATIONS,
+    },
+    async ({ workspaceId, pruneStaleMetadata }) => {
+      const startedAt = performance.now();
+      const closed = await workspaces.closeWorkspace({ workspaceId, pruneStaleMetadata });
+      logToolCall(config, {
+        tool: toolNames.closeWorkspace,
+        workspaceId,
+        path: closed.root,
+        success: true,
+        durationMs: Math.round(performance.now() - startedAt),
+      });
+      return {
+        content: [
+          {
+            type: "text" as const,
+            text: [
+              `Closed workspace ${workspaceId}`,
+              `Root: ${closed.root}`,
+              `Mode: ${closed.mode}`,
+              closed.removed ? "Managed worktree removed through Git." : undefined,
+              closed.staleMetadataPruned ? "Validated stale Git worktree metadata pruned." : undefined,
+            ].filter(Boolean).join("\n"),
+          },
+        ],
+        structuredContent: { ...closed },
       };
     },
   );
@@ -898,7 +982,7 @@ function createMcpServer(
       const response = await writeFileTool(input, {
         cwd: workspace.root,
         root: workspace.root,
-        allowedRoots: config.allowedRoots,
+        allowedRoots: [workspace.root],
       });
 
       if (response.isError) {
@@ -986,7 +1070,7 @@ function createMcpServer(
       const response = await editFileTool(input, {
         cwd: workspace.root,
         root: workspace.root,
-        allowedRoots: config.allowedRoots,
+        allowedRoots: [workspace.root],
       });
 
       if (response.isError) {
@@ -1133,7 +1217,7 @@ function createMcpServer(
         const response = await grepFilesTool(input, {
           cwd: workspace.root,
           root: workspace.root,
-          allowedRoots: config.allowedRoots,
+          allowedRoots: [workspace.root],
         });
 
         if (response.isError) {
@@ -1204,7 +1288,7 @@ function createMcpServer(
         const response = await findFilesTool(input, {
           cwd: workspace.root,
           root: workspace.root,
-          allowedRoots: config.allowedRoots,
+          allowedRoots: [workspace.root],
         });
 
         if (response.isError) {
@@ -1275,7 +1359,7 @@ function createMcpServer(
         const response = await listDirectoryTool(input, {
           cwd: workspace.root,
           root: workspace.root,
-          allowedRoots: config.allowedRoots,
+          allowedRoots: [workspace.root],
         });
 
         if (response.isError) {
@@ -1382,7 +1466,7 @@ function createMcpServer(
         const result = await publishGitChanges({
           cwd,
           workspaceRoot: workspace.root,
-          allowedRoots: config.allowedRoots,
+          allowedRoots: [workspace.root],
           paths,
           message,
           remote,
@@ -1554,7 +1638,7 @@ function createMcpServer(
       const workspace = workspaces.getWorkspace(workspaceId);
 
       try {
-        await safeRenameFile([workspace.root, ...config.allowedRoots], sourcePath, targetPath);
+        await safeRenameFile(workspace.root, sourcePath, targetPath);
       } catch (err: unknown) {
         logFailedToolResponse(
           config,
@@ -1794,7 +1878,7 @@ if (await isMainModule()) {
     console.log(
       config.oauth.deviceAuthorization.required
         ? "auth: enrolled-PC device proof required"
-        : "auth: oauth owner-token flow required",
+        : "auth: enrolled-PC proof for configured callbacks; owner approval otherwise",
     );
     console.log(`logging: ${config.logging.level} ${config.logging.format}`);
     console.log(`request logging: ${config.logging.requests ? "enabled" : "disabled"}`);

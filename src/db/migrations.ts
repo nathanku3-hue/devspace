@@ -22,6 +22,16 @@ const migrations: Migration[] = [
     name: "oauth-device-bound-tokens",
     up: migrateOAuthDeviceBoundTokens,
   },
+  {
+    version: 4,
+    name: "workspace-branch-metadata",
+    up: migrateWorkspaceBranchMetadata,
+  },
+  {
+    version: 5,
+    name: "workspace-head-metadata",
+    up: migrateWorkspaceHeadMetadata,
+  },
 ];
 
 export function migrateDatabase(sqlite: Database.Database): void {
@@ -148,6 +158,14 @@ function migrateOAuthState(sqlite: Database.Database): void {
 function migrateOAuthDeviceBoundTokens(sqlite: Database.Database): void {
   addColumnIfMissing(sqlite, "oauth_access_tokens", "device_bound", "integer not null default 0");
   addColumnIfMissing(sqlite, "oauth_refresh_tokens", "device_bound", "integer not null default 0");
+}
+
+function migrateWorkspaceBranchMetadata(sqlite: Database.Database): void {
+  addColumnIfMissing(sqlite, "workspace_sessions", "branch", "text");
+}
+
+function migrateWorkspaceHeadMetadata(sqlite: Database.Database): void {
+  addColumnIfMissing(sqlite, "workspace_sessions", "head_sha", "text");
 }
 
 function addColumnIfMissing(

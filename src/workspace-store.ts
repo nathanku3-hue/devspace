@@ -15,6 +15,8 @@ export interface WorkspaceSession {
   sourceRoot?: string;
   baseRef?: string;
   baseSha?: string;
+  headSha?: string;
+  branch?: string;
   managed: boolean;
   createdAt: string;
   lastUsedAt: string;
@@ -28,10 +30,13 @@ export interface WorkspaceStore {
     sourceRoot?: string;
     baseRef?: string;
     baseSha?: string;
+    headSha?: string;
+    branch?: string;
     managed?: boolean;
   }): WorkspaceSession;
   getSession(id: string): WorkspaceSession | undefined;
   touchSession(id: string): void;
+  closeSession(id: string, headSha?: string): void;
   close?(): void;
 }
 
@@ -49,6 +54,8 @@ export class SqliteWorkspaceStore implements WorkspaceStore {
     sourceRoot?: string;
     baseRef?: string;
     baseSha?: string;
+    headSha?: string;
+    branch?: string;
     managed?: boolean;
   }): WorkspaceSession {
     const now = new Date().toISOString();
@@ -60,6 +67,8 @@ export class SqliteWorkspaceStore implements WorkspaceStore {
       sourceRoot: input.sourceRoot,
       baseRef: input.baseRef,
       baseSha: input.baseSha,
+      headSha: input.headSha ?? input.baseSha,
+      branch: input.branch,
       managed: input.managed ?? false,
       createdAt: now,
       lastUsedAt: now,
@@ -75,6 +84,8 @@ export class SqliteWorkspaceStore implements WorkspaceStore {
         sourceRoot: session.sourceRoot ?? null,
         baseRef: session.baseRef ?? null,
         baseSha: session.baseSha ?? null,
+        headSha: session.headSha ?? null,
+        branch: session.branch ?? null,
         managed: String(session.managed),
         createdAt: session.createdAt,
         lastUsedAt: session.lastUsedAt,
@@ -102,10 +113,23 @@ export class SqliteWorkspaceStore implements WorkspaceStore {
       .run();
   }
 
+  closeSession(id: string, headSha?: string): void {
+    const values: { status: string; lastUsedAt: string; headSha?: string } = {
+      status: "closed",
+      lastUsedAt: new Date().toISOString(),
+    };
+    if (headSha) values.headSha = headSha;
+
+    this.database.db
+      .update(workspaceSessions)
+      .set(values)
+      .where(eq(workspaceSessions.id, id))
+      .run();
+  }
+
   close(): void {
     this.database.close();
   }
-
 }
 
 export function createWorkspaceStore(stateDir: string): WorkspaceStore {
@@ -121,6 +145,8 @@ function rowToWorkspaceSession(row: WorkspaceSessionRow): WorkspaceSession {
     sourceRoot: row.sourceRoot ?? undefined,
     baseRef: row.baseRef ?? undefined,
     baseSha: row.baseSha ?? undefined,
+    headSha: row.headSha ?? undefined,
+    branch: row.branch ?? undefined,
     managed: row.managed === "true",
     createdAt: row.createdAt,
     lastUsedAt: row.lastUsedAt,

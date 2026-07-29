@@ -194,7 +194,7 @@ async function serve(): Promise<void> {
     console.log(
       config.oauth.deviceAuthorization.required
         ? "auth: enrolled-PC device proof required"
-        : "auth: Owner password approval required",
+        : "auth: enrolled-PC proof for configured callbacks; owner approval otherwise",
     );
     console.log(`logging: ${config.logging.level} ${config.logging.format}`);
   });

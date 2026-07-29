@@ -4,7 +4,7 @@ import { mkdir, opendir, stat } from "node:fs/promises";
 import { dirname, join, relative, resolve, sep } from "node:path";
 import { loadProjectContextFiles } from "@earendil-works/pi-coding-agent";
 import type { ServerConfig } from "./config.js";
-import { createManagedWorktree } from "./git-worktrees.js";
+import { createManagedWorktree, removeManagedWorktree } from "./git-worktrees.js";
 import { git } from "./git.js";
 import { assertAllowedPath, isPathInsideRoot, resolveAllowedPath } from "./roots.js";
 import {
@@ -28,6 +28,7 @@ export interface WorkspaceWorktree {
   path: string;
   baseRef: string;
   baseSha: string;
+  branch?: string;
   dirtySource: boolean;
   detached: boolean;
   managed: boolean;
@@ -60,6 +61,20 @@ export interface OpenWorkspaceInput {
   path: string;
   mode?: WorkspaceMode;
   baseRef?: string;
+  branch?: string;
+  createBranch?: boolean;
+}
+
+export interface ClosedWorkspace {
+  workspaceId: string;
+  root: string;
+  sourceRoot?: string;
+  mode: WorkspaceMode;
+  managed: boolean;
+  removed: boolean;
+  staleMetadataPruned: boolean;
+  headSha?: string;
+  branch?: string;
 }
 
 export class WorkspaceRegistry {
@@ -75,7 +90,12 @@ export class WorkspaceRegistry {
     const mode = options.mode ?? "checkout";
 
     if (mode === "worktree") {
-      return this.openWorktreeWorkspace(options.path, options.baseRef);
+      return this.openWorktreeWorkspace(
+        options.path,
+        options.baseRef,
+        options.branch,
+        options.createBranch,
+      );
     }
 
     return this.openCheckoutWorkspace(options.path);
@@ -89,8 +109,8 @@ export class WorkspaceRegistry {
     }
 
     const session = this.store?.getSession(workspaceId);
-    if (!session) {
-      throw new Error(`Unknown workspaceId: ${workspaceId}. Call open_workspace first.`);
+    if (!session || session.status !== "active") {
+      throw new Error(`Unknown or closed workspaceId: ${workspaceId}. Call open_workspace first.`);
     }
 
     const root = this.assertWorkspaceRootAllowed(session.root, session.mode, session.sourceRoot);
@@ -105,8 +125,9 @@ export class WorkspaceRegistry {
               path: root,
               baseRef: session.baseRef ?? "HEAD",
               baseSha: session.baseSha ?? "",
+              branch: session.branch,
               dirtySource: false,
-              detached: true,
+              detached: !session.branch,
               managed: session.managed,
             }
           : undefined,
@@ -119,10 +140,61 @@ export class WorkspaceRegistry {
     return restoredWorkspace;
   }
 
+  async closeWorkspace(input: {
+    workspaceId: string;
+    pruneStaleMetadata?: boolean;
+  }): Promise<ClosedWorkspace> {
+    const workspace = this.workspaces.get(input.workspaceId);
+    const session = this.store?.getSession(input.workspaceId);
+    if (!workspace && (!session || session.status !== "active")) {
+      throw new Error(`Unknown or closed workspaceId: ${input.workspaceId}. Call open_workspace first.`);
+    }
+
+    const root = workspace?.root ?? session!.root;
+    const mode = workspace?.mode ?? session!.mode;
+    const sourceRoot = workspace?.sourceRoot ?? session?.sourceRoot;
+    const managed = workspace?.worktree?.managed ?? session?.managed ?? false;
+    let removed = false;
+    let staleMetadataPruned = false;
+    let headSha = workspace?.worktree?.baseSha ?? session?.headSha ?? session?.baseSha;
+    let branch = workspace?.worktree?.branch ?? session?.branch;
+
+    if (mode === "worktree" && managed) {
+      if (!sourceRoot) {
+        throw new Error(`Managed worktree workspace is missing sourceRoot: ${input.workspaceId}`);
+      }
+      const result = await removeManagedWorktree({
+        sourceRoot,
+        worktreePath: root,
+        allowedRoots: this.config.allowedRoots,
+        pruneStaleMetadata: input.pruneStaleMetadata,
+      });
+      removed = result.removed;
+      staleMetadataPruned = result.staleMetadataPruned;
+      headSha = result.headSha ?? headSha;
+      branch = result.branch ?? branch;
+    }
+
+    this.workspaces.delete(input.workspaceId);
+    this.store?.closeSession(input.workspaceId, headSha);
+
+    return {
+      workspaceId: input.workspaceId,
+      root,
+      sourceRoot,
+      mode,
+      managed,
+      removed,
+      staleMetadataPruned,
+      headSha,
+      branch,
+    };
+  }
+
   resolvePath(workspace: Workspace, inputPath: string): string {
-    const absolutePath = resolveAllowedPath(inputPath, workspace.root, this.config.allowedRoots);
-    if (!this.config.allowedRoots.some((root) => isPathInsideRoot(absolutePath, root))) {
-      throw new Error(`Path is outside allowed roots: ${inputPath}`);
+    const absolutePath = resolveAllowedPath(inputPath, workspace.root, [workspace.root]);
+    if (!isPathInsideRoot(absolutePath, workspace.root)) {
+      throw new Error(`Path is outside workspace root: ${inputPath}`);
     }
 
     return absolutePath;
@@ -132,7 +204,7 @@ export class WorkspaceRegistry {
     try {
       return {
         absolutePath: this.resolvePath(workspace, inputPath),
-        readRoots: [workspace.root, ...this.config.allowedRoots],
+        readRoots: [workspace.root],
       };
     } catch (workspaceError) {
       const skillRead = resolveSkillReadPath(
@@ -144,7 +216,7 @@ export class WorkspaceRegistry {
 
       return {
         absolutePath: skillRead.absolutePath,
-        readRoots: [workspace.root, skillRead.skill.baseDir, ...this.config.allowedRoots],
+        readRoots: [workspace.root, skillRead.skill.baseDir],
         skillRead,
       };
     }
@@ -158,7 +230,7 @@ export class WorkspaceRegistry {
 
   resolveWorkingDirectory(workspace: Workspace, workingDirectory: string | undefined): string {
     const directory = workingDirectory ? this.resolvePath(workspace, workingDirectory) : workspace.root;
-    return assertAllowedPath(directory, this.config.allowedRoots);
+    return assertAllowedPath(directory, [workspace.root]);
   }
 
   private async openCheckoutWorkspace(path: string): Promise<WorkspaceContext> {
@@ -173,10 +245,17 @@ export class WorkspaceRegistry {
     return this.createWorkspaceContext({ root, mode: "checkout" });
   }
 
-  private async openWorktreeWorkspace(path: string, baseRef: string | undefined): Promise<WorkspaceContext> {
+  private async openWorktreeWorkspace(
+    path: string,
+    baseRef: string | undefined,
+    branch: string | undefined,
+    createBranch: boolean | undefined,
+  ): Promise<WorkspaceContext> {
     const worktree = await createManagedWorktree({
       sourcePath: path,
       baseRef,
+      branch,
+      createBranch,
       config: this.config,
     });
 
@@ -211,6 +290,8 @@ export class WorkspaceRegistry {
       sourceRoot: workspace.sourceRoot,
       baseRef: workspace.worktree?.baseRef,
       baseSha: workspace.worktree?.baseSha,
+      headSha: workspace.worktree?.baseSha,
+      branch: workspace.worktree?.branch,
       managed: workspace.worktree?.managed,
     });
     this.workspaces.set(workspace.id, workspace);
@@ -234,7 +315,7 @@ export class WorkspaceRegistry {
         throw new Error(`Stored worktree workspace is missing sourceRoot: ${root}`);
       }
       assertAllowedPath(sourceRoot, this.config.allowedRoots);
-      return assertAllowedPath(root, [this.config.worktreeRoot]);
+      return assertAllowedPath(root, [join(sourceRoot, ".worktrees")]);
     }
 
     return assertAllowedPath(root, this.config.allowedRoots);

@@ -26,11 +26,30 @@ if (!(Test-Path $cliPath) -or !(Test-Path $serverPath)) {
     exit 1
 }
 
-if (!(Select-String -Path $serverPath -Pattern 'publish_git_changes' -SimpleMatch -Quiet)) {
-    Write-Error "Built DevSpace server does not expose publish_git_changes. Refusing to start a Git-inspection-only tool surface."
+$expectedTools = @(
+    "bash",
+    "close_workspace",
+    "edit",
+    "open_workspace",
+    "publish_git_changes",
+    "read",
+    "read_files",
+    "safe_rename_file",
+    "write"
+)
+$missingToolMarkers = @()
+foreach ($toolName in $expectedTools) {
+    $quotedPattern = '"' + [regex]::Escape($toolName) + '"'
+    if (!(Select-String -Path $serverPath -Pattern $quotedPattern -Quiet)) {
+        $missingToolMarkers += $toolName
+    }
+}
+if ($missingToolMarkers.Count -gt 0) {
+    Write-Error "Built DevSpace server is missing expected MCP tool markers: $($missingToolMarkers -join ', '). Refusing to start."
     exit 1
 }
-Write-Host "Verified built MCP tool: publish_git_changes"
+Write-Host "Verified built MCP tool markers: $($expectedTools.Count)/$($expectedTools.Count)"
+Write-Host "Live authenticated tools/list checks remain authoritative and run after startup."
 
 $ghCommand = Get-Command gh.exe -ErrorAction SilentlyContinue
 if ($null -eq $ghCommand) {

@@ -47,18 +47,64 @@ Use worktree mode for isolated parallel work:
 }
 ```
 
-Managed worktrees are created under:
+Managed worktrees are created under the owning repository:
 
 ```text
-~/.devspace/worktrees
+<owning-repository>/.worktrees/devspace-<random-id>
 ```
 
-Worktree mode requires a Git repository with at least one commit. It starts from
-`HEAD` unless `baseRef` is provided.
+Worktree mode requires a Git repository with at least one commit. With no branch
+options, it creates a detached worktree from `HEAD` or `baseRef`.
+
+Attach an existing local branch:
+
+```json
+{
+  "path": "~/work/my-project",
+  "mode": "worktree",
+  "branch": "feature/existing"
+}
+```
+
+Create and attach a new branch from `HEAD` or `baseRef`:
+
+```json
+{
+  "path": "~/work/my-project",
+  "mode": "worktree",
+  "baseRef": "origin/main",
+  "branch": "feature/new-slice",
+  "createBranch": true
+}
+```
+
+Managed worktrees are repository-local:
+
+```text
+<owning-repository>/.worktrees/devspace-<random-id>
+```
+
+DevSpace resolves the owning repository even when the supplied path is inside an
+existing linked worktree. The owning repository's `.git/info/exclude` must
+contain `/.worktrees/`; creation fails closed otherwise. Symlink and Windows
+junction escapes are rejected after canonical path resolution.
 
 Uncommitted source checkout changes are not copied into the managed worktree.
 DevSpace reports when the source checkout was dirty so the model can decide how
 to proceed with the user.
+
+Close a session when the isolated task is complete:
+
+```json
+{
+  "workspaceId": "ws_example"
+}
+```
+
+`close_workspace` removes clean managed worktrees through `git worktree remove`.
+It refuses dirty worktrees. If the directory is already missing, stale metadata
+is pruned only when Git marks it prunable and the caller explicitly supplies
+`"pruneStaleMetadata": true`.
 
 ## Project Instructions
 

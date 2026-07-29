@@ -16,7 +16,6 @@ export interface DevspaceUserConfig {
   publicBaseUrl?: string | null;
   allowedHosts?: string[];
   stateDir?: string;
-  worktreeRoot?: string;
   agentDir?: string;
 }
 
