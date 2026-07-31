@@ -9,6 +9,7 @@ import { chromium, type Browser } from "playwright-core";
 import {
   chatGptConversationIdentityFromUrl,
   findExactlyOneComposer,
+  injectAndSubmitPrompt,
   insertAndVerifyPrompt,
   readComposerText,
   resolveWebLaunchProfilePath,
@@ -24,11 +25,16 @@ const fixtureHtml = `
   <body>
     <main>
       <textarea aria-label="Prompt"></textarea>
-      <button data-testid="send-button">Send</button>
+      <button data-testid="send-button" disabled>Send</button>
     </main>
     <script>
       const composer = document.querySelector('textarea');
       const send = document.querySelector('button');
+      composer.addEventListener('input', () => {
+        setTimeout(() => {
+          send.disabled = false;
+        }, 50);
+      });
       send.addEventListener('click', () => {
         const conversationId = 'fixture-conversation-' + crypto.randomUUID().replaceAll('-', '');
         document.body.dataset.submitted = composer.value;
@@ -131,6 +137,246 @@ test("composer adapter collapses nested layers and uses native insertion without
     assert.ok(Number(await page.evaluate(() => document.body.dataset.inputCount ?? "0")) >= 2);
     assert.equal(await page.evaluate(() => document.body.dataset.enterCount ?? "0"), "0");
     assert.equal(await page.evaluate(() => document.body.dataset.submitCount ?? "0"), "0");
+    await page.close();
+  } finally {
+    await browser.close();
+  }
+});
+
+test("send readiness waits for asynchronous enablement before one click", async () => {
+  const browser = await launchInstalledChrome();
+  try {
+    const page = await browser.newPage();
+    await page.setContent(`
+      <main>
+        <form>
+          <textarea id="prompt-textarea"></textarea>
+          <button type="button" data-testid="send-button" aria-label="Submit" disabled>→</button>
+        </form>
+      </main>
+      <script>
+        const composer = document.querySelector('#prompt-textarea');
+        const send = document.querySelector('[data-testid="send-button"]');
+        composer.addEventListener('input', () => {
+          setTimeout(() => {
+            send.disabled = false;
+          }, 75);
+        });
+        send.addEventListener('click', () => {
+          document.body.dataset.submitCount = String(Number(document.body.dataset.submitCount || '0') + 1);
+          document.body.dataset.submitted = composer.value;
+          composer.value = '';
+          send.disabled = true;
+        });
+      </script>
+    `);
+
+    await injectAndSubmitPrompt(page, "asynchronous readiness", { sendReadyTimeoutMs: 1_000 });
+    assert.equal(await page.evaluate(() => document.body.dataset.submitCount), "1");
+    assert.equal(await page.evaluate(() => document.body.dataset.submitted), "asynchronous readiness");
+    await page.close();
+  } finally {
+    await browser.close();
+  }
+});
+
+test("exact aria-label Send is a supported associated control", async () => {
+  const browser = await launchInstalledChrome();
+  try {
+    const page = await browser.newPage();
+    await page.setContent(`
+      <main>
+        <form>
+          <textarea id="prompt-textarea"></textarea>
+          <button type="button" aria-label="Send">→</button>
+        </form>
+      </main>
+      <script>
+        const composer = document.querySelector('#prompt-textarea');
+        const send = document.querySelector('button');
+        send.addEventListener('click', () => {
+          document.body.dataset.submitCount = String(Number(document.body.dataset.submitCount || '0') + 1);
+          composer.value = '';
+          send.disabled = true;
+        });
+      </script>
+    `);
+
+    await injectAndSubmitPrompt(page, "exact send label", { sendReadyTimeoutMs: 250 });
+    assert.equal(await page.evaluate(() => document.body.dataset.submitCount), "1");
+    await page.close();
+  } finally {
+    await browser.close();
+  }
+});
+
+test("form-scoped submit fallback ignores an unrelated page submit button", async () => {
+  const browser = await launchInstalledChrome();
+  try {
+    const page = await browser.newPage();
+    await page.setContent(`
+      <form id="unrelated-form">
+        <button id="unrelated-submit" type="submit">Save settings</button>
+      </form>
+      <main>
+        <form id="composer-form">
+          <textarea id="prompt-textarea"></textarea>
+          <button id="composer-submit" type="submit">Launch</button>
+        </form>
+      </main>
+      <script>
+        const composer = document.querySelector('#prompt-textarea');
+        const localForm = document.querySelector('#composer-form');
+        const localSend = document.querySelector('#composer-submit');
+        document.querySelector('#unrelated-form').addEventListener('submit', (event) => {
+          event.preventDefault();
+          document.body.dataset.unrelatedSubmitCount = String(Number(document.body.dataset.unrelatedSubmitCount || '0') + 1);
+        });
+        localForm.addEventListener('submit', (event) => event.preventDefault());
+        localSend.addEventListener('click', () => {
+          document.body.dataset.localSubmitCount = String(Number(document.body.dataset.localSubmitCount || '0') + 1);
+          document.body.dataset.submitted = composer.value;
+          composer.value = '';
+          localSend.disabled = true;
+        });
+      </script>
+    `);
+
+    await injectAndSubmitPrompt(page, "form scoped", { sendReadyTimeoutMs: 250 });
+    assert.equal(await page.evaluate(() => document.body.dataset.localSubmitCount), "1");
+    assert.equal(await page.evaluate(() => document.body.dataset.unrelatedSubmitCount), undefined);
+    assert.equal(await page.evaluate(() => document.body.dataset.submitted), "form scoped");
+    await page.close();
+  } finally {
+    await browser.close();
+  }
+});
+
+test("send diagnostics distinguish missing, hidden, and disabled controls", async () => {
+  const browser = await launchInstalledChrome();
+  try {
+    const page = await browser.newPage();
+
+    await page.setContent('<main><form><textarea id="prompt-textarea"></textarea></form></main>');
+    await assert.rejects(
+      injectAndSubmitPrompt(page, "missing", { sendReadyTimeoutMs: 25 }),
+      (error: unknown) => {
+        assert.ok(error instanceof WebLaunchBrowserError);
+        assert.match(error.message, /state=missing/);
+        assert.match(error.message, /testid=0/);
+        assert.match(error.message, /visible=0 enabled=0/);
+        assert.match(error.message, /associatedForm=true/);
+        return true;
+      },
+    );
+
+    await page.setContent(`
+      <main><form><textarea id="prompt-textarea"></textarea><button data-testid="send-button" aria-label="Submit" style="display:none">→</button></form></main>
+    `);
+    await assert.rejects(
+      injectAndSubmitPrompt(page, "hidden", { sendReadyTimeoutMs: 25 }),
+      (error: unknown) => {
+        assert.ok(error instanceof WebLaunchBrowserError);
+        assert.match(error.message, /state=hidden/);
+        assert.match(error.message, /testid=1/);
+        assert.match(error.message, /visible=0 enabled=0/);
+        return true;
+      },
+    );
+
+    await page.setContent(`
+      <main><form><textarea id="prompt-textarea"></textarea><button data-testid="send-button" aria-label="Submit" disabled>→</button></form></main>
+    `);
+    const sensitivePrompt = "private Unicode 測試";
+    await assert.rejects(
+      injectAndSubmitPrompt(page, sensitivePrompt, { sendReadyTimeoutMs: 25 }),
+      (error: unknown) => {
+        assert.ok(error instanceof WebLaunchBrowserError);
+        assert.match(error.message, /state=disabled/);
+        assert.match(error.message, /testid=1/);
+        assert.match(error.message, /visible=1 enabled=0/);
+        assert.doesNotMatch(error.message, new RegExp(sensitivePrompt));
+        return true;
+      },
+    );
+    await page.close();
+  } finally {
+    await browser.close();
+  }
+});
+
+test("two equally credible associated send controls fail closed", async () => {
+  const browser = await launchInstalledChrome();
+  try {
+    const page = await browser.newPage();
+    await page.setContent(`
+      <main>
+        <form>
+          <textarea id="prompt-textarea"></textarea>
+          <button type="button" aria-label="Send">one</button>
+          <button type="button" aria-label="Send prompt">two</button>
+        </form>
+      </main>
+    `);
+
+    await assert.rejects(
+      injectAndSubmitPrompt(page, "ambiguous", { sendReadyTimeoutMs: 25 }),
+      (error: unknown) => {
+        assert.ok(error instanceof WebLaunchBrowserError);
+        assert.match(error.message, /state=ambiguous/);
+        assert.match(error.message, /semantic=2/);
+        assert.match(error.message, /rank=semantic visible=2 enabled=2/);
+        return true;
+      },
+    );
+    await page.close();
+  } finally {
+    await browser.close();
+  }
+});
+
+test("disabled application state triggers one native reactivation with exact multiline Unicode", async () => {
+  const browser = await launchInstalledChrome();
+  try {
+    const page = await browser.newPage();
+    await page.setContent(`
+      <main>
+        <form>
+          <textarea id="prompt-textarea"></textarea>
+          <button type="button" data-testid="send-button" aria-label="Submit" disabled>→</button>
+        </form>
+      </main>
+      <script>
+        const composer = document.querySelector('#prompt-textarea');
+        const send = document.querySelector('[data-testid="send-button"]');
+        let nativeClearSeen = false;
+        composer.addEventListener('keydown', (event) => {
+          if (event.key === 'Backspace') {
+            nativeClearSeen = true;
+            document.body.dataset.reactivationCount = String(Number(document.body.dataset.reactivationCount || '0') + 1);
+          }
+          if (event.key === 'Enter') {
+            document.body.dataset.enterCount = String(Number(document.body.dataset.enterCount || '0') + 1);
+          }
+        });
+        composer.addEventListener('input', () => {
+          if (nativeClearSeen && composer.value.length > 0) send.disabled = false;
+        });
+        send.addEventListener('click', () => {
+          document.body.dataset.submitCount = String(Number(document.body.dataset.submitCount || '0') + 1);
+          document.body.dataset.submitted = composer.value;
+          composer.value = '';
+          send.disabled = true;
+        });
+      </script>
+    `);
+
+    const prompt = "  First line\nUnicode=測試🚀\nLast  ";
+    await injectAndSubmitPrompt(page, prompt, { sendReadyTimeoutMs: 50 });
+    assert.equal(await page.evaluate(() => document.body.dataset.reactivationCount), "1");
+    assert.equal(await page.evaluate(() => document.body.dataset.enterCount), undefined);
+    assert.equal(await page.evaluate(() => document.body.dataset.submitCount), "1");
+    assert.equal(await page.evaluate(() => document.body.dataset.submitted), prompt);
     await page.close();
   } finally {
     await browser.close();

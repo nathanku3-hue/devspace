@@ -24,12 +24,19 @@ const COMPOSER_SELECTORS = [
   'main [contenteditable="true"]',
 ] as const;
 const COMPOSER_SELECTOR = COMPOSER_SELECTORS.join(", ");
-const SEND_SELECTOR = [
-  'button[data-testid="send-button"]',
+const SEND_ACCESSIBLE_NAME = /^Send(?: prompt| message)?$/i;
+const SEND_TESTID_SELECTOR = 'button[data-testid="send-button"]';
+const SEND_LABEL_SELECTOR = [
+  'button[aria-label="Send"]',
   'button[aria-label="Send prompt"]',
   'button[aria-label="Send message"]',
-  'button[aria-label^="Send"]',
 ].join(", ");
+const SEND_ASSOCIATION_SELECTOR = [
+  SEND_TESTID_SELECTOR,
+  SEND_LABEL_SELECTOR,
+  'button[type="submit"]',
+].join(", ");
+const SEND_READY_TIMEOUT_MS = 5_000;
 const STOP_SELECTOR = [
   'button[data-testid="stop-button"]',
   'button[aria-label^="Stop"]',
@@ -51,6 +58,31 @@ interface BrowserProfileLease {
 export interface WebLaunchBrowserOptions {
   contextFactory?: () => Promise<BrowserContext>;
   now?: () => Date;
+}
+
+export interface InjectAndSubmitPromptOptions {
+  sendReadyTimeoutMs?: number;
+}
+
+type SendControlRank = "semantic" | "testid" | "label" | "submit" | "none";
+
+interface InspectedSendGroup {
+  rank: Exclude<SendControlRank, "none">;
+  matched: number;
+  visible: Locator[];
+  enabled: Locator[];
+}
+
+interface SendControlSnapshot {
+  associatedForm: boolean;
+  semantic: number;
+  testid: number;
+  label: number;
+  submit: number;
+  selectedRank: SendControlRank;
+  visible: number;
+  enabled: number;
+  enabledCandidates: Locator[];
 }
 
 export class WebLaunchBrowserError extends Error {
@@ -186,10 +218,19 @@ async function claimLaunchPage(context: BrowserContext): Promise<Page> {
   return context.pages().find((page) => isReusableSeedPage(page.url())) ?? context.newPage();
 }
 
-export async function injectAndSubmitPrompt(page: Page, prompt: string): Promise<void> {
+export async function injectAndSubmitPrompt(
+  page: Page,
+  prompt: string,
+  options: InjectAndSubmitPromptOptions = {},
+): Promise<void> {
   const composer = await findExactlyOneComposer(page);
   await insertAndVerifyPrompt(composer, prompt);
-  await submitPrompt(page, composer, prompt);
+  await submitPrompt(
+    page,
+    composer,
+    prompt,
+    options.sendReadyTimeoutMs ?? SEND_READY_TIMEOUT_MS,
+  );
 }
 
 export async function waitForChatGptConversationIdentity(
@@ -253,23 +294,7 @@ export async function insertAndVerifyPrompt(composer: Locator, text: string): Pr
   }
 
   try {
-    await composer.click({ timeout: 5_000 });
-    const isTextControl = await composer.evaluate(
-      (element) => element instanceof HTMLTextAreaElement || element instanceof HTMLInputElement,
-    );
-    if (isTextControl) {
-      await composer.press("ControlOrMeta+A");
-    } else {
-      await composer.evaluate((element) => {
-        const selection = window.getSelection();
-        const range = document.createRange();
-        range.selectNodeContents(element);
-        selection?.removeAllRanges();
-        selection?.addRange(range);
-      });
-    }
-    await composer.press("Backspace");
-    await composer.page().keyboard.insertText(text);
+    await replacePromptWithNativeEvents(composer, text);
     if (normalizeText(await readComposerText(composer)) !== normalizeText(text)) {
       throw new Error("composer read-back did not match the requested prompt");
     }
@@ -278,19 +303,36 @@ export async function insertAndVerifyPrompt(composer: Locator, text: string): Pr
   }
 }
 
-async function submitPrompt(page: Page, composer: Locator, expected: string): Promise<void> {
+async function submitPrompt(
+  page: Page,
+  composer: Locator,
+  expected: string,
+  sendReadyTimeoutMs: number,
+): Promise<void> {
   if (normalizeText(await readComposerText(composer)) !== normalizeText(expected)) {
     throw new WebLaunchBrowserError("prompt changed before submission");
   }
 
-  const sendControls = await credibleLocators(page.locator(SEND_SELECTOR), true);
-  if (sendControls.length !== 1) {
-    throw new WebLaunchBrowserError(
-      `expected one enabled send control, found ${sendControls.length}`,
-    );
+  let readiness = await waitForAssociatedSendControl(page, composer, sendReadyTimeoutMs);
+  if (!readiness.send && shouldReactivatePrompt(readiness.snapshot)) {
+    try {
+      await replacePromptWithNativeEvents(composer, expected);
+      if (normalizeText(await readComposerText(composer)) !== normalizeText(expected)) {
+        throw new Error("composer read-back did not match after native reactivation");
+      }
+    } catch (error) {
+      throw new WebLaunchBrowserError("unable to reactivate prompt application state", {
+        cause: error,
+      });
+    }
+    readiness = await waitForAssociatedSendControl(page, composer, sendReadyTimeoutMs);
   }
 
-  const send = sendControls[0]!;
+  if (!readiness.send) {
+    throw new WebLaunchBrowserError(formatSendControlFailure(readiness.snapshot));
+  }
+
+  const send = readiness.send;
   const stopWasVisible = (await credibleLocators(page.locator(STOP_SELECTOR))).length > 0;
   await send.click({ timeout: 5_000 });
 
@@ -311,6 +353,152 @@ async function submitPrompt(page: Page, composer: Locator, expected: string): Pr
   }
 
   throw new WebLaunchBrowserError("prompt submission was not confirmed");
+}
+
+async function replacePromptWithNativeEvents(composer: Locator, text: string): Promise<void> {
+  await composer.click({ timeout: 5_000 });
+  const isTextControl = await composer.evaluate(
+    (element) => element instanceof HTMLTextAreaElement || element instanceof HTMLInputElement,
+  );
+  if (isTextControl) {
+    await composer.press("ControlOrMeta+A");
+  } else {
+    await composer.evaluate((element) => {
+      const selection = window.getSelection();
+      const range = document.createRange();
+      range.selectNodeContents(element);
+      selection?.removeAllRanges();
+      selection?.addRange(range);
+    });
+  }
+  await composer.press("Backspace");
+  await composer.page().keyboard.insertText(text);
+}
+
+async function waitForAssociatedSendControl(
+  page: Page,
+  composer: Locator,
+  timeoutMs: number,
+): Promise<{ send?: Locator; snapshot: SendControlSnapshot }> {
+  const deadline = Date.now() + Math.max(0, timeoutMs);
+  let snapshot = await inspectAssociatedSendControls(composer);
+  while (true) {
+    if (
+      snapshot.visible === 1 &&
+      snapshot.enabled === 1 &&
+      snapshot.enabledCandidates.length === 1
+    ) {
+      return { send: snapshot.enabledCandidates[0], snapshot };
+    }
+    if (Date.now() >= deadline) return { snapshot };
+    await page.waitForTimeout(Math.min(100, Math.max(1, deadline - Date.now())));
+    snapshot = await inspectAssociatedSendControls(composer);
+  }
+}
+
+async function inspectAssociatedSendControls(composer: Locator): Promise<SendControlSnapshot> {
+  const { container, associatedForm } = await composerAssociatedContainer(composer);
+  const groups: Array<{
+    rank: Exclude<SendControlRank, "none">;
+    locator: Locator;
+  }> = [
+    {
+      rank: "semantic",
+      locator: container.getByRole("button", {
+        name: SEND_ACCESSIBLE_NAME,
+        includeHidden: true,
+      }),
+    },
+    { rank: "testid", locator: container.locator(SEND_TESTID_SELECTOR) },
+    { rank: "label", locator: container.locator(SEND_LABEL_SELECTOR) },
+  ];
+  if (associatedForm) {
+    groups.push({ rank: "submit", locator: container.locator('button[type="submit"]') });
+  }
+
+  const inspected = await Promise.all(
+    groups.map(async ({ rank, locator }): Promise<InspectedSendGroup> => {
+      const candidates = await locator.all();
+      const visible: Locator[] = [];
+      const enabled: Locator[] = [];
+      for (const candidate of candidates) {
+        try {
+          if (!(await candidate.isVisible())) continue;
+          visible.push(candidate);
+          if (await candidate.isEnabled()) enabled.push(candidate);
+        } catch {
+          // Ignore detached controls and inspect a fresh snapshot on the next poll.
+        }
+      }
+      return { rank, matched: candidates.length, visible, enabled };
+    }),
+  );
+
+  const selected =
+    inspected.find((group) => group.visible.length > 0) ??
+    inspected.find((group) => group.matched > 0);
+  const byRank = new Map(inspected.map((group) => [group.rank, group]));
+  return {
+    associatedForm,
+    semantic: byRank.get("semantic")?.matched ?? 0,
+    testid: byRank.get("testid")?.matched ?? 0,
+    label: byRank.get("label")?.matched ?? 0,
+    submit: byRank.get("submit")?.matched ?? 0,
+    selectedRank: selected?.rank ?? "none",
+    visible: selected?.visible.length ?? 0,
+    enabled: selected?.enabled.length ?? 0,
+    enabledCandidates: selected?.enabled ?? [],
+  };
+}
+
+async function composerAssociatedContainer(
+  composer: Locator,
+): Promise<{ container: Locator; associatedForm: boolean }> {
+  const form = composer.locator("xpath=ancestor::form[1]");
+  if ((await form.count()) === 1) return { container: form, associatedForm: true };
+
+  const roleForm = composer.locator("xpath=ancestor::*[@role='form'][1]");
+  if ((await roleForm.count()) === 1) return { container: roleForm, associatedForm: false };
+
+  const namedComposer = composer.locator(
+    "xpath=ancestor::*[contains(@data-testid, 'composer')][1]",
+  );
+  if ((await namedComposer.count()) === 1) {
+    return { container: namedComposer, associatedForm: false };
+  }
+
+  const parent = composer.locator("xpath=parent::*");
+  if ((await parent.count()) === 1) return { container: parent, associatedForm: false };
+  throw new WebLaunchBrowserError("unable to resolve composer-associated send container");
+}
+
+function shouldReactivatePrompt(snapshot: SendControlSnapshot): boolean {
+  return snapshot.selectedRank !== "none" && snapshot.visible === 1 && snapshot.enabled === 0;
+}
+
+function formatSendControlFailure(snapshot: SendControlSnapshot): string {
+  const totalMatched = snapshot.semantic + snapshot.testid + snapshot.label + snapshot.submit;
+  const state =
+    totalMatched === 0
+      ? "missing"
+      : snapshot.visible === 0
+        ? "hidden"
+        : snapshot.visible > 1 || snapshot.enabled > 1
+          ? "ambiguous"
+          : snapshot.enabled === 0
+            ? "disabled"
+            : "not-ready";
+  return [
+    `send control not ready: state=${state}`,
+    `semantic=${snapshot.semantic}`,
+    `testid=${snapshot.testid}`,
+    `label=${snapshot.label}`,
+    `submit=${snapshot.submit}`,
+    `rank=${snapshot.selectedRank}`,
+    `visible=${snapshot.visible}`,
+    `enabled=${snapshot.enabled}`,
+    `associatedForm=${snapshot.associatedForm}`,
+  ].join(" ");
 }
 
 async function rankedComposerLocators(page: Page): Promise<Locator[]> {
@@ -344,7 +532,7 @@ async function rankedComposerLocators(page: Page): Promise<Locator[]> {
         };
       });
     },
-    { selectors: [...COMPOSER_SELECTORS], sendSelector: SEND_SELECTOR },
+    { selectors: [...COMPOSER_SELECTORS], sendSelector: SEND_ASSOCIATION_SELECTOR },
   );
 
   const credibleIndices = new Set<number>();
