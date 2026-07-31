@@ -37,6 +37,8 @@ const SEND_ASSOCIATION_SELECTOR = [
   'button[type="submit"]',
 ].join(", ");
 const SEND_READY_TIMEOUT_MS = 5_000;
+const PROMPT_READBACK_TIMEOUT_MS = 750;
+const PROMPT_READBACK_POLL_MS = 50;
 const STOP_SELECTOR = [
   'button[data-testid="stop-button"]',
   'button[aria-label^="Stop"]',
@@ -285,22 +287,125 @@ export async function findExactlyOneComposer(page: Page, timeoutMs = 20_000): Pr
   throw new WebLaunchBrowserError("no credible ChatGPT composer was found");
 }
 
+type PromptInsertionStatus = "exact" | "readback-mismatch" | "error" | "detached";
+
+interface PromptReadbackResult {
+  actual: string;
+  detached: boolean;
+  exact: boolean;
+}
+
 export async function insertAndVerifyPrompt(composer: Locator, text: string): Promise<void> {
+  const expected = normalizeText(text);
+  const editor = await composerEditorType(composer);
+  let fillFailed = false;
   try {
     await composer.fill(text, { timeout: 10_000 });
-    if (normalizeText(await readComposerText(composer)) === normalizeText(text)) return;
   } catch {
-    // Rich editors can accept fill() without updating their internal document.
+    fillFailed = true;
   }
 
+  const fillReadback = await waitForPromptReadback(composer, expected);
+  const fillStatus = promptInsertionStatus(fillReadback, fillFailed);
+  if (fillReadback.exact) return;
+
+  let nativeFailed = false;
   try {
     await replacePromptWithNativeEvents(composer, text);
-    if (normalizeText(await readComposerText(composer)) !== normalizeText(text)) {
-      throw new Error("composer read-back did not match the requested prompt");
-    }
-  } catch (error) {
-    throw new WebLaunchBrowserError("unable to insert and verify prompt", { cause: error });
+  } catch {
+    nativeFailed = true;
   }
+
+  const nativeReadback = await waitForPromptReadback(composer, expected);
+  const nativeStatus = promptInsertionStatus(nativeReadback, nativeFailed);
+  if (nativeReadback.exact) return;
+
+  throw new WebLaunchBrowserError(
+    formatPromptInsertionFailure({
+      editor,
+      fillStatus,
+      nativeStatus,
+      expected,
+      actual: nativeReadback.actual,
+      detached: fillReadback.detached || nativeReadback.detached,
+    }),
+  );
+}
+
+async function waitForPromptReadback(
+  composer: Locator,
+  expected: string,
+): Promise<PromptReadbackResult> {
+  const deadline = Date.now() + PROMPT_READBACK_TIMEOUT_MS;
+  let actual = "";
+  while (true) {
+    try {
+      actual = normalizeText(await readComposerText(composer));
+      if (actual === expected) return { actual, detached: false, exact: true };
+    } catch {
+      return { actual, detached: true, exact: false };
+    }
+    if (Date.now() >= deadline) return { actual, detached: false, exact: false };
+    await composer.page().waitForTimeout(
+      Math.min(PROMPT_READBACK_POLL_MS, Math.max(1, deadline - Date.now())),
+    );
+  }
+}
+
+function promptInsertionStatus(
+  readback: PromptReadbackResult,
+  operationFailed: boolean,
+): PromptInsertionStatus {
+  if (readback.exact) return "exact";
+  if (readback.detached) return "detached";
+  return operationFailed ? "error" : "readback-mismatch";
+}
+
+async function composerEditorType(composer: Locator): Promise<string> {
+  try {
+    return await composer.evaluate((element) => {
+      if (element instanceof HTMLTextAreaElement) return "textarea";
+      if (element instanceof HTMLInputElement) return "input";
+      if (element instanceof HTMLElement && element.getAttribute("contenteditable") === "true") {
+        return "contenteditable";
+      }
+      return element.tagName.toLowerCase();
+    });
+  } catch {
+    return "detached";
+  }
+}
+
+function formatPromptInsertionFailure({
+  editor,
+  fillStatus,
+  nativeStatus,
+  expected,
+  actual,
+  detached,
+}: {
+  editor: string;
+  fillStatus: PromptInsertionStatus;
+  nativeStatus: PromptInsertionStatus;
+  expected: string;
+  actual: string;
+  detached: boolean;
+}): string {
+  return [
+    "prompt insertion failed:",
+    `editor=${editor}`,
+    `fill=${fillStatus}`,
+    `native=${nativeStatus}`,
+    `expectedLength=${expected.length}`,
+    `actualLength=${actual.length}`,
+    `expectedNewlines=${newlineCount(expected)}`,
+    `actualNewlines=${newlineCount(actual)}`,
+    `detached=${detached}`,
+  ].join("\n");
+}
+
+function newlineCount(value: string): number {
+  return value.split("\n").length - 1;
 }
 
 async function submitPrompt(

@@ -143,6 +143,51 @@ test("composer adapter collapses nested layers and uses native insertion without
   }
 });
 
+test("live fallback textarea waits for delayed fill read-back without native fallback", async () => {
+  const browser = await launchInstalledChrome();
+  try {
+    const page = await browser.newPage();
+    await page.setContent(`
+      <main>
+        <form>
+          <textarea class="wcDTda_fallbackTextarea">existing draft</textarea>
+          <button type="button" aria-label="Send">Send</button>
+        </form>
+      </main>
+      <script>
+        const composer = document.querySelector('textarea');
+        let delayNextFill = true;
+        composer.addEventListener('input', () => {
+          if (!delayNextFill) return;
+          delayNextFill = false;
+          const requested = composer.value;
+          composer.value = '';
+          setTimeout(() => {
+            composer.value = requested;
+          }, 125);
+        });
+        composer.addEventListener('keydown', (event) => {
+          if (event.key === 'Backspace') {
+            document.body.dataset.nativeBackspaceCount = String(
+              Number(document.body.dataset.nativeBackspaceCount || '0') + 1,
+            );
+          }
+        });
+      </script>
+    `);
+
+    const composer = await findExactlyOneComposer(page, 500);
+    const prompt = "DEVSPACE_INSERT_PROBE_20260801\nUnicode=測試\nEND";
+    await insertAndVerifyPrompt(composer, prompt);
+
+    assert.equal(await readComposerText(composer), prompt);
+    assert.equal(await page.evaluate(() => document.body.dataset.nativeBackspaceCount), undefined);
+    await page.close();
+  } finally {
+    await browser.close();
+  }
+});
+
 test("send readiness waits for asynchronous enablement before one click", async () => {
   const browser = await launchInstalledChrome();
   try {
@@ -431,17 +476,27 @@ test("composer adapter prefers a send-associated editor and fails closed on a tr
   }
 });
 
-test("composer insertion failures use prompt-neutral wording", async () => {
+test("composer insertion failures preserve stage diagnostics without prompt content", async () => {
   const browser = await launchInstalledChrome();
   try {
     const page = await browser.newPage();
     await page.setContent('<main><button id="not-an-editor">fixed</button></main>');
+    const sensitivePrompt = "reviewer packet Unicode=測試";
     await assert.rejects(
-      insertAndVerifyPrompt(page.locator("#not-an-editor"), "cannot insert"),
+      insertAndVerifyPrompt(page.locator("#not-an-editor"), sensitivePrompt),
       (error: unknown) => {
         assert.ok(error instanceof WebLaunchBrowserError);
-        assert.match(error.message, /prompt/i);
-        assert.doesNotMatch(error.message, /reviewer packet/i);
+        assert.match(error.message, /prompt insertion failed:/i);
+        assert.match(error.message, /editor=button/);
+        assert.match(error.message, /fill=error/);
+        assert.match(error.message, /native=(error|readback-mismatch)/);
+        assert.match(error.message, /expectedLength=26/);
+        assert.match(error.message, /actualLength=5/);
+        assert.match(error.message, /expectedNewlines=0/);
+        assert.match(error.message, /actualNewlines=0/);
+        assert.match(error.message, /detached=false/);
+        assert.doesNotMatch(error.message, /reviewer packet/);
+        assert.doesNotMatch(error.message, /Unicode=測試/);
         return true;
       },
     );
