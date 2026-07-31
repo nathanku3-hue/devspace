@@ -25,7 +25,9 @@
     "build:app": "vite build",
     "dev": "node scripts/dev-server.mjs",
     "start": "node dist/cli.js serve",
-    "test": "tsx src/config.test.ts && tsx src/roots.test.ts && tsx src/skills.test.ts && tsx src/workspaces.test.ts && tsx src/review-checkpoints.test.ts && tsx src/device-authorization.test.ts && tsx src/oauth-store.test.ts && tsx src/read-files.test.ts && tsx src/git-publish.test.ts && tsx src/cli.test.ts && tsx src/safe-rename.test.ts && npm run test:powershell",
+    "test": "tsx src/config.test.ts && tsx src/roots.test.ts && tsx src/skills.test.ts && tsx src/workspaces.test.ts && tsx src/review-checkpoints.test.ts && tsx src/device-authorization.test.ts && tsx src/oauth-store.test.ts && tsx src/read-files.test.ts && tsx src/git-publish.test.ts && tsx src/cli.test.ts && tsx src/safe-rename.test.ts && tsx --test src/web-launch.test.ts && npm run test:powershell",
+    "test:web-launch": "tsx --test src/web-launch.test.ts",
+    "test:web-launch-browser": "tsx --test src/web-launch-browser.fixture.test.ts",
     "test:powershell": "node scripts/run-powershell-tests.mjs",
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
@@ -41,6 +43,7 @@
     "better-sqlite3": "^12.10.0",
     "drizzle-orm": "^0.45.2",
     "express": "^5.2.1",
+    "playwright-core": "1.62.0",
     "react": "^19.2.6",
     "react-dom": "^19.2.6",
     "semver": "^7.8.4",

@@ -48,6 +48,8 @@ import {
 } from "./read-files.js";
 import { createWorkspaceStore } from "./workspace-store.js";
 import { formatAgentsPath, WorkspaceRegistry } from "./workspaces.js";
+import { WebLaunchBrowserController } from "./web-launch-browser.js";
+import { registerWebLaunchTool } from "./web-launch-tools.js";
 
 type Transport = StreamableHTTPServerTransport;
 const WORKSPACE_APP_URI = "ui://devspace/workspace-app.html";
@@ -98,7 +100,7 @@ const SHELL_TOOL_ANNOTATIONS = {
 interface RunningServer {
   app: ReturnType<typeof createMcpExpressApp>;
   config: ServerConfig;
-  close(): void;
+  close(): Promise<void>;
 }
 
 type ToolContent =
@@ -239,7 +241,7 @@ function serverInstructions(config: ServerConfig, toolNames: ToolNames): string 
       ? " After creating, editing, or overwriting files, call show_changes once after the related file changes are complete so the user can see the aggregate diff."
       : "";
 
-  return `Use DevSpace as a local coding workspace. Call ${toolNames.openWorkspace} once per project folder or worktree to obtain a workspaceId. Reuse that same workspaceId for all later file, search, edit, write, show-changes, shell, and Git publication tools in that folder; do not call ${toolNames.openWorkspace} again unless switching folders/worktrees, changing checkout/worktree mode, the workspaceId is rejected as unknown, or the user explicitly asks to reopen. Close managed worktree sessions with ${toolNames.closeWorkspace}; it refuses dirty worktrees and removes clean worktrees through Git. ${agentsMd}${skills}${inspection}Batch known context reads with ${toolNames.readBatch} to reduce host approval prompts. Prefer ${toolNames.edit} for targeted modifications, ${toolNames.write} only for new files or complete rewrites, and ${toolNames.shell} for tests, builds, Git inspection, package scripts, and commands that are better executed by the shell. When the user explicitly requests a commit or push, use publish_git_changes with the existing workspaceId, a workingDirectory relative to the workspace root, and exact file paths. Do not construct /mnt paths, Windows absolute paths, or shell cd commands for workspace navigation; use the workingDirectory field. Do not use ${toolNames.shell} to edit working-tree contents or mutate the Git index, history, remotes, or branches. Avoid shell redirection, heredocs, tee, sed -i, perl -i, node/python/ruby scripts, generated scripts, or other commands whose purpose is to write project files. Use ${toolNames.edit} or ${toolNames.write} for content changes.${showChanges}`;
+  return `Use DevSpace as a local coding workspace. Call ${toolNames.openWorkspace} once per project folder or worktree to obtain a workspaceId. Reuse that same workspaceId for all later file, search, edit, write, show-changes, shell, and Git publication tools in that folder; do not call ${toolNames.openWorkspace} again unless switching folders/worktrees, changing checkout/worktree mode, the workspaceId is rejected as unknown, or the user explicitly asks to reopen. Close managed worktree sessions with ${toolNames.closeWorkspace}; it refuses dirty worktrees and removes clean worktrees through Git. When the user explicitly requests one fresh ChatGPT Web conversation with a supplied prompt, invoke web_launch; do not infer this trigger from text typed in another composer. WEB-LAUNCH-0 returns only launch acknowledgement and does not capture assistant output or continue the spawned conversation. ${agentsMd}${skills}${inspection}Batch known context reads with ${toolNames.readBatch} to reduce host approval prompts. Prefer ${toolNames.edit} for targeted modifications, ${toolNames.write} only for new files or complete rewrites, and ${toolNames.shell} for tests, builds, Git inspection, package scripts, and commands that are better executed by the shell. When the user explicitly requests a commit or push, use publish_git_changes with the existing workspaceId, a workingDirectory relative to the workspace root, and exact file paths. Do not construct /mnt paths, Windows absolute paths, or shell cd commands for workspace navigation; use the workingDirectory field. Do not use ${toolNames.shell} to edit working-tree contents or mutate the Git index, history, remotes, or branches. Avoid shell redirection, heredocs, tee, sed -i, perl -i, node/python/ruby scripts, generated scripts, or other commands whose purpose is to write project files. Use ${toolNames.edit} or ${toolNames.write} for content changes.${showChanges}`;
 }
 function resultOutputSchema(extra: z.ZodRawShape = {}): z.ZodRawShape {
   return {
@@ -491,10 +493,11 @@ async function assertWorkspaceAppAssets(): Promise<void> {
   }
 }
 
-function createMcpServer(
+export function createMcpServer(
   config: ServerConfig,
   workspaces: WorkspaceRegistry,
   reviewCheckpoints: ReturnType<typeof createReviewCheckpointManager>,
+  webLaunchBrowser: Pick<WebLaunchBrowserController, "launchWebConversation">,
 ): McpServer {
   const toolNames = toolNamesFor(config);
   const server = new McpServer(
@@ -540,6 +543,8 @@ function createMcpServer(
       };
     },
   );
+
+  registerWebLaunchTool({ server, browser: webLaunchBrowser });
 
   registerAppTool(
     server,
@@ -1705,6 +1710,7 @@ export function createServer(config = loadConfig()): RunningServer {
   const workspaceStore = createWorkspaceStore(config.stateDir);
   const workspaces = new WorkspaceRegistry(config, workspaceStore);
   const reviewCheckpoints = createReviewCheckpointManager();
+  const webLaunchBrowser = new WebLaunchBrowserController(config.allowedRoots);
 
   if (config.logging.trustProxy) {
     app.set("trust proxy", () => true);
@@ -1828,7 +1834,12 @@ export function createServer(config = loadConfig()): RunningServer {
           }
         };
 
-        const server = createMcpServer(config, workspaces, reviewCheckpoints);
+        const server = createMcpServer(
+          config,
+          workspaces,
+          reviewCheckpoints,
+          webLaunchBrowser,
+        );
         await server.connect(transport);
       } else {
         sendJsonRpcError(res, 400, -32000, "No valid MCP session");
@@ -1851,9 +1862,10 @@ export function createServer(config = loadConfig()): RunningServer {
   return {
     app,
     config,
-    close: () => {
+    close: async () => {
       if (closed) return;
       closed = true;
+      await webLaunchBrowser.close();
       oauthProvider.close();
       workspaceStore.close?.();
     },
@@ -1888,8 +1900,7 @@ if (await isMainModule()) {
 
   const shutdown = () => {
     httpServer.close(() => {
-      close();
-      process.exit(0);
+      void close().finally(() => process.exit(0));
     });
   };
   process.once("SIGINT", shutdown);
