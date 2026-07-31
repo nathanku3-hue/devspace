@@ -2,6 +2,7 @@
 import { createRequire } from "node:module";
 import { stdin as input, stdout as output } from "node:process";
 import { resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import * as prompts from "@clack/prompts";
 import { getShellConfig } from "@earendil-works/pi-coding-agent";
 import { satisfies } from "semver";
@@ -199,14 +200,62 @@ async function serve(): Promise<void> {
     console.log(`logging: ${config.logging.level} ${config.logging.format}`);
   });
 
-  const shutdown = () => {
-    httpServer.close(() => {
-      close();
-      process.exit(0);
-    });
+  const shutdown = createShutdownHandler({
+    stopHttpServer: () =>
+      new Promise<void>((resolveShutdown, rejectShutdown) => {
+        httpServer.close((error) => {
+          if (error) rejectShutdown(error);
+          else resolveShutdown();
+        });
+      }),
+    closeApplication: close,
+    exit: (code) => process.exit(code),
+    logError: (message) => console.error(message),
+  });
+  process.once("SIGINT", () => {
+    void shutdown();
+  });
+  process.once("SIGTERM", () => {
+    void shutdown();
+  });
+}
+
+interface ShutdownHandlerOptions {
+  stopHttpServer(): Promise<void>;
+  closeApplication(): Promise<void>;
+  exit(code: number): void;
+  logError(message: string): void;
+}
+
+export function createShutdownHandler({
+  stopHttpServer,
+  closeApplication,
+  exit,
+  logError,
+}: ShutdownHandlerOptions): () => Promise<void> {
+  let shutdownInFlight: Promise<void> | undefined;
+  return () => {
+    shutdownInFlight ??= (async () => {
+      const failures: unknown[] = [];
+      try {
+        await stopHttpServer();
+      } catch (error) {
+        failures.push(error);
+      }
+      try {
+        await closeApplication();
+      } catch (error) {
+        failures.push(error);
+      }
+      for (const failure of failures) {
+        logError(
+          `DevSpace shutdown failed: ${failure instanceof Error ? failure.message : String(failure)}`,
+        );
+      }
+      exit(failures.length === 0 ? 0 : 1);
+    })();
+    return shutdownInFlight;
   };
-  process.once("SIGINT", shutdown);
-  process.once("SIGTERM", shutdown);
 }
 
 async function runDoctor(): Promise<void> {
@@ -397,7 +446,18 @@ function checkBashShell(): string {
   }
 }
 
-main(process.argv.slice(2)).catch((error) => {
-  console.error(error instanceof Error ? error.message : String(error));
-  process.exitCode = 1;
-});
+function isCliEntrypoint(): boolean {
+  if (!process.argv[1]) return false;
+  const entrypoint = resolve(process.argv[1]);
+  const modulePath = resolve(fileURLToPath(import.meta.url));
+  return process.platform === "win32"
+    ? entrypoint.toLowerCase() === modulePath.toLowerCase()
+    : entrypoint === modulePath;
+}
+
+if (isCliEntrypoint()) {
+  main(process.argv.slice(2)).catch((error) => {
+    console.error(error instanceof Error ? error.message : String(error));
+    process.exitCode = 1;
+  });
+}
