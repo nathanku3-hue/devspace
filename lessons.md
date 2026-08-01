@@ -516,3 +516,136 @@ Chatshare OAuth and authenticated DevSpace MCP execution are confirmed working a
 ```javascript
 sessionStorage.getItem("chatshare-oauth-callback-rescue-status")
 ```
+
+---
+
+# Chatshare.xyz Compatibility Revalidation Lessons
+
+Date: 2026-08-01
+Client: `https://chatshare.xyz`
+Classification: Chatshare.xyz compatibility stream. This is not `WEB-CONNECTOR-1`.
+Live extension: unpacked `chatshare-oauth-rescue-extension` version `1.3.0`
+
+## Confirmed outcome
+
+The compatibility flow was confirmed end to end from Chatshare. The enrolled-PC
+authorization completed, Chatshare exchanged the authorization code, DevSpace
+persisted device-bound access and refresh tokens, authenticated MCP sessions were
+created, and the user successfully invoked `DevSpace Local` to run
+`open_workspace` for `E:\code`.
+
+The authoritative acceptance evidence is the authenticated tool execution and
+returned workspace card. A callback page that looks unfinished is not evidence
+that OAuth failed.
+
+No authorization code, state value, access token, refresh token, device proof,
+or browser credential is recorded here.
+
+## Failure sequence and lessons
+
+### 1. The enrolled-PC check could appear to hang
+
+The authorization page displayed:
+
+```text
+Checking this enrolled PC...
+```
+
+and the Retry button appeared to do nothing. The live extension disabled Retry
+while awaiting `chrome.runtime.sendMessage`, but had no bounded timeout. A stale
+content script or sleeping extension service worker could therefore leave the
+page indefinitely in the checking state even though the loopback signer at
+`127.0.0.1:7677` was healthy.
+
+Reloading the unpacked extension and starting a fresh OAuth attempt restored the
+flow. Reusing the old authorization URL was unsafe because its OAuth challenge
+was short-lived.
+
+Lesson: every browser-extension relay must have a bounded timeout, explicit
+service-worker and loopback failure messages, and guaranteed Retry
+re-enablement. A visually enabled-looking button must not actually be disabled
+without distinct styling.
+
+### 2. Cloudflare error 1016 was a separate transport failure
+
+After the extension was installed, the browser encountered:
+
+```text
+Error 1016: Origin DNS error
+```
+
+This did not originate in OAuth or the extension. The stable Worker proxy was
+still targeting an expired Quick Tunnel hostname. Creating and registering a
+fresh tunnel restored the public `/healthz` path.
+
+Lesson: diagnose the integration by layer. Cloudflare origin routing, OAuth
+authorization, callback handling, token exchange, and authenticated MCP are
+separate gates. Temporal proximity does not establish causation.
+
+### 3. The callback UI did not reliably show completion
+
+The browser successfully returned through the rescued Chatshare callback route,
+but the page did not visibly return to connector settings or show a clear
+connected state. Server evidence nevertheless showed successful token exchange,
+device-bound token persistence, and subsequent authenticated MCP requests.
+
+The final real user action then succeeded:
+
+```text
+Chatshare conversation
+-> DevSpace Local
+-> open_workspace E:\code
+-> workspace card returned
+```
+
+Lesson: post-auth navigation and connector UI refresh are presentation concerns,
+not the authority for connection state. Treat them as a separate UX defect once
+a real authenticated tool call succeeds.
+
+### 4. Use an evidence hierarchy for OAuth closure
+
+The strongest-to-weakest evidence order is:
+
+1. A real authenticated MCP tool invocation succeeds.
+2. An authenticated MCP session initializes and discovers tools.
+3. The client exchanges the authorization code and receives tokens.
+4. The browser reaches the callback route.
+5. The UI displays a success message.
+
+Lesson: close compatibility work on the highest available protocol and product
+evidence, not on redirect appearance alone. Keep receipts free of authorization
+codes, state values, tokens, and device proofs.
+
+### 5. Keep the stream classification exact
+
+This work repairs Chatshare-specific compatibility across redirect aliasing,
+missing callback routing, React Router metadata, enrolled-PC authorization, and
+post-auth recovery. It does not implement the `WEB-CONNECTOR-1` product slice,
+review return, browser response capture, or reviewer orchestration.
+
+Lesson: a successful Chatshare-to-DevSpace connection proves this compatibility
+stream. It must not be used to silently advance a separate roadmap slice.
+
+### 6. Live deployment and repository custody were temporarily different
+
+The successful live run used the unpacked extension at:
+
+```text
+E:\Code\devspace\chatshare-oauth-rescue-extension
+```
+
+with version `1.3.0`, while the repository copy in this checkout still described
+version `1.2.0`. The live result is valid product evidence, but the deployment
+artifact and tracked source should be reconciled before claiming exact-SHA
+reproducibility for version `1.3.0`.
+
+Lesson: functional acceptance and source custody are distinct. Record both
+honestly rather than downgrading a real success or overstating reproducibility.
+
+## Final status
+
+Chatshare.xyz compatibility is functionally confirmed as of 2026-08-01 through
+a real authenticated `open_workspace E:\code` invocation. The remaining known
+issues are non-blocking callback UX ambiguity, missing timeout behavior in the
+device-proof relay, and temporary live-source custody divergence. These findings
+belong to the Chatshare.xyz compatibility stream, not `WEB-CONNECTOR-1`.
