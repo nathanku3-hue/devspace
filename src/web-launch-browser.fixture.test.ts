@@ -11,6 +11,7 @@ import {
   findExactlyOneComposer,
   injectAndSubmitPrompt,
   insertAndVerifyPrompt,
+  launchWebLaunchPersistentContext,
   readComposerText,
   resolveWebLaunchProfilePath,
   WebLaunchBrowserController,
@@ -87,6 +88,28 @@ test("dedicated profile is rejected when it falls inside an allowed root", async
   } finally {
     await rm(parent, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
   }
+});
+
+test("headed Chrome launch explicitly enables the Chromium sandbox", async () => {
+  let capturedProfilePath: string | undefined;
+  let capturedOptions:
+    | NonNullable<Parameters<typeof chromium.launchPersistentContext>[1]>
+    | undefined;
+  const sentinel = new Error("fixture launcher stop");
+
+  await assert.rejects(
+    launchWebLaunchPersistentContext("fixture-profile", async (profilePath, options) => {
+      capturedProfilePath = profilePath;
+      capturedOptions = options;
+      throw sentinel;
+    }),
+    (error: unknown) => error === sentinel,
+  );
+
+  assert.equal(capturedProfilePath, "fixture-profile");
+  assert.equal(capturedOptions?.channel, "chrome");
+  assert.equal(capturedOptions?.headless, false);
+  assert.equal(capturedOptions?.chromiumSandbox, true);
 });
 
 test("composer adapter collapses nested layers and uses native insertion without implicit submit", async () => {

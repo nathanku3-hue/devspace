@@ -62,6 +62,24 @@ export interface WebLaunchBrowserOptions {
   now?: () => Date;
 }
 
+type PersistentContextLauncher = (
+  userDataDir: string,
+  options: NonNullable<Parameters<typeof chromium.launchPersistentContext>[1]>,
+) => Promise<BrowserContext>;
+
+export async function launchWebLaunchPersistentContext(
+  profilePath: string,
+  launcher: PersistentContextLauncher = (userDataDir, options) =>
+    chromium.launchPersistentContext(userDataDir, options),
+): Promise<BrowserContext> {
+  return launcher(profilePath, {
+    channel: "chrome",
+    headless: false,
+    chromiumSandbox: true,
+    viewport: { width: 1280, height: 900 },
+  });
+}
+
 export interface InjectAndSubmitPromptOptions {
   sendReadyTimeoutMs?: number;
 }
@@ -191,11 +209,7 @@ export class WebLaunchBrowserController {
     const profilePath = await resolveWebLaunchProfilePath(this.#allowedRoots);
     this.#lease = await acquireProfileLease(profilePath);
     try {
-      this.#context = await chromium.launchPersistentContext(profilePath, {
-        channel: "chrome",
-        headless: false,
-        viewport: { width: 1280, height: 900 },
-      });
+      this.#context = await launchWebLaunchPersistentContext(profilePath);
       await this.#prepareContext(this.#context);
       return this.#context;
     } catch (error) {
