@@ -39,6 +39,7 @@ const SEND_ASSOCIATION_SELECTOR = [
 const SEND_READY_TIMEOUT_MS = 5_000;
 const PROMPT_READBACK_TIMEOUT_MS = 750;
 const PROMPT_READBACK_POLL_MS = 50;
+const FALLBACK_COMPOSER_GRACE_MS = 3_500;
 const STOP_SELECTOR = [
   'button[data-testid="stop-button"]',
   'button[aria-label^="Stop"]',
@@ -285,13 +286,29 @@ function sha256(value: string): string {
 }
 
 export async function findExactlyOneComposer(page: Page, timeoutMs = 20_000): Promise<Locator> {
-  const deadline = Date.now() + timeoutMs;
+  const startedAt = Date.now();
+  const deadline = startedAt + timeoutMs;
+  const fallbackDeadline = Math.min(deadline, startedAt + FALLBACK_COMPOSER_GRACE_MS);
   let candidates: Locator[] = [];
-  while (Date.now() < deadline) {
+  while (true) {
     await assertAuthenticated(page);
     candidates = await rankedComposerLocators(page);
-    if (candidates.length === 1) return candidates[0]!;
-    await page.waitForTimeout(200);
+    if (candidates.length === 1) {
+      const candidate = candidates[0]!;
+      try {
+        const isTransientFallback = await candidate.evaluate(
+          (element) =>
+            element instanceof HTMLTextAreaElement &&
+            element.classList.contains("wcDTda_fallbackTextarea"),
+        );
+        if (!isTransientFallback || Date.now() >= fallbackDeadline) return candidate;
+      } catch {
+        // The hydration transition replaced this candidate; inspect a fresh DOM snapshot.
+      }
+    }
+    const now = Date.now();
+    if (now >= deadline) break;
+    await page.waitForTimeout(Math.min(200, Math.max(1, deadline - now)));
   }
   if (candidates.length > 1) {
     throw new WebLaunchBrowserError(

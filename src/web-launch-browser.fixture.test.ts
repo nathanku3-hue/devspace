@@ -90,6 +90,41 @@ test("dedicated profile is rejected when it falls inside an allowed root", async
   }
 });
 
+test("transient fallback textarea yields to the hydrated ProseMirror composer", async () => {
+  const browser = await launchInstalledChrome();
+  try {
+    const page = await browser.newPage();
+    await page.setContent(`
+      <main>
+        <form>
+          <textarea class="wcDTda_fallbackTextarea" aria-label="Chat with ChatGPT"></textarea>
+          <div
+            id="prompt-textarea"
+            class="ProseMirror"
+            role="textbox"
+            contenteditable="true"
+            aria-label="Chat with ChatGPT"
+            hidden
+          ></div>
+        </form>
+      </main>
+      <script>
+        setTimeout(() => {
+          document.querySelector('textarea').style.display = 'none';
+          document.querySelector('[contenteditable="true"]').hidden = false;
+        }, 75);
+      </script>
+    `);
+
+    const composer = await findExactlyOneComposer(page, 1_000);
+    assert.equal(await composer.evaluate((element) => element.tagName.toLowerCase()), "div");
+    assert.equal(await composer.getAttribute("id"), "prompt-textarea");
+    await page.close();
+  } finally {
+    await browser.close();
+  }
+});
+
 test("headed Chrome launch explicitly enables the Chromium sandbox", async () => {
   let capturedProfilePath: string | undefined;
   let capturedOptions:
