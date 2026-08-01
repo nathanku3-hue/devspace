@@ -1,6 +1,8 @@
 # WEB-LAUNCH-0: One outbound ChatGPT Web launch
 
-> Candidate status: implemented for mechanical verification. Independent live ChatGPT Web acceptance is required before WEB-LAUNCH-0 is banked.
+> Status: BANKED
+> Classification: experimental bounded explicit-invocation feature
+> Accepted SHA: `afa2271f606e3a888ee0f893358c73ad9a7f4a0d`
 
 ## Product claim
 
@@ -86,4 +88,18 @@ WEB-LAUNCH-0 does not add or require:
 - connector verification;
 - automatic continuation.
 
-Do not open WEB-CONNECTOR-1 until a deployed exact candidate passes live acceptance and its receipt is preserved.
+## Roadmap status
+
+The established sequence remains:
+
+```text
+WEB-LAUNCH-0
+→ WEB-CONNECTOR-1
+→ REVIEW-RETURN-2
+→ THREE-REVIEWER-SAW-3
+→ META-HARNESS-INTEGRATION-4
+```
+
+WEB-LAUNCH-0 proved the headed-browser execution boundary and is retained as an
+experimental explicit-invocation capability. Its implementation does not alter
+the roadmap architecture. WEB-CONNECTOR-1 is now the sole active product slice.
