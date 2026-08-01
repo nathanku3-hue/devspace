@@ -36,7 +36,8 @@ $expectedTools = @(
     "read_files",
     "safe_rename_file",
     "web_connector_probe",
-    "web_connector_proof",
+    "web_connector_start",
+    "web_connector_status",
     "web_launch",
     "write"
 )
