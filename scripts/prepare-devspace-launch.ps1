@@ -40,10 +40,17 @@ $expectedTools = @(
     "web_launch",
     "write"
 )
+$builtJavascript = @(
+    Get-ChildItem -Path (Join-Path $repository "dist") -Filter "*.js" -Recurse -File
+).FullName
+if ($builtJavascript.Count -eq 0) {
+    Write-Error "Built DevSpace JavaScript output is missing under '$(Join-Path $repository "dist")'. Refusing to start."
+    exit 1
+}
 $missingToolMarkers = @()
 foreach ($toolName in $expectedTools) {
     $quotedPattern = '"' + [regex]::Escape($toolName) + '"'
-    if (!(Select-String -Path $serverPath -Pattern $quotedPattern -Quiet)) {
+    if (!(Select-String -Path $builtJavascript -Pattern $quotedPattern -Quiet)) {
         $missingToolMarkers += $toolName
     }
 }

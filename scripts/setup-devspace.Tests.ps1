@@ -90,3 +90,40 @@ Describe "DevSpace setup probe client persistence" {
         $loaded | Should Be $null
     }
 }
+
+Describe "DevSpace launch build marker verification" {
+    It "finds tool markers split across modular JavaScript output" {
+        $testRoot = Join-Path ([System.IO.Path]::GetTempPath()) ("devspace-launch-build-test-" + [Guid]::NewGuid().ToString("N"))
+        $repository = Join-Path $testRoot "repository"
+        $dist = Join-Path $repository "dist"
+        $chunks = Join-Path $dist "chunks"
+        $shimDirectory = Join-Path $testRoot "bin"
+        $originalPath = $env:Path
+
+        try {
+            New-Item -ItemType Directory -Path $chunks -Force | Out-Null
+            New-Item -ItemType Directory -Path $shimDirectory -Force | Out-Null
+            Set-Content -LiteralPath (Join-Path $repository "package.json") -Value "{}" -Encoding UTF8
+            Set-Content -LiteralPath (Join-Path $dist "cli.js") -Value "// fixture" -Encoding UTF8
+            Set-Content -LiteralPath (Join-Path $dist "server.js") -Value @'
+"bash" "close_workspace" "edit" "open_workspace" "publish_git_changes" "read"
+"read_files" "safe_rename_file" "web_launch" "write"
+'@ -Encoding UTF8
+            Set-Content -LiteralPath (Join-Path $chunks "web-connector.js") -Value @'
+"web_connector_probe" "web_connector_proof"
+'@ -Encoding UTF8
+            Set-Content -LiteralPath (Join-Path $shimDirectory "npm.cmd") -Value "@exit /b 0" -Encoding ASCII
+            $env:Path = $shimDirectory + ";" + $originalPath
+
+            $output = & powershell.exe -NoProfile -ExecutionPolicy Bypass -File `
+                (Join-Path $here "prepare-devspace-launch.ps1") -RepositoryRoot $repository 2>&1
+            $exitCode = $LASTEXITCODE
+
+            $exitCode | Should Be 0
+            ($output -join "`n") | Should Match "Verified built MCP tool markers: 12/12"
+        } finally {
+            $env:Path = $originalPath
+            Remove-Item -LiteralPath $testRoot -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+}
