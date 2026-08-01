@@ -1,8 +1,8 @@
 # WEB-LAUNCH-0: One outbound ChatGPT Web launch
 
-> Status: BANKED
+> Status: BANKED AND DEPLOYED
 > Classification: experimental bounded explicit-invocation feature
-> Accepted SHA: `afa2271f606e3a888ee0f893358c73ad9a7f4a0d`
+> Accepted and deployed SHA: `65781ea82114a0c0e0b42f25ad65ff40b32c8c80`
 
 ## Product claim
 
@@ -102,4 +102,5 @@ WEB-LAUNCH-0
 
 WEB-LAUNCH-0 proved the headed-browser execution boundary and is retained as an
 experimental explicit-invocation capability. Its implementation does not alter
-the roadmap architecture. WEB-CONNECTOR-1 is now the sole active product slice.
+the roadmap architecture. WEB-CONNECTOR-1 is now the sole active product slice;
+its bounded contract is documented in `docs/web-connector-1.md`.

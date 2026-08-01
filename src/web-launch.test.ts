@@ -8,6 +8,7 @@ import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import type { ServerConfig } from "./config.js";
 import { createReviewCheckpointManager } from "./review-checkpoints.js";
 import { createMcpServer } from "./server.js";
+import { WebConnectorProofController } from "./web-connector-proof.js";
 import type {
   WebLaunchAcknowledgement,
   WebLaunchBrowserController,
@@ -77,6 +78,7 @@ test("public web_launch exposes only WEB-LAUNCH-0 and preserves the supplied pro
     new WorkspaceRegistry(config),
     createReviewCheckpointManager(),
     browser,
+    new WebConnectorProofController(browser),
   );
   const client = new Client({ name: "web-launch-test", version: "1.0.0" });
   const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();

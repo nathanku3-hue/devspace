@@ -35,6 +35,9 @@ $expectedTools = @(
     "read",
     "read_files",
     "safe_rename_file",
+    "web_connector_probe",
+    "web_connector_proof",
+    "web_launch",
     "write"
 )
 $missingToolMarkers = @()

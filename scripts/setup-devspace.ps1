@@ -66,6 +66,9 @@ $ExpectedTools = @(
     "read",
     "read_files",
     "safe_rename_file",
+    "web_connector_probe",
+    "web_connector_proof",
+    "web_launch",
     "write"
 )
 . (Join-Path $PSScriptRoot "setup-devspace-support.ps1")
