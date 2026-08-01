@@ -209,8 +209,12 @@ The shell tool is for commands that belong in a terminal:
 - package scripts
 - environment checks
 
-File writes should go through the edit/write tools rather than shell
-redirection, heredocs, `tee`, `sed -i`, or generated scripts.
+Project file writes should go through the edit/write tools rather than shell
+redirection, heredocs, `tee`, `sed -i`, or generated scripts. One narrow
+exception is explicitly requested repository-local operational state that needs
+native create-only or atomic filesystem semantics. That state must remain inside
+the opened workspace, be excluded from Git, and must not be written to a
+machine-global location such as `C:\ProgramData`.
 
 When the user explicitly requests a commit or push, use
 `publish_git_changes` with exact file paths. The tool refuses unrelated staged
