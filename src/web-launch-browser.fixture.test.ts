@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { promisify } from "node:util";
-import { chromium, type Browser } from "playwright-core";
+import { chromium, type Browser, type BrowserContext } from "playwright-core";
 import {
   chatGptConversationIdentityFromUrl,
   findExactlyOneComposer,
@@ -38,6 +38,7 @@ const fixtureHtml = `
       });
       send.addEventListener('click', () => {
         const conversationId = 'fixture-conversation-' + crypto.randomUUID().replaceAll('-', '');
+        document.body.dataset.submitCount = String(Number(document.body.dataset.submitCount || '0') + 1);
         document.body.dataset.submitted = composer.value;
         history.pushState({}, '', '/c/' + conversationId);
         composer.value = '';
@@ -609,6 +610,92 @@ test("WEB-LAUNCH-0 submits one exact prompt and returns acknowledgement only", a
     );
     assert.equal(await gitStatus(process.cwd()), originalStatus);
   } finally {
+    await controller?.close();
+    await browser.close();
+    await rm(parent, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+  }
+});
+
+test("closed cached context releases its lease before a fresh context submits once", async () => {
+  const parent = await mkdtemp(join(tmpdir(), "devspace-web-launch-recovery-"));
+  const browser = await launchInstalledChrome();
+  const contexts: BrowserContext[] = [];
+  const releasedLeases: number[] = [];
+  let controller: WebLaunchBrowserController | undefined;
+  let contextFactoryCalls = 0;
+  let leaseFactoryCalls = 0;
+  let releaseFirstLease!: () => void;
+  let markFirstReleaseStarted!: () => void;
+  const firstLeaseGate = new Promise<void>((resolve) => {
+    releaseFirstLease = resolve;
+  });
+  const firstReleaseStarted = new Promise<void>((resolve) => {
+    markFirstReleaseStarted = resolve;
+  });
+
+  try {
+    controller = new WebLaunchBrowserController([parent], {
+      contextFactory: async () => {
+        contextFactoryCalls += 1;
+        const context = await browser.newContext();
+        await context.route("https://chatgpt.com/**", (route) =>
+          route.fulfill({ status: 200, contentType: "text/html", body: fixtureHtml }),
+        );
+        contexts.push(context);
+        return context;
+      },
+      profileLeaseFactory: async () => {
+        leaseFactoryCalls += 1;
+        const leaseNumber = leaseFactoryCalls;
+        return {
+          release: async () => {
+            releasedLeases.push(leaseNumber);
+            if (leaseNumber === 1) {
+              markFirstReleaseStarted();
+              await firstLeaseGate;
+            }
+          },
+        };
+      },
+    });
+
+    await controller.launchWebConversation("first prompt");
+    const firstConversation = contexts[0]!
+      .pages()
+      .find((page) => chatGptConversationIdentityFromUrl(page.url()) !== undefined);
+    assert.ok(firstConversation);
+    assert.equal(await firstConversation.evaluate(() => document.body.dataset.submitted), "first prompt");
+    assert.equal(await firstConversation.evaluate(() => document.body.dataset.submitCount), "1");
+
+    const closeFirstContext = contexts[0]!.close();
+    await Promise.race([
+      firstReleaseStarted,
+      new Promise<never>((_, reject) =>
+        setTimeout(() => reject(new Error("context close did not start lease release")), 5_000),
+      ),
+    ]);
+    const secondLaunch = controller.launchWebConversation("second prompt");
+    await new Promise((resolve) => setTimeout(resolve, 25));
+    assert.equal(contextFactoryCalls, 1);
+    assert.deepEqual(releasedLeases, [1]);
+
+    releaseFirstLease();
+    await closeFirstContext;
+    await secondLaunch;
+
+    assert.equal(contextFactoryCalls, 2);
+    assert.equal(leaseFactoryCalls, 2);
+    const secondConversation = contexts[1]!
+      .pages()
+      .find((page) => chatGptConversationIdentityFromUrl(page.url()) !== undefined);
+    assert.ok(secondConversation);
+    assert.equal(
+      await secondConversation.evaluate(() => document.body.dataset.submitted),
+      "second prompt",
+    );
+    assert.equal(await secondConversation.evaluate(() => document.body.dataset.submitCount), "1");
+  } finally {
+    releaseFirstLease();
     await controller?.close();
     await browser.close();
     await rm(parent, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });

@@ -60,6 +60,7 @@ interface BrowserProfileLease {
 
 export interface WebLaunchBrowserOptions {
   contextFactory?: () => Promise<BrowserContext>;
+  profileLeaseFactory?: () => Promise<{ release(): Promise<void> }>;
   now?: () => Date;
 }
 
@@ -116,14 +117,17 @@ export class WebLaunchBrowserError extends Error {
 export class WebLaunchBrowserController {
   readonly #allowedRoots: string[];
   readonly #contextFactory: (() => Promise<BrowserContext>) | undefined;
+  readonly #profileLeaseFactory: (() => Promise<BrowserProfileLease>) | undefined;
   readonly #now: () => Date;
   #context: BrowserContext | undefined;
   #lease: BrowserProfileLease | undefined;
+  #contextCleanup: Promise<void> | undefined;
   #launchInFlight = false;
 
   constructor(allowedRoots: string[], options: WebLaunchBrowserOptions = {}) {
     this.#allowedRoots = [...allowedRoots];
     this.#contextFactory = options.contextFactory;
+    this.#profileLeaseFactory = options.profileLeaseFactory;
     this.#now = options.now ?? (() => new Date());
   }
 
@@ -192,35 +196,86 @@ export class WebLaunchBrowserController {
   async close(): Promise<void> {
     const context = this.#context;
     const lease = this.#lease;
+    const cleanup = this.#contextCleanup;
     this.#context = undefined;
     this.#lease = undefined;
+    this.#contextCleanup = undefined;
     if (context) await context.close().catch(() => undefined);
     if (lease) await lease.release().catch(() => undefined);
+    if (cleanup) await cleanup.catch(() => undefined);
   }
 
   async #ensureContext(): Promise<BrowserContext> {
+    await this.#contextCleanup;
     if (this.#context) return this.#context;
 
     if (this.#contextFactory) {
-      this.#context = await this.#contextFactory();
-      await this.#prepareContext(this.#context);
-      return this.#context;
+      const lease = await this.#profileLeaseFactory?.();
+      let context: BrowserContext | undefined;
+      try {
+        context = await this.#contextFactory();
+        return await this.#adoptContext(context, lease);
+      } catch (error) {
+        if (!context) await lease?.release().catch(() => undefined);
+        throw error;
+      }
     }
 
     const profilePath = await resolveWebLaunchProfilePath(this.#allowedRoots);
-    this.#lease = await acquireProfileLease(profilePath);
+    const lease = await acquireProfileLease(profilePath);
+    let context: BrowserContext | undefined;
     try {
-      this.#context = await launchWebLaunchPersistentContext(profilePath);
-      await this.#prepareContext(this.#context);
-      return this.#context;
+      context = await launchWebLaunchPersistentContext(profilePath);
+      return await this.#adoptContext(context, lease);
     } catch (error) {
-      await this.#lease.release().catch(() => undefined);
-      this.#lease = undefined;
+      if (!context) await lease.release().catch(() => undefined);
       throw new WebLaunchBrowserError(
         "unable to launch dedicated headed Chrome for ChatGPT automation",
         { cause: error },
       );
     }
+  }
+
+  async #adoptContext(
+    context: BrowserContext,
+    lease: BrowserProfileLease | undefined,
+  ): Promise<BrowserContext> {
+    this.#context = context;
+    this.#lease = lease;
+    context.once("close", () => this.#handleContextClose(context, lease));
+    try {
+      await this.#prepareContext(context);
+      return context;
+    } catch (error) {
+      await this.#discardContext(context, lease);
+      throw error;
+    }
+  }
+
+  #handleContextClose(context: BrowserContext, lease: BrowserProfileLease | undefined): void {
+    if (this.#context !== context) return;
+    this.#context = undefined;
+    if (this.#lease === lease) this.#lease = undefined;
+    if (!lease) return;
+
+    const release = lease.release().catch(() => undefined);
+    let tracked: Promise<void>;
+    tracked = release.finally(() => {
+      if (this.#contextCleanup === tracked) this.#contextCleanup = undefined;
+    });
+    this.#contextCleanup = tracked;
+  }
+
+  async #discardContext(
+    context: BrowserContext,
+    lease: BrowserProfileLease | undefined,
+  ): Promise<void> {
+    const ownsLease = lease !== undefined && this.#lease === lease;
+    if (this.#context === context) this.#context = undefined;
+    if (ownsLease) this.#lease = undefined;
+    await context.close().catch(() => undefined);
+    if (ownsLease) await lease.release().catch(() => undefined);
+    await this.#contextCleanup;
   }
 
   async #prepareContext(context: BrowserContext): Promise<void> {
