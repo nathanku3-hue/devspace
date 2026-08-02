@@ -900,28 +900,71 @@ export async function resolveWebLaunchProfilePath(
   return canonical;
 }
 
-async function acquireProfileLease(profilePath: string): Promise<BrowserProfileLease> {
-  const lockPath = `${profilePath}.devspace.lock`;
-  const token = randomUUID();
-  let handle;
+export interface ProfileLeaseOptions {
+  processExists?: (pid: number) => boolean;
+}
+
+export interface ProfileLockRecord {
+  pid: number;
+  token: string;
+  createdAt: string;
+}
+
+/**
+ * True when the OS reports the PID as present or ownership is ambiguous.
+ * ESRCH/missing → false (provably dead). EPERM/other → true (fail closed).
+ */
+export function processExists(pid: number): boolean {
+  if (!Number.isSafeInteger(pid) || pid <= 0) return true;
   try {
-    handle = await open(lockPath, "wx", 0o600);
-    await handle.writeFile(
-      `${JSON.stringify({ pid: process.pid, token, createdAt: new Date().toISOString() })}\n`,
-    );
+    process.kill(pid, 0);
+    return true;
   } catch (error) {
-    await handle?.close().catch(() => undefined);
-    if (isErrorCode(error, "EEXIST")) {
+    if (isErrorCode(error, "ESRCH")) return false;
+    return true;
+  }
+}
+
+export function parseProfileLockRecord(raw: string): ProfileLockRecord | undefined {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return undefined;
+  }
+  if (!parsed || typeof parsed !== "object") return undefined;
+  const record = parsed as { pid?: unknown; token?: unknown; createdAt?: unknown };
+  if (!Number.isSafeInteger(record.pid) || (record.pid as number) <= 0) return undefined;
+  if (typeof record.token !== "string" || record.token.length === 0) return undefined;
+  if (typeof record.createdAt !== "string" || record.createdAt.length === 0) return undefined;
+  return {
+    pid: record.pid as number,
+    token: record.token,
+    createdAt: record.createdAt,
+  };
+}
+
+export async function acquireProfileLease(
+  profilePath: string,
+  options: ProfileLeaseOptions = {},
+): Promise<BrowserProfileLease> {
+  const lockPath = `${profilePath}.devspace.lock`;
+  const exists = options.processExists ?? processExists;
+  const token = randomUUID();
+
+  const created = await tryCreateProfileLease(lockPath, token);
+  if (!created) {
+    await reclaimDeadProfileLock(lockPath, exists);
+    const retried = await tryCreateProfileLease(lockPath, token);
+    if (!retried) {
       throw new WebLaunchBrowserError("dedicated ChatGPT browser profile is already in use");
     }
-    throw error;
   }
-  await handle.close();
 
   const release = async (): Promise<void> => {
     try {
-      const current = JSON.parse(await readFile(lockPath, "utf8")) as { token?: unknown };
-      if (current.token === token) await rm(lockPath, { force: true });
+      const current = parseProfileLockRecord(await readFile(lockPath, "utf8"));
+      if (current?.token === token) await rm(lockPath, { force: true });
     } catch {
       // Never delete a replaced or unreadable lock.
     }
@@ -934,6 +977,79 @@ async function acquireProfileLease(profilePath: string): Promise<BrowserProfileL
     }
   }
   return { release };
+}
+
+async function tryCreateProfileLease(lockPath: string, token: string): Promise<boolean> {
+  let handle;
+  try {
+    handle = await open(lockPath, "wx", 0o600);
+    await handle.writeFile(
+      `${JSON.stringify({ pid: process.pid, token, createdAt: new Date().toISOString() })}\n`,
+    );
+    await handle.close();
+    return true;
+  } catch (error) {
+    await handle?.close().catch(() => undefined);
+    if (isErrorCode(error, "EEXIST")) return false;
+    throw error;
+  }
+}
+
+async function reclaimDeadProfileLock(
+  lockPath: string,
+  exists: (pid: number) => boolean,
+): Promise<void> {
+  let raw: string;
+  try {
+    raw = await readFile(lockPath, "utf8");
+  } catch (error) {
+    if (isErrorCode(error, "ENOENT")) return;
+    throw new WebLaunchBrowserError(
+      "dedicated ChatGPT browser profile lock is unreadable and cannot be reclaimed",
+    );
+  }
+
+  const record = parseProfileLockRecord(raw);
+  if (!record) {
+    throw new WebLaunchBrowserError(
+      "dedicated ChatGPT browser profile lock is malformed and cannot be reclaimed",
+    );
+  }
+  if (record.pid === process.pid) {
+    throw new WebLaunchBrowserError("dedicated ChatGPT browser profile is already in use");
+  }
+  if (exists(record.pid)) {
+    throw new WebLaunchBrowserError("dedicated ChatGPT browser profile is already in use");
+  }
+
+  // Re-read immediately before unlink so a live owner that rewrote the lock wins.
+  let currentRaw: string;
+  try {
+    currentRaw = await readFile(lockPath, "utf8");
+  } catch (error) {
+    if (isErrorCode(error, "ENOENT")) return;
+    throw new WebLaunchBrowserError(
+      "dedicated ChatGPT browser profile lock ownership became ambiguous during reclaim",
+    );
+  }
+  const current = parseProfileLockRecord(currentRaw);
+  if (!current || current.token !== record.token || current.pid !== record.pid) {
+    throw new WebLaunchBrowserError(
+      "dedicated ChatGPT browser profile lock ownership became ambiguous during reclaim",
+    );
+  }
+  if (exists(current.pid)) {
+    throw new WebLaunchBrowserError("dedicated ChatGPT browser profile is already in use");
+  }
+
+  try {
+    await rm(lockPath, { force: false });
+  } catch (error) {
+    if (isErrorCode(error, "ENOENT")) return;
+    throw new WebLaunchBrowserError(
+      "dedicated ChatGPT browser profile lock could not be reclaimed safely",
+    );
+  }
 }
 
 async function canonicalizePotentialPath(input: string): Promise<string> {

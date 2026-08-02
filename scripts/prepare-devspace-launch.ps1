@@ -26,34 +26,10 @@ if (!(Test-Path $cliPath) -or !(Test-Path $serverPath)) {
     exit 1
 }
 
-$expectedTools = @(
-    "bash",
-    "close_workspace",
-    "edit",
-    "open_workspace",
-    "publish_git_changes",
-    "read",
-    "read_files",
-    "safe_rename_file",
-    "web_connector_probe",
-    "web_connector_start",
-    "web_connector_status",
-    "web_launch",
-    "write"
-)
-$missingToolMarkers = @()
-foreach ($toolName in $expectedTools) {
-    $quotedPattern = '"' + [regex]::Escape($toolName) + '"'
-    if (!(Select-String -Path $serverPath -Pattern $quotedPattern -Quiet)) {
-        $missingToolMarkers += $toolName
-    }
-}
-if ($missingToolMarkers.Count -gt 0) {
-    Write-Error "Built DevSpace server is missing expected MCP tool markers: $($missingToolMarkers -join ', '). Refusing to start."
-    exit 1
-}
-Write-Host "Verified built MCP tool markers: $($expectedTools.Count)/$($expectedTools.Count)"
-Write-Host "Live authenticated tools/list checks remain authoritative and run after startup."
+# Static compiled-string marker scans are intentionally removed: they forced inert
+# artifact injection against modular dist layouts. Authenticated tools/list after
+# startup (setup-devspace.ps1) is the authoritative inventory check.
+Write-Host "Build artifacts present. Authenticated tools/list after startup remains authoritative."
 
 $ghCommand = Get-Command gh.exe -ErrorAction SilentlyContinue
 if ($null -eq $ghCommand) {
