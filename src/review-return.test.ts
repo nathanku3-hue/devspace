@@ -9,9 +9,12 @@ import type { ServerConfig } from "./config.js";
 import { createReviewCheckpointManager } from "./review-checkpoints.js";
 import {
   buildReviewReturnPrompt,
+  PRODUCT_ROLE_POLICY,
+  PRODUCT_ROLE_POLICY_DIGEST,
   ReviewReturnController,
   ReviewReturnError,
-  type ReviewStructuredResult,
+  sha256Hex,
+  type ReviewCallbackInput,
 } from "./review-return.js";
 import { createMcpServer } from "./server.js";
 import { WebConnectorProofController } from "./web-connector-proof.js";
@@ -22,13 +25,14 @@ import type {
 import { WorkspaceRegistry } from "./workspaces.js";
 
 const REVIEW_ID = "a".repeat(64);
-const CANDIDATE_DIGEST = "b".repeat(64);
-const EVIDENCE_DIGEST = "c".repeat(64);
-const POLICY_DIGEST = "d".repeat(64);
+const CHALLENGE = "f".repeat(64);
+const CANDIDATE_MANIFEST = "candidate: ship review return with packet content";
+const EVIDENCE_MANIFEST = "evidence: fixture-1 proves structured return";
+const CANDIDATE_DIGEST = sha256Hex(CANDIDATE_MANIFEST);
+const EVIDENCE_DIGEST = sha256Hex(EVIDENCE_MANIFEST);
 const CONVERSATION_HASH = "e".repeat(64);
 const START_TIME = "2026-08-02T08:00:00.000Z";
 const CALLBACK_TIME = "2026-08-02T08:00:05.000Z";
-const REVIEWED_AT = "2026-08-02T08:00:04.000Z";
 
 function launchAcknowledgement(): WebLaunchAcknowledgement {
   return {
@@ -40,28 +44,27 @@ function launchAcknowledgement(): WebLaunchAcknowledgement {
   };
 }
 
-function digests() {
+function startInput() {
   return {
+    candidateManifest: CANDIDATE_MANIFEST,
     candidateManifestDigest: CANDIDATE_DIGEST,
+    evidenceManifest: EVIDENCE_MANIFEST,
     evidenceManifestDigest: EVIDENCE_DIGEST,
-    rolePolicyDigest: POLICY_DIGEST,
   };
 }
 
-function validSubmission(overrides: Partial<ReviewStructuredResult> = {}): ReviewStructuredResult {
+function validCallback(overrides: Partial<ReviewCallbackInput> = {}): ReviewCallbackInput {
   return {
-    reviewId: REVIEW_ID,
-    role: "PRODUCT",
+    challenge: CHALLENGE,
     result: "pass",
-    summary: "Minimum structured PRODUCT review.",
+    summary: "Minimum structured PRODUCT review over packet content.",
     findings: [
       {
         severity: "advisory",
-        claim: "Transport returns structured result.",
-        evidenceRef: "sha256:fixture-evidence",
+        claim: "Candidate matches evidence fixture-1.",
+        evidenceRef: "fixture-1",
       },
     ],
-    reviewedAt: REVIEWED_AT,
     ...overrides,
   };
 }
@@ -129,55 +132,142 @@ async function waitFor(predicate: () => boolean, timeoutMs = 1_000): Promise<voi
   }
 }
 
-test("REVIEW-RETURN-2 prompt is fixed, names PRODUCT, and binds digests", () => {
-  const prompt = buildReviewReturnPrompt({
-    reviewId: REVIEW_ID,
-    ...digests(),
-  });
-  assert.match(prompt, /REVIEW-RETURN-2 PRODUCT review packet/);
-  assert.match(prompt, /review_submit/);
-  assert.match(prompt, new RegExp(REVIEW_ID));
-  assert.match(prompt, new RegExp(CANDIDATE_DIGEST));
-  assert.match(prompt, new RegExp(EVIDENCE_DIGEST));
-  assert.match(prompt, new RegExp(POLICY_DIGEST));
-  assert.match(prompt, /Do not include previous reviewer output/);
-  assert.doesNotMatch(prompt, /web_connector_probe/);
-});
-
-test("start retains the review and returns before browser launch resolves", async () => {
-  const launch = deferred<WebLaunchAcknowledgement>();
-  const prompts: string[] = [];
-  const browser = {
-    launchWebConversation: async (prompt: string) => {
-      prompts.push(prompt);
-      return launch.promise;
-    },
-  } as Pick<WebLaunchBrowserController, "launchWebConversation">;
-  const review = new ReviewReturnController(browser, {
+function controller(
+  browser: Pick<WebLaunchBrowserController, "launchWebConversation">,
+  now: () => Date = () => new Date(START_TIME),
+): ReviewReturnController {
+  return new ReviewReturnController(browser, {
     reviewIdFactory: () => REVIEW_ID,
-    now: () => new Date(START_TIME),
+    challengeFactory: () => CHALLENGE,
+    now,
     timeoutMs: 1_000,
     retentionMs: 1_000,
   });
+}
 
+test("exact manifest bytes and PRODUCT policy appear in the fixed prompt", () => {
+  const prompt = buildReviewReturnPrompt({
+    challenge: CHALLENGE,
+    candidateManifest: CANDIDATE_MANIFEST,
+    candidateManifestDigest: CANDIDATE_DIGEST,
+    evidenceManifest: EVIDENCE_MANIFEST,
+    evidenceManifestDigest: EVIDENCE_DIGEST,
+    rolePolicy: PRODUCT_ROLE_POLICY,
+    rolePolicyDigest: PRODUCT_ROLE_POLICY_DIGEST,
+  });
+  assert.match(prompt, new RegExp(CANDIDATE_MANIFEST));
+  assert.match(prompt, new RegExp(EVIDENCE_MANIFEST));
+  assert.match(prompt, new RegExp(PRODUCT_ROLE_POLICY.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+  assert.match(prompt, new RegExp(CHALLENGE));
+  assert.doesNotMatch(prompt, new RegExp(REVIEW_ID));
+  assert.match(prompt, /challenge:/);
+  assert.doesNotMatch(prompt, /reviewId:/);
+  assert.match(prompt, /Do not supply reviewId, role, rolePolicyDigest, or reviewedAt/);
+});
+
+test("supplied digests must match exact manifest content", () => {
+  const review = controller({
+    launchWebConversation: async () => launchAcknowledgement(),
+  });
   try {
-    const started = review.startReview(digests());
-    assert.deepEqual(started, {
-      slice: "REVIEW-RETURN-2",
-      reviewId: REVIEW_ID,
-      role: "PRODUCT",
-      status: "pending",
-      startedAt: START_TIME,
-      expiresAt: "2026-08-02T08:00:01.000Z",
-      ...digests(),
-      assistantOutputCaptured: false,
-    });
+    assert.throws(
+      () =>
+        review.startReview({
+          ...startInput(),
+          candidateManifestDigest: "0".repeat(64),
+        }),
+      /candidateManifestDigest does not match/,
+    );
+    assert.throws(
+      () =>
+        review.startReview({
+          ...startInput(),
+          evidenceManifestDigest: "1".repeat(64),
+        }),
+      /evidenceManifestDigest does not match/,
+    );
+  } finally {
+    review.close();
+  }
+});
+
+test("source-visible reviewId cannot authorize submission", () => {
+  const review = controller({
+    launchWebConversation: async () => launchAcknowledgement(),
+  });
+  try {
+    const started = review.startReview(startInput());
+    assert.equal(started.reviewId, REVIEW_ID);
+    assert.throws(
+      () =>
+        review.submitReview({
+          ...validCallback(),
+          challenge: REVIEW_ID,
+        }),
+      /unknown, expired, or already consumed/,
+    );
     assert.equal(review.getReviewStatus(REVIEW_ID).status, "pending");
-    assert.equal(prompts.length, 0);
-    await Promise.resolve();
-    assert.equal(prompts.length, 1);
-    assert.throws(() => review.startReview(digests()), /in progress|duplicate/);
-    launch.resolve(launchAcknowledgement());
+  } finally {
+    review.close();
+  }
+});
+
+test("unknown and reused challenges fail closed", async () => {
+  const times = [new Date(START_TIME), new Date(CALLBACK_TIME)];
+  const review = controller(
+    { launchWebConversation: async () => launchAcknowledgement() },
+    () => times.shift() ?? new Date(CALLBACK_TIME),
+  );
+  try {
+    review.startReview(startInput());
+    assert.throws(
+      () => review.submitReview(validCallback({ challenge: "9".repeat(64) })),
+      /unknown, expired, or already consumed/,
+    );
+    review.submitReview(validCallback());
+    await waitFor(() => review.getReviewStatus(REVIEW_ID).status === "succeeded");
+    assert.throws(
+      () => review.submitReview(validCallback()),
+      /unknown, expired, or already consumed/,
+    );
+  } finally {
+    review.close();
+  }
+});
+
+test("role, timestamps, and policy digest are server-owned", async () => {
+  const times = [new Date(START_TIME), new Date(CALLBACK_TIME)];
+  const review = controller(
+    { launchWebConversation: async () => launchAcknowledgement() },
+    () => times.shift() ?? new Date(CALLBACK_TIME),
+  );
+  try {
+    const started = review.startReview(startInput());
+    assert.equal(started.role, "PRODUCT");
+    assert.equal(started.rolePolicyDigest, PRODUCT_ROLE_POLICY_DIGEST);
+    assert.equal("challenge" in started, false);
+
+    const accepted = review.submitReview(validCallback());
+    assert.equal(accepted.reviewId, REVIEW_ID);
+    assert.equal(accepted.timestamp, CALLBACK_TIME);
+
+    await waitFor(() => review.getReviewStatus(REVIEW_ID).status === "succeeded");
+    const status = review.getReviewStatus(REVIEW_ID) as {
+      role: string;
+      reviewedAt: string;
+      callbackTimestamp: string;
+      rolePolicyDigest: string;
+      conversationIdentitySha256: string;
+      result: string;
+      summary: string;
+    };
+    assert.equal(status.role, "PRODUCT");
+    assert.equal(status.reviewedAt, CALLBACK_TIME);
+    assert.equal(status.callbackTimestamp, CALLBACK_TIME);
+    assert.equal(status.rolePolicyDigest, PRODUCT_ROLE_POLICY_DIGEST);
+    assert.equal(status.conversationIdentitySha256, CONVERSATION_HASH);
+    assert.equal(status.result, "pass");
+    assert.match(status.summary, /packet content/);
   } finally {
     review.close();
   }
@@ -187,48 +277,21 @@ test("callback and launch acknowledgement may arrive in either order", async (t)
   await t.test("callback first", async () => {
     const launch = deferred<WebLaunchAcknowledgement>();
     const times = [new Date(START_TIME), new Date(CALLBACK_TIME)];
-    const review = new ReviewReturnController(
+    const review = controller(
       { launchWebConversation: async () => launch.promise },
-      {
-        reviewIdFactory: () => REVIEW_ID,
-        now: () => times.shift() ?? new Date(CALLBACK_TIME),
-        timeoutMs: 1_000,
-        retentionMs: 1_000,
-      },
+      () => times.shift() ?? new Date(CALLBACK_TIME),
     );
 
     try {
-      review.startReview(digests());
-      review.submitReview(validSubmission());
+      review.startReview(startInput());
+      review.submitReview(validCallback());
       assert.equal(review.getReviewStatus(REVIEW_ID).status, "pending");
       launch.resolve(launchAcknowledgement());
       await waitFor(() => review.getReviewStatus(REVIEW_ID).status === "succeeded");
-      const status = review.getReviewStatus(REVIEW_ID);
-      assert.equal(status.status, "succeeded");
-      assert.equal(status.assistantOutputCaptured, false);
-      assert.deepEqual(
-        {
-          reviewId: (status as { reviewId: string }).reviewId,
-          role: (status as { role: string }).role,
-          result: (status as { result: string }).result,
-          summary: (status as { summary: string }).summary,
-          findings: (status as { findings: unknown }).findings,
-          reviewedAt: (status as { reviewedAt: string }).reviewedAt,
-          candidateManifestDigest: (status as { candidateManifestDigest: string })
-            .candidateManifestDigest,
-          evidenceManifestDigest: (status as { evidenceManifestDigest: string })
-            .evidenceManifestDigest,
-          rolePolicyDigest: (status as { rolePolicyDigest: string }).rolePolicyDigest,
-          conversationIdentitySha256: (status as { conversationIdentitySha256: string })
-            .conversationIdentitySha256,
-          callbackTimestamp: (status as { callbackTimestamp: string }).callbackTimestamp,
-        },
-        {
-          ...validSubmission(),
-          ...digests(),
-          conversationIdentitySha256: CONVERSATION_HASH,
-          callbackTimestamp: CALLBACK_TIME,
-        },
+      assert.equal(
+        (review.getReviewStatus(REVIEW_ID) as { conversationIdentitySha256: string })
+          .conversationIdentitySha256,
+        CONVERSATION_HASH,
       );
     } finally {
       review.close();
@@ -238,95 +301,61 @@ test("callback and launch acknowledgement may arrive in either order", async (t)
   await t.test("launch first", async () => {
     const times = [new Date(START_TIME), new Date(CALLBACK_TIME)];
     let launchReturned = false;
-    const review = new ReviewReturnController(
+    const review = controller(
       {
         launchWebConversation: async () => {
           launchReturned = true;
           return launchAcknowledgement();
         },
       },
-      {
-        reviewIdFactory: () => REVIEW_ID,
-        now: () => times.shift() ?? new Date(CALLBACK_TIME),
-        timeoutMs: 1_000,
-        retentionMs: 1_000,
-      },
+      () => times.shift() ?? new Date(CALLBACK_TIME),
     );
 
     try {
-      review.startReview(digests());
+      review.startReview(startInput());
       await waitFor(() => launchReturned);
       assert.equal(review.getReviewStatus(REVIEW_ID).status, "pending");
-      review.submitReview(validSubmission());
+      review.submitReview(validCallback());
       await waitFor(() => review.getReviewStatus(REVIEW_ID).status === "succeeded");
-      assert.throws(() => review.submitReview(validSubmission()), /already consumed|unknown/);
     } finally {
       review.close();
     }
   });
 });
 
-test("schema and binding validation fail closed", () => {
-  const review = new ReviewReturnController(
-    { launchWebConversation: async () => launchAcknowledgement() },
-    {
-      reviewIdFactory: () => REVIEW_ID,
-      now: () => new Date(START_TIME),
-      timeoutMs: 1_000,
-      retentionMs: 1_000,
+test("start returns before launch and prompt contains challenge not reviewId", async () => {
+  const launch = deferred<WebLaunchAcknowledgement>();
+  const prompts: string[] = [];
+  const review = controller({
+    launchWebConversation: async (prompt: string) => {
+      prompts.push(prompt);
+      return launch.promise;
     },
-  );
+  });
 
   try {
-    review.startReview(digests());
-    assert.throws(
-      () => review.submitReview(validSubmission({ role: "STRATEGY" as "PRODUCT" })),
-      /PRODUCT/,
-    );
-    assert.throws(
-      () => review.submitReview(validSubmission({ result: "maybe" as "pass" })),
-      /pass.*fail.*abstain/,
-    );
-    assert.throws(
-      () => review.submitReview(validSubmission({ summary: "" })),
-      /summary/,
-    );
-    assert.throws(
-      () => review.submitReview(validSubmission({ reviewId: "0".repeat(64) })),
-      /unknown|expired|completed/,
-    );
-    assert.throws(
-      () =>
-        review.startReview({
-          ...digests(),
-          candidateManifestDigest: "not-a-digest",
-        }),
-      /candidateManifestDigest/,
-    );
-  } finally {
-    review.close();
-  }
-});
-
-test("launch failure remains retrievable", async () => {
-  const review = new ReviewReturnController(
-    { launchWebConversation: async () => Promise.reject(new Error("browser failed")) },
-    {
-      reviewIdFactory: () => REVIEW_ID,
-      now: () => new Date(START_TIME),
-      timeoutMs: 1_000,
-      retentionMs: 1_000,
-    },
-  );
-
-  try {
-    review.startReview(digests());
-    await waitFor(() => review.getReviewStatus(REVIEW_ID).status === "failed");
-    assert.equal(
-      (review.getReviewStatus(REVIEW_ID) as { failureCode?: string }).failureCode,
-      "launch_failed",
-    );
-    assert.throws(() => review.submitReview(validSubmission()), /unknown|expired|completed/);
+    const started = review.startReview(startInput());
+    assert.deepEqual(started, {
+      slice: "REVIEW-RETURN-2",
+      reviewId: REVIEW_ID,
+      role: "PRODUCT",
+      status: "pending",
+      startedAt: START_TIME,
+      expiresAt: "2026-08-02T08:00:01.000Z",
+      candidateManifestDigest: CANDIDATE_DIGEST,
+      evidenceManifestDigest: EVIDENCE_DIGEST,
+      rolePolicyDigest: PRODUCT_ROLE_POLICY_DIGEST,
+      assistantOutputCaptured: false,
+    });
+    assert.equal(prompts.length, 0);
+    await Promise.resolve();
+    assert.equal(prompts.length, 1);
+    assert.match(prompts[0]!, new RegExp(CHALLENGE));
+    assert.match(prompts[0]!, new RegExp(CANDIDATE_MANIFEST));
+    assert.match(prompts[0]!, new RegExp(EVIDENCE_MANIFEST));
+    assert.doesNotMatch(prompts[0]!, new RegExp(REVIEW_ID));
+    assert.throws(() => review.startReview(startInput()), /in progress|duplicate/);
+    launch.resolve(launchAcknowledgement());
   } finally {
     review.close();
   }
@@ -348,6 +377,7 @@ test("independent sessions survive source disconnect and retrieve the structured
   const times = [new Date(START_TIME), new Date(CALLBACK_TIME)];
   const review = new ReviewReturnController(browser, {
     reviewIdFactory: () => REVIEW_ID,
+    challengeFactory: () => CHALLENGE,
     now: () => times.shift() ?? new Date(CALLBACK_TIME),
     timeoutMs: 1_000,
     retentionMs: 1_000,
@@ -395,37 +425,47 @@ test("independent sessions survive source disconnect and retrieve the structured
     await statusClient.connect(statusClientTransport);
 
     const listed = await spawnedClient.listTools();
-    assert.ok(listed.tools.some((tool) => tool.name === "review_start"));
-    assert.ok(listed.tools.some((tool) => tool.name === "review_submit"));
-    assert.ok(listed.tools.some((tool) => tool.name === "review_status"));
     const submit = listed.tools.find((tool) => tool.name === "review_submit");
+    const start = listed.tools.find((tool) => tool.name === "review_start");
     assert.ok(submit);
-    assert.equal(submit.annotations?.readOnlyHint, false);
-    assert.equal(submit.annotations?.idempotentHint, false);
+    assert.ok(start);
+    assert.deepEqual(Object.keys(submit.inputSchema.properties ?? {}).sort(), [
+      "challenge",
+      "findings",
+      "result",
+      "summary",
+    ]);
+    assert.deepEqual(Object.keys(start.inputSchema.properties ?? {}).sort(), [
+      "candidateManifest",
+      "candidateManifestDigest",
+      "evidenceManifest",
+      "evidenceManifestDigest",
+    ]);
 
     const startResult = await sourceClient.callTool({
       name: "review_start",
-      arguments: digests(),
+      arguments: startInput(),
     });
-    assert.deepEqual(startResult.structuredContent, {
-      slice: "REVIEW-RETURN-2",
-      reviewId: REVIEW_ID,
-      role: "PRODUCT",
-      status: "pending",
-      startedAt: START_TIME,
-      expiresAt: "2026-08-02T08:00:01.000Z",
-      ...digests(),
-      assistantOutputCaptured: false,
-    });
+    assert.equal(
+      (startResult.structuredContent as { reviewId?: string }).reviewId,
+      REVIEW_ID,
+    );
+    assert.equal(
+      (startResult.structuredContent as { rolePolicyDigest?: string }).rolePolicyDigest,
+      PRODUCT_ROLE_POLICY_DIGEST,
+    );
+
     const prompt = await promptReady;
-    assert.match(prompt, new RegExp(REVIEW_ID));
+    assert.match(prompt, new RegExp(CHALLENGE));
+    assert.match(prompt, new RegExp(CANDIDATE_MANIFEST));
+    assert.doesNotMatch(prompt, new RegExp(REVIEW_ID));
 
     await sourceClient.close();
     await sourceServer.close();
 
     const submitResult = await spawnedClient.callTool({
       name: "review_submit",
-      arguments: validSubmission(),
+      arguments: validCallback(),
     });
     assert.deepEqual(submitResult.structuredContent, {
       slice: "REVIEW-RETURN-2",
@@ -438,23 +478,19 @@ test("independent sessions survive source disconnect and retrieve the structured
       name: "review_status",
       arguments: { reviewId: REVIEW_ID },
     });
+    assert.equal((statusResult.structuredContent as { status?: string }).status, "succeeded");
     assert.equal(
-      (statusResult.structuredContent as { status?: string }).status,
-      "succeeded",
+      (statusResult.structuredContent as { role?: string }).role,
+      "PRODUCT",
     );
     assert.equal(
-      (statusResult.structuredContent as { assistantOutputCaptured?: boolean })
-        .assistantOutputCaptured,
-      false,
+      (statusResult.structuredContent as { reviewedAt?: string }).reviewedAt,
+      CALLBACK_TIME,
     );
     assert.equal(
       (statusResult.structuredContent as { conversationIdentitySha256?: string })
         .conversationIdentitySha256,
       CONVERSATION_HASH,
-    );
-    assert.equal(
-      (statusResult.structuredContent as { result?: string }).result,
-      "pass",
     );
   } finally {
     review.close();

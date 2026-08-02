@@ -5,6 +5,7 @@ import type { ReviewReturnController } from "./review-return.js";
 
 const NO_APP_META = { _meta: {} } as const;
 const HEX_64_PATTERN = /^[0-9a-f]{64}$/;
+const MAX_MANIFEST_CHARS = 50_000;
 
 const findingSchema = z
   .object({
@@ -14,14 +15,12 @@ const findingSchema = z
   })
   .strict();
 
-const structuredResultSchema = z
+const callbackSchema = z
   .object({
-    reviewId: z.string().regex(HEX_64_PATTERN),
-    role: z.literal("PRODUCT"),
+    challenge: z.string().regex(HEX_64_PATTERN),
     result: z.enum(["pass", "fail", "abstain"]),
     summary: z.string().min(1).max(4_000),
     findings: z.array(findingSchema).max(20),
-    reviewedAt: z.string().min(1).max(64),
   })
   .strict();
 
@@ -40,20 +39,26 @@ export function registerReviewReturnTools(input: {
     {
       title: "Start PRODUCT review return",
       description:
-        "REVIEW-RETURN-2 only. Starts one bounded asynchronous PRODUCT review against immutable candidate, evidence, and role-policy digests. Returns a review ID immediately, then launches one fixed review packet into a fresh ChatGPT Web conversation without waiting for the callback. It does not capture assistant output, open a workspace, read files, or accept previous reviewer output.",
+        "REVIEW-RETURN-2 only. Starts one bounded asynchronous PRODUCT review. Requires exact candidate and evidence manifest bytes plus their SHA-256 digests. The server recomputes digests, owns the PRODUCT role policy, returns a source-visible reviewId, and launches a fixed review packet containing the manifests and a prompt-only one-time challenge. It does not capture assistant output, open a workspace, or accept previous reviewer output.",
       inputSchema: {
+        candidateManifest: z
+          .string()
+          .min(1)
+          .max(MAX_MANIFEST_CHARS)
+          .describe("Exact candidate manifest text included in the fresh-Web packet."),
         candidateManifestDigest: z
           .string()
           .regex(HEX_64_PATTERN)
-          .describe("SHA-256 hex digest of the immutable candidate manifest."),
+          .describe("SHA-256 hex digest of candidateManifest exact UTF-8 bytes."),
+        evidenceManifest: z
+          .string()
+          .min(1)
+          .max(MAX_MANIFEST_CHARS)
+          .describe("Exact evidence manifest text included in the fresh-Web packet."),
         evidenceManifestDigest: z
           .string()
           .regex(HEX_64_PATTERN)
-          .describe("SHA-256 hex digest of the immutable evidence manifest."),
-        rolePolicyDigest: z
-          .string()
-          .regex(HEX_64_PATTERN)
-          .describe("SHA-256 hex digest of the PRODUCT role policy."),
+          .describe("SHA-256 hex digest of evidenceManifest exact UTF-8 bytes."),
       },
       ...NO_APP_META,
       annotations: {
@@ -63,11 +68,17 @@ export function registerReviewReturnTools(input: {
         openWorldHint: true,
       },
     },
-    async ({ candidateManifestDigest, evidenceManifestDigest, rolePolicyDigest }) => {
+    async ({
+      candidateManifest,
+      candidateManifestDigest,
+      evidenceManifest,
+      evidenceManifestDigest,
+    }) => {
       const acknowledgement = review.startReview({
+        candidateManifest,
         candidateManifestDigest,
+        evidenceManifest,
         evidenceManifestDigest,
-        rolePolicyDigest,
       });
       return {
         content: [
@@ -87,14 +98,12 @@ export function registerReviewReturnTools(input: {
     {
       title: "Submit PRODUCT review result",
       description:
-        "REVIEW-RETURN-2 internal bounded callback. Invoke exactly once only when a newly launched ChatGPT conversation contains the exact PRODUCT review packet. Accepts only the fixed structured result schema. It does not open a workspace, access files, run commands, capture assistant transcripts, or accept previous reviewer output.",
+        "REVIEW-RETURN-2 internal bounded callback. Invoke exactly once only when a newly launched ChatGPT conversation contains the prompt-only one-time challenge. Accepts only challenge, result, summary, and findings. The server owns reviewId, role, role policy digest, reviewedAt, and callback timestamps. It does not open a workspace, access files, run commands, or capture assistant transcripts.",
       inputSchema: {
-        reviewId: structuredResultSchema.shape.reviewId,
-        role: structuredResultSchema.shape.role,
-        result: structuredResultSchema.shape.result,
-        summary: structuredResultSchema.shape.summary,
-        findings: structuredResultSchema.shape.findings,
-        reviewedAt: structuredResultSchema.shape.reviewedAt,
+        challenge: callbackSchema.shape.challenge,
+        result: callbackSchema.shape.result,
+        summary: callbackSchema.shape.summary,
+        findings: callbackSchema.shape.findings,
       },
       ...NO_APP_META,
       annotations: {
@@ -105,7 +114,7 @@ export function registerReviewReturnTools(input: {
       },
     },
     async (args) => {
-      const payload = structuredResultSchema.parse(args);
+      const payload = callbackSchema.parse(args);
       const acknowledgement = review.submitReview(payload);
       return {
         content: [
@@ -125,7 +134,7 @@ export function registerReviewReturnTools(input: {
     {
       title: "Read PRODUCT review status",
       description:
-        "REVIEW-RETURN-2 only. Retrieves the retained bounded state for one review ID. Returns pending, succeeded, failed, or expired metadata with immutable digest bindings when available. Does not access assistant output, browser content, workspaces, files, commands, or persistent storage.",
+        "REVIEW-RETURN-2 only. Retrieves the retained bounded state for one source-visible review ID. Returns pending, succeeded, failed, or expired metadata with server-owned digest bindings. Does not access assistant output, browser content, workspaces, files, commands, or persistent storage.",
       inputSchema: {
         reviewId: z
           .string()

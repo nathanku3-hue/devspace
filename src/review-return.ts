@@ -1,4 +1,4 @@
-import { randomBytes } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import {
   RetainedExternalConversationRuns,
   type ExternalConversationRunStatus,
@@ -14,6 +14,23 @@ const MAX_SUMMARY_CHARS = 4_000;
 const MAX_FINDINGS = 20;
 const MAX_FINDING_CLAIM_CHARS = 2_000;
 const MAX_FINDING_EVIDENCE_REF_CHARS = 512;
+const MAX_MANIFEST_CHARS = 50_000;
+
+/**
+ * Server-owned PRODUCT review policy. Digest is computed over these exact bytes.
+ * Callers cannot supply or override role policy content.
+ */
+export const PRODUCT_ROLE_POLICY = [
+  "REVIEW-RETURN-2 PRODUCT role policy v1.",
+  "Review only the candidate manifest and evidence manifest supplied in this packet.",
+  "Judge product correctness, scope fit, and acceptance clarity.",
+  "result must be pass, fail, or abstain.",
+  "findings must cite evidenceRef values present in the evidence manifest when possible.",
+  "Do not invent repository state, prior reviewer output, or assistant transcript content.",
+  "Do not invoke any connector tool other than review_submit.",
+].join("\n");
+
+export const PRODUCT_ROLE_POLICY_DIGEST = sha256Hex(PRODUCT_ROLE_POLICY);
 
 export type ReviewResultVerdict = "pass" | "fail" | "abstain";
 export type ReviewFindingSeverity = "blocking" | "material" | "advisory";
@@ -24,6 +41,20 @@ export interface ReviewFinding {
   evidenceRef: string;
 }
 
+export interface ReviewStartInput {
+  candidateManifest: string;
+  candidateManifestDigest: string;
+  evidenceManifest: string;
+  evidenceManifestDigest: string;
+}
+
+export interface ReviewCallbackInput {
+  challenge: string;
+  result: ReviewResultVerdict;
+  summary: string;
+  findings: ReviewFinding[];
+}
+
 export interface ReviewStructuredResult {
   reviewId: string;
   role: "PRODUCT";
@@ -31,12 +62,6 @@ export interface ReviewStructuredResult {
   summary: string;
   findings: ReviewFinding[];
   reviewedAt: string;
-}
-
-export interface ReviewStartInput {
-  candidateManifestDigest: string;
-  evidenceManifestDigest: string;
-  rolePolicyDigest: string;
 }
 
 export interface ReviewStartAcknowledgement extends Record<string, unknown> {
@@ -106,6 +131,7 @@ export type ReviewStatusAcknowledgement =
 
 export interface ReviewReturnOptions {
   reviewIdFactory?: () => string;
+  challengeFactory?: () => string;
   now?: () => Date;
   timeoutMs?: number;
   retentionMs?: number;
@@ -131,10 +157,13 @@ export class ReviewReturnError extends Error {
 export class ReviewReturnController {
   readonly #browser: Pick<WebLaunchBrowserController, "launchWebConversation">;
   readonly #reviewIdFactory: () => string;
+  readonly #challengeFactory: () => string;
   readonly #now: () => Date;
   readonly #runs: RetainedExternalConversationRuns<ReviewReturnResult>;
   readonly #bindingsByReviewId = new Map<string, FrozenReviewBindings>();
   readonly #submissionByReviewId = new Map<string, PendingSubmission>();
+  readonly #reviewIdByChallenge = new Map<string, string>();
+  readonly #challengeByReviewId = new Map<string, string>();
 
   constructor(
     browser: Pick<WebLaunchBrowserController, "launchWebConversation">,
@@ -143,6 +172,8 @@ export class ReviewReturnController {
     this.#browser = browser;
     this.#reviewIdFactory =
       options.reviewIdFactory ?? (() => randomBytes(32).toString("hex"));
+    this.#challengeFactory =
+      options.challengeFactory ?? (() => randomBytes(32).toString("hex"));
     this.#now = options.now ?? (() => new Date());
 
     this.#runs = new RetainedExternalConversationRuns<ReviewReturnResult>({
@@ -169,6 +200,7 @@ export class ReviewReturnController {
         };
       },
       onTerminal: (run) => {
+        this.#removeChallengeForReview(run.id);
         if (run.status !== "succeeded") {
           this.#submissionByReviewId.delete(run.id);
         }
@@ -177,20 +209,36 @@ export class ReviewReturnController {
   }
 
   startReview(input: ReviewStartInput): ReviewStartAcknowledgement {
-    const candidateManifestDigest = assertHex64(
+    const candidateManifest = assertBoundedManifest(
+      input.candidateManifest,
+      "candidateManifest",
+    );
+    const evidenceManifest = assertBoundedManifest(
+      input.evidenceManifest,
+      "evidenceManifest",
+    );
+    const candidateManifestDigest = assertMatchingDigest(
+      candidateManifest,
       input.candidateManifestDigest,
       "candidateManifestDigest",
     );
-    const evidenceManifestDigest = assertHex64(
+    const evidenceManifestDigest = assertMatchingDigest(
+      evidenceManifest,
       input.evidenceManifestDigest,
       "evidenceManifestDigest",
     );
-    const rolePolicyDigest = assertHex64(input.rolePolicyDigest, "rolePolicyDigest");
+    const rolePolicyDigest = PRODUCT_ROLE_POLICY_DIGEST;
+
     const reviewId = this.#reviewIdFactory();
+    const challenge = this.#challengeFactory();
     assertHex64(reviewId, "reviewId");
+    assertHex64(challenge, "challenge");
 
     if (this.#runs.get(reviewId)) {
       throw new ReviewReturnError("REVIEW-RETURN-2 generated a duplicate review ID");
+    }
+    if (this.#reviewIdByChallenge.has(challenge)) {
+      throw new ReviewReturnError("REVIEW-RETURN-2 generated a duplicate challenge");
     }
 
     const run = this.#runs.start(reviewId, this.#now());
@@ -199,14 +247,19 @@ export class ReviewReturnController {
       evidenceManifestDigest,
       rolePolicyDigest,
     });
+    this.#reviewIdByChallenge.set(challenge, reviewId);
+    this.#challengeByReviewId.set(reviewId, challenge);
 
     void Promise.resolve()
       .then(() =>
         this.#browser.launchWebConversation(
           buildReviewReturnPrompt({
-            reviewId,
+            challenge,
+            candidateManifest,
             candidateManifestDigest,
+            evidenceManifest,
             evidenceManifestDigest,
+            rolePolicy: PRODUCT_ROLE_POLICY,
             rolePolicyDigest,
           }),
         ),
@@ -234,34 +287,47 @@ export class ReviewReturnController {
     };
   }
 
-  submitReview(payload: ReviewStructuredResult): ReviewSubmitAcknowledgement {
-    const structured = normalizeStructuredResult(payload);
-    const bindings = this.#bindingsByReviewId.get(structured.reviewId);
-    const run = this.#runs.get(structured.reviewId);
+  submitReview(payload: ReviewCallbackInput): ReviewSubmitAcknowledgement {
+    const callback = normalizeCallbackInput(payload);
+    const reviewId = this.#reviewIdByChallenge.get(callback.challenge);
+    if (!reviewId) {
+      throw new ReviewReturnError(
+        "REVIEW-RETURN-2 challenge is unknown, expired, or already consumed",
+      );
+    }
+
+    const bindings = this.#bindingsByReviewId.get(reviewId);
+    const run = this.#runs.get(reviewId);
     if (!bindings || !run || run.status !== "pending") {
       throw new ReviewReturnError(
         "REVIEW-RETURN-2 review is unknown, expired, or already completed",
       );
     }
-    if (this.#submissionByReviewId.has(structured.reviewId)) {
-      throw new ReviewReturnError(
-        "REVIEW-RETURN-2 review callback already consumed",
-      );
+    if (this.#submissionByReviewId.has(reviewId)) {
+      throw new ReviewReturnError("REVIEW-RETURN-2 review callback already consumed");
     }
 
-    const timestamp = this.#now().toISOString();
-    const retained: ReviewStructuredResult = {
-      ...structured,
-      reviewedAt: structured.reviewedAt,
+    // Consume the prompt-only challenge before accepting the callback body.
+    this.#reviewIdByChallenge.delete(callback.challenge);
+    this.#challengeByReviewId.delete(reviewId);
+
+    const reviewedAt = this.#now().toISOString();
+    const structured: ReviewStructuredResult = {
+      reviewId,
+      role: ROLE,
+      result: callback.result,
+      summary: callback.summary,
+      findings: callback.findings,
+      reviewedAt,
     };
-    this.#submissionByReviewId.set(structured.reviewId, { structured: retained });
-    this.#runs.recordCallback(structured.reviewId, timestamp);
+    this.#submissionByReviewId.set(reviewId, { structured });
+    this.#runs.recordCallback(reviewId, reviewedAt);
 
     return {
       slice: SLICE,
       reviewAccepted: true,
-      reviewId: structured.reviewId,
-      timestamp,
+      reviewId,
+      timestamp: reviewedAt,
     };
   }
 
@@ -311,17 +377,29 @@ export class ReviewReturnController {
   close(): void {
     this.#bindingsByReviewId.clear();
     this.#submissionByReviewId.clear();
+    this.#reviewIdByChallenge.clear();
+    this.#challengeByReviewId.clear();
     this.#runs.close();
+  }
+
+  #removeChallengeForReview(reviewId: string): void {
+    const challenge = this.#challengeByReviewId.get(reviewId);
+    if (!challenge) return;
+    this.#challengeByReviewId.delete(reviewId);
+    this.#reviewIdByChallenge.delete(challenge);
   }
 }
 
 export function buildReviewReturnPrompt(input: {
-  reviewId: string;
+  challenge: string;
+  candidateManifest: string;
   candidateManifestDigest: string;
+  evidenceManifest: string;
   evidenceManifestDigest: string;
+  rolePolicy: string;
   rolePolicyDigest: string;
 }): string {
-  assertHex64(input.reviewId, "reviewId");
+  assertHex64(input.challenge, "challenge");
   assertHex64(input.candidateManifestDigest, "candidateManifestDigest");
   assertHex64(input.evidenceManifestDigest, "evidenceManifestDigest");
   assertHex64(input.rolePolicyDigest, "rolePolicyDigest");
@@ -329,17 +407,26 @@ export function buildReviewReturnPrompt(input: {
     "REVIEW-RETURN-2 PRODUCT review packet.",
     "Use the connected DevSpace connector through the normal ChatGPT tool interface.",
     "You are the PRODUCT reviewer for this candidate.",
-    `reviewId: ${input.reviewId}`,
+    "Review only the candidate and evidence content in this packet under the PRODUCT policy.",
+    `challenge: ${input.challenge}`,
     `candidateManifestDigest: ${input.candidateManifestDigest}`,
     `evidenceManifestDigest: ${input.evidenceManifestDigest}`,
     `rolePolicyDigest: ${input.rolePolicyDigest}`,
-    "Invoke the bounded `review_submit` tool exactly once with this exact structured payload:",
-    '- reviewId matching the value above',
-    '- role "PRODUCT"',
+    "----- BEGIN CANDIDATE MANIFEST -----",
+    input.candidateManifest,
+    "----- END CANDIDATE MANIFEST -----",
+    "----- BEGIN EVIDENCE MANIFEST -----",
+    input.evidenceManifest,
+    "----- END EVIDENCE MANIFEST -----",
+    "----- BEGIN PRODUCT ROLE POLICY -----",
+    input.rolePolicy,
+    "----- END PRODUCT ROLE POLICY -----",
+    "Invoke the bounded `review_submit` tool exactly once with:",
+    "- challenge matching the value above",
     "- result one of pass | fail | abstain",
     "- summary bounded text",
     "- findings array of {severity: blocking|material|advisory, claim, evidenceRef}",
-    "- reviewedAt ISO-8601 timestamp",
+    "Do not supply reviewId, role, rolePolicyDigest, or reviewedAt; the server owns those.",
     "Do not invoke any other connector tool.",
     "Do not include previous reviewer output.",
     "Do not capture or return assistant transcript text.",
@@ -347,14 +434,15 @@ export function buildReviewReturnPrompt(input: {
   ].join("\n");
 }
 
-function normalizeStructuredResult(payload: ReviewStructuredResult): ReviewStructuredResult {
+export function sha256Hex(value: string): string {
+  return createHash("sha256").update(value, "utf8").digest("hex");
+}
+
+function normalizeCallbackInput(payload: ReviewCallbackInput): ReviewCallbackInput {
   if (!payload || typeof payload !== "object") {
     throw new ReviewReturnError("REVIEW-RETURN-2 callback payload must be an object");
   }
-  const reviewId = assertHex64(payload.reviewId, "reviewId");
-  if (payload.role !== ROLE) {
-    throw new ReviewReturnError('REVIEW-RETURN-2 role must be "PRODUCT"');
-  }
+  const challenge = assertHex64(payload.challenge, "challenge");
   if (payload.result !== "pass" && payload.result !== "fail" && payload.result !== "abstain") {
     throw new ReviewReturnError(
       'REVIEW-RETURN-2 result must be "pass", "fail", or "abstain"',
@@ -379,17 +467,11 @@ function normalizeStructuredResult(payload: ReviewStructuredResult): ReviewStruc
       `REVIEW-RETURN-2 findings must contain at most ${MAX_FINDINGS} items`,
     );
   }
-  const findings = payload.findings.map((finding, index) =>
-    normalizeFinding(finding, index),
-  );
-  const reviewedAt = assertIso8601(payload.reviewedAt, "reviewedAt");
   return {
-    reviewId,
-    role: ROLE,
+    challenge,
     result: payload.result,
     summary: payload.summary,
-    findings,
-    reviewedAt,
+    findings: payload.findings.map((finding, index) => normalizeFinding(finding, index)),
   };
 }
 
@@ -431,22 +513,43 @@ function normalizeFinding(finding: ReviewFinding, index: number): ReviewFinding 
   };
 }
 
-function assertHex64(value: string, label: string): string {
-  if (typeof value !== "string" || !HEX_64_PATTERN.test(value)) {
+function assertBoundedManifest(value: string, label: string): string {
+  if (typeof value !== "string") {
+    throw new ReviewReturnError(`REVIEW-RETURN-2 ${label} must be a string`);
+  }
+  if (value.length === 0 || value.length > MAX_MANIFEST_CHARS) {
     throw new ReviewReturnError(
-      `REVIEW-RETURN-2 ${label} must be exactly 64 lowercase hexadecimal characters`,
+      `REVIEW-RETURN-2 ${label} must be 1..${MAX_MANIFEST_CHARS} characters`,
+    );
+  }
+  if (value.includes("\r")) {
+    throw new ReviewReturnError(
+      `REVIEW-RETURN-2 ${label} rejects carriage returns so digest bytes stay exact`,
     );
   }
   return value;
 }
 
-function assertIso8601(value: string, label: string): string {
-  if (typeof value !== "string" || value.length === 0 || value.length > 64) {
-    throw new ReviewReturnError(`REVIEW-RETURN-2 ${label} must be a bounded ISO-8601 string`);
+function assertMatchingDigest(
+  content: string,
+  suppliedDigest: string,
+  label: string,
+): string {
+  const expected = assertHex64(suppliedDigest, label);
+  const actual = sha256Hex(content);
+  if (actual !== expected) {
+    throw new ReviewReturnError(
+      `REVIEW-RETURN-2 ${label} does not match the exact manifest content`,
+    );
   }
-  const parsed = Date.parse(value);
-  if (!Number.isFinite(parsed)) {
-    throw new ReviewReturnError(`REVIEW-RETURN-2 ${label} must be a valid ISO-8601 timestamp`);
+  return expected;
+}
+
+function assertHex64(value: string, label: string): string {
+  if (typeof value !== "string" || !HEX_64_PATTERN.test(value)) {
+    throw new ReviewReturnError(
+      `REVIEW-RETURN-2 ${label} must be exactly 64 lowercase hexadecimal characters`,
+    );
   }
   return value;
 }
