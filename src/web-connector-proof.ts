@@ -59,8 +59,8 @@ export interface WebConnectorPendingStatus extends WebConnectorStatusBase {
   status: "pending";
 }
 
-export interface WebConnectorSucceededStatus extends WebConnectorStatusBase,
-  WebConnectorProofResult {
+export interface WebConnectorSucceededStatus
+  extends WebConnectorStatusBase, WebConnectorProofResult {
   status: "succeeded";
 }
 
@@ -93,36 +93,57 @@ interface RetainedRunRecord<TResult> {
   cleanupTimer?: NodeJS.Timeout;
 }
 
-interface RetainedExternalConversationRunsOptions<TResult> {
+export interface RetainedExternalConversationRunsOptions<TResult> {
+  /** Slice label used in error messages (e.g. WEB-CONNECTOR-1, REVIEW-RETURN-2). */
+  label?: string;
   timeoutMs: number;
   retentionMs: number;
   buildResult(run: ExternalConversationRun<TResult>): TResult;
   onTerminal?(run: ExternalConversationRun<TResult>): void;
+  errorFactory?(message: string): Error;
 }
 
+/**
+ * One-active-run retain/timeout/callback harness shared by async Web slices.
+ * Exported in place from WEB-CONNECTOR-1 for REVIEW-RETURN-2 reuse (no separate module).
+ */
 export class RetainedExternalConversationRuns<TResult> {
+  readonly #label: string;
   readonly #timeoutMs: number;
   readonly #retentionMs: number;
   readonly #buildResult: (run: ExternalConversationRun<TResult>) => TResult;
   readonly #onTerminal?: (run: ExternalConversationRun<TResult>) => void;
+  readonly #errorFactory: (message: string) => Error;
   readonly #records = new Map<string, RetainedRunRecord<TResult>>();
   #activeRunId: string | undefined;
 
   constructor(options: RetainedExternalConversationRunsOptions<TResult>) {
-    this.#timeoutMs = assertPositiveInteger(options.timeoutMs, "run timeout");
-    this.#retentionMs = assertPositiveInteger(options.retentionMs, "run retention");
+    this.#label = options.label ?? "WEB-CONNECTOR-1";
+    this.#timeoutMs = assertPositiveInteger(options.timeoutMs, `${this.#label} run timeout`);
+    this.#retentionMs = assertPositiveInteger(
+      options.retentionMs,
+      `${this.#label} run retention`,
+    );
     this.#buildResult = options.buildResult;
     this.#onTerminal = options.onTerminal;
+    this.#errorFactory =
+      options.errorFactory ?? ((message) => new WebConnectorProofError(message));
   }
 
   start(id: string, startedAt: Date): ExternalConversationRun<TResult> {
     if (this.#activeRunId) {
-      throw new WebConnectorProofError(
-        "WEB-CONNECTOR-1 already has a connector run in progress",
+      throw this.#errorFactory(
+        this.#label === "WEB-CONNECTOR-1"
+          ? "WEB-CONNECTOR-1 already has a connector run in progress"
+          : `${this.#label} already has a run in progress`,
       );
     }
     if (this.#records.has(id)) {
-      throw new WebConnectorProofError("WEB-CONNECTOR-1 generated a duplicate proof ID");
+      throw this.#errorFactory(
+        this.#label === "WEB-CONNECTOR-1"
+          ? "WEB-CONNECTOR-1 generated a duplicate proof ID"
+          : `${this.#label} generated a duplicate run ID`,
+      );
     }
 
     const startedAtIso = startedAt.toISOString();
@@ -161,8 +182,10 @@ export class RetainedExternalConversationRuns<TResult> {
   recordCallback(id: string, callbackReceivedAt: string): void {
     const record = this.#records.get(id);
     if (!record || record.run.status !== "pending") {
-      throw new WebConnectorProofError(
-        "WEB-CONNECTOR-1 proof is unknown, expired, or already completed",
+      throw this.#errorFactory(
+        this.#label === "WEB-CONNECTOR-1"
+          ? "WEB-CONNECTOR-1 proof is unknown, expired, or already completed"
+          : `${this.#label} run is unknown, expired, or already completed`,
       );
     }
     record.run.callbackReceivedAt = callbackReceivedAt;
@@ -234,8 +257,10 @@ export class WebConnectorProofController {
     this.#now = options.now ?? (() => new Date());
 
     this.#runs = new RetainedExternalConversationRuns<WebConnectorProofResult>({
+      label: "WEB-CONNECTOR-1",
       timeoutMs: options.timeoutMs ?? DEFAULT_RUN_TIMEOUT_MS,
       retentionMs: options.retentionMs ?? DEFAULT_RUN_RETENTION_MS,
+      errorFactory: (message) => new WebConnectorProofError(message),
       buildResult: (run) => ({
         connectorDiscovered: true,
         connectorInvoked: true,
@@ -386,9 +411,7 @@ function assertValidHex64(value: string, label: "challenge" | "proof ID"): void 
 
 function assertPositiveInteger(value: number, label: string): number {
   if (!Number.isSafeInteger(value) || value <= 0) {
-    throw new WebConnectorProofError(
-      `WEB-CONNECTOR-1 ${label} must be a positive integer`,
-    );
+    throw new WebConnectorProofError(`${label} must be a positive integer`);
   }
   return value;
 }

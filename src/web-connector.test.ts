@@ -301,9 +301,41 @@ test("independent sessions survive source disconnect and retrieve the callback",
   });
   const workspaces = new WorkspaceRegistry(config);
   const reviewCheckpoints = createReviewCheckpointManager();
-  const sourceServer = createMcpServer(config, workspaces, reviewCheckpoints, browser, proof);
-  const spawnedServer = createMcpServer(config, workspaces, reviewCheckpoints, browser, proof);
-  const statusServer = createMcpServer(config, workspaces, reviewCheckpoints, browser, proof);
+  const reviewReturn = {
+    startReview: () => {
+      throw new Error("unexpected review_start");
+    },
+    submitReview: () => {
+      throw new Error("unexpected review_submit");
+    },
+    getReviewStatus: () => {
+      throw new Error("unexpected review_status");
+    },
+  };
+  const sourceServer = createMcpServer(
+    config,
+    workspaces,
+    reviewCheckpoints,
+    browser,
+    proof,
+    reviewReturn,
+  );
+  const spawnedServer = createMcpServer(
+    config,
+    workspaces,
+    reviewCheckpoints,
+    browser,
+    proof,
+    reviewReturn,
+  );
+  const statusServer = createMcpServer(
+    config,
+    workspaces,
+    reviewCheckpoints,
+    browser,
+    proof,
+    reviewReturn,
+  );
   const sourceClient = new Client({ name: "web-connector-source", version: "1.0.0" });
   const spawnedClient = new Client({ name: "web-connector-spawned", version: "1.0.0" });
   const statusClient = new Client({ name: "web-connector-status", version: "1.0.0" });
@@ -330,6 +362,9 @@ test("independent sessions survive source disconnect and retrieve the callback",
         "publish_git_changes",
         "read",
         "read_files",
+        "review_start",
+        "review_status",
+        "review_submit",
         "safe_rename_file",
         "web_connector_probe",
         "web_connector_start",
