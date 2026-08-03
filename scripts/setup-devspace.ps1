@@ -42,6 +42,7 @@ $script:intentionalStop = $false
 $script:leaveRunning = $false
 $script:cloudflaredProcess = $null
 $script:devspaceProcess = $null
+$script:devspaceCliPath = $null
 $script:setupLogFile = Join-Path $env:TEMP "devspace_setup.log"
 $script:runtimePidFile = Join-Path $env:USERPROFILE ".devspace\runtime.json"
 $script:probeClientFile = Join-Path $env:USERPROFILE ".devspace\setup-probe-client.json"
@@ -641,10 +642,68 @@ function Stop-DevSpaceRuntime {
 }
 
 function Find-DevSpaceServeProcess {
-    Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object {
+    param([string]$ExpectedCliPath = $null)
+
+    # Match main-repo, worktree, and absolute installs:
+    #   ...\devspace-src\dist\cli.js serve
+    #   ...\devspace-src\.worktrees\<id>\dist\cli.js serve
+    # The old pattern required devspace-src\dist immediately and missed worktrees.
+    $candidates = @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object {
         $cmd = if ($_.CommandLine) { $_.CommandLine } else { "" }
-        $cmd -match 'devspace-src[\\/]+dist[\\/]+cli\.js' -and $cmd -match 'serve'
-    } | Select-Object -First 1
+        if ($cmd -notmatch 'serve') { return $false }
+        if ($cmd -match 'dist[\\/]+cli\.js') { return $true }
+        if ($cmd -match 'cli\.js["\s]+serve') { return $true }
+        if ($ExpectedCliPath) {
+            $normExpected = ($ExpectedCliPath -replace '/', '\').ToLowerInvariant()
+            $normCmd = ($cmd -replace '/', '\').ToLowerInvariant()
+            if ($normCmd.Contains($normExpected)) { return $true }
+        }
+        return $false
+    })
+
+    if ($ExpectedCliPath -and $candidates.Count -gt 0) {
+        $normExpected = ($ExpectedCliPath -replace '/', '\').ToLowerInvariant()
+        $exact = $candidates | Where-Object {
+            $normCmd = ($_.CommandLine -replace '/', '\').ToLowerInvariant()
+            $normCmd.Contains($normExpected)
+        } | Select-Object -First 1
+        if ($exact) { return $exact }
+    }
+    return $candidates | Select-Object -First 1
+}
+
+function Get-ListenerProcessId([int]$port) {
+    try {
+        $owner = Get-NetTCPConnection -LocalPort $port -State Listen -ErrorAction SilentlyContinue |
+            Select-Object -ExpandProperty OwningProcess -Unique |
+            Select-Object -First 1
+        if ($owner) { return [int]$owner }
+    } catch {}
+    return $null
+}
+
+function Resolve-DevSpaceServeProcess {
+    param(
+        [string]$ExpectedCliPath = $null,
+        [System.Diagnostics.Process]$Preferred = $null
+    )
+    if ($Preferred -and (Test-ManagedProcessAlive $Preferred)) {
+        return $Preferred
+    }
+
+    $found = Find-DevSpaceServeProcess -ExpectedCliPath $ExpectedCliPath
+    if ($found) {
+        $byCmd = Get-Process -Id $found.ProcessId -ErrorAction SilentlyContinue
+        if ($byCmd) { return $byCmd }
+    }
+
+    # Port-based rebind: WMI may have started a healthy serve that cmdline discovery missed.
+    $ownerId = Get-ListenerProcessId -port $LocalPort
+    if ($ownerId) {
+        $byPort = Get-Process -Id $ownerId -ErrorAction SilentlyContinue
+        if ($byPort) { return $byPort }
+    }
+    return $null
 }
 
 function Stop-DevSpaceRelatedProcesses {
@@ -975,16 +1034,24 @@ function Start-DevSpaceServer([string]$devspaceCli, [string]$tunnelHost) {
     }
     Write-SetupLog "Launcher PID=$($create.ProcessId) ($launcherCmd)"
 
+    $script:devspaceCliPath = $devspaceCli
     $proc = $null
     for ($i = 0; $i -lt 30; $i++) {
         Start-Sleep -Milliseconds 400
-        $found = Find-DevSpaceServeProcess
-        if ($found) {
-            $proc = Get-Process -Id $found.ProcessId -ErrorAction SilentlyContinue
+        $proc = Resolve-DevSpaceServeProcess -ExpectedCliPath $devspaceCli
+        if ($proc) { break }
+        # Healthy listener without a matched cmdline still counts (worktree / permission edge cases).
+        if (Test-LocalDevSpaceHealthy) {
+            $proc = Resolve-DevSpaceServeProcess -ExpectedCliPath $devspaceCli
             if ($proc) { break }
         }
     }
     if ($null -eq $proc) {
+        # Never dual-launch when something already answers /healthz on LocalPort.
+        if (Test-LocalDevSpaceHealthy) {
+            $ownerId = Get-ListenerProcessId -port $LocalPort
+            throw "DevSpace is healthy on port $LocalPort (PID=$ownerId) but the serve process handle could not be resolved. Avoiding a second Start-Process launch."
+        }
         Write-SetupLog "WMI launcher did not yield serve PID; falling back to Start-Process." "WARN"
         $proc = Start-Process -FilePath $nodeExe `
             -ArgumentList @($devspaceCli, "serve") `
@@ -1218,8 +1285,7 @@ Write-Host "Waiting for tunnel URL..." -NoNewline
 for ($i = 0; $i -lt 30; $i++) {
     Start-Sleep -Seconds 1
     Write-Host "." -NoNewline
-    $script:cloudflaredProcess.Refresh()
-    if ($script:cloudflaredProcess.HasExited) {
+    if (-not (Test-ManagedProcessAlive $script:cloudflaredProcess)) {
         throw "cloudflared exited before publishing a URL. ExitCode=$(Get-SafeExitCode $script:cloudflaredProcess). See $logFile"
     }
     if (Test-Path $logFile) {
@@ -1261,13 +1327,21 @@ for ($i = 0; $i -lt 30; $i++) {
     Start-Sleep -Seconds 1
     Write-Host "." -NoNewline
 
-    $script:cloudflaredProcess.Refresh()
-    if ($script:cloudflaredProcess.HasExited) {
+    if (-not (Test-ManagedProcessAlive $script:cloudflaredProcess)) {
         throw "Cloudflare Tunnel stopped during startup. ExitCode=$(Get-SafeExitCode $script:cloudflaredProcess). See $logFile"
     }
-    $script:devspaceProcess.Refresh()
-    if ($script:devspaceProcess.HasExited) {
-        throw "DevSpace stopped during startup. PID=$($script:devspaceProcess.Id); ExitCode=$(Get-SafeExitCode $script:devspaceProcess)."
+    if (-not (Test-ManagedProcessAlive $script:devspaceProcess)) {
+        # Re-bind if WMI-detached serve is still healthy but the tracked handle went stale/job-killed.
+        $cliPath = if ($script:devspaceCliPath) { $script:devspaceCliPath } else { $devspaceCli }
+        $rebound = Resolve-DevSpaceServeProcess -ExpectedCliPath $cliPath
+        if ($rebound -and (Test-LocalDevSpaceHealthy)) {
+            Write-SetupLog "Re-bound DevSpace process handle after stale exit flag: oldPID=$($script:devspaceProcess.Id) newPID=$($rebound.Id)" "WARN"
+            $script:devspaceProcess = $rebound
+        } else {
+            $oldPid = if ($script:devspaceProcess) { $script:devspaceProcess.Id } else { "n/a" }
+            $tail = Get-LogTail $script:devspaceStderrLog 40
+            throw "DevSpace stopped during startup. PID=$oldPid; ExitCode=$(Get-SafeExitCode $script:devspaceProcess).`n--- stderr tail ---`n$tail"
+        }
     }
 
     if (Test-CloudflaredEdgeRegistered -logPath $logFile) {
@@ -1447,10 +1521,11 @@ if (-not $Monitor) {
 
         # Re-bind process handles if WMI-launched PIDs were recycled
         if (-not $dsAlive -or -not $localOk) {
-            $found = Find-DevSpaceServeProcess
-            if ($found) {
-                $script:devspaceProcess = Get-Process -Id $found.ProcessId -ErrorAction SilentlyContinue
-                $dsAlive = $null -ne $script:devspaceProcess
+            $cliPath = if ($script:devspaceCliPath) { $script:devspaceCliPath } else { $devspaceCli }
+            $rebound = Resolve-DevSpaceServeProcess -ExpectedCliPath $cliPath
+            if ($rebound) {
+                $script:devspaceProcess = $rebound
+                $dsAlive = Test-ManagedProcessAlive $script:devspaceProcess
                 $localOk = Test-LocalDevSpaceHealthy
             }
         }
