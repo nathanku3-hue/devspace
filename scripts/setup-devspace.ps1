@@ -626,7 +626,7 @@ function Stop-DevSpaceRuntime {
     }
     Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object {
         $cmd = if ($_.CommandLine) { $_.CommandLine } else { "" }
-        $_.Name -eq "cloudflared.exe" -or $cmd -match 'devspace-src.*cli\.js.*serve'
+        $_.Name -eq "cloudflared.exe" -or (Test-IsDevSpaceServeCommandLine $cmd)
     } | ForEach-Object {
         Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue
     }
@@ -636,11 +636,59 @@ function Stop-DevSpaceRuntime {
     Write-SetupLog "Stop complete."
 }
 
+function Find-DevSpaceListenerProcess {
+    # Recover serve PID from the reserved MCP port when command-line discovery lags
+    # (common for WMI-detached worktree launches).
+    try {
+        $listener = Get-NetTCPConnection -LocalAddress $LocalHost -LocalPort $LocalPort -State Listen -ErrorAction SilentlyContinue |
+            Select-Object -First 1
+        if (-not $listener) {
+            $listener = Get-NetTCPConnection -LocalPort $LocalPort -State Listen -ErrorAction SilentlyContinue |
+                Select-Object -First 1
+        }
+        if (-not $listener -or -not $listener.OwningProcess) {
+            return $null
+        }
+        $cim = Get-CimInstance Win32_Process -Filter "ProcessId=$($listener.OwningProcess)" -ErrorAction SilentlyContinue
+        if (-not $cim) {
+            return $null
+        }
+        $cmd = if ($cim.CommandLine) { $cim.CommandLine } else { "" }
+        if (Test-IsDevSpaceServeCommandLine $cmd) {
+            return $cim
+        }
+        # Port 7676 is reserved for DevSpace; accept a node listener during startup recovery.
+        if ($cim.Name -match '(?i)^node(\.exe)?$') {
+            return $cim
+        }
+        return $null
+    } catch {
+        return $null
+    }
+}
+
 function Find-DevSpaceServeProcess {
-    Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object {
+    $byCmd = Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object {
         $cmd = if ($_.CommandLine) { $_.CommandLine } else { "" }
-        $cmd -match 'devspace-src[\\/]+dist[\\/]+cli\.js' -and $cmd -match 'serve'
+        Test-IsDevSpaceServeCommandLine $cmd
     } | Select-Object -First 1
+    if ($byCmd) {
+        return $byCmd
+    }
+    return Find-DevSpaceListenerProcess
+}
+
+function Resolve-DevSpaceServeProcessHandle {
+    param([System.Diagnostics.Process]$Current)
+
+    if ($Current -and (Test-ManagedProcessAlive $Current)) {
+        return $Current
+    }
+    $found = Find-DevSpaceServeProcess
+    if (-not $found) {
+        return $null
+    }
+    return (Get-Process -Id $found.ProcessId -ErrorAction SilentlyContinue)
 }
 
 function Stop-DevSpaceRelatedProcesses {
@@ -974,10 +1022,17 @@ function Start-DevSpaceServer([string]$devspaceCli, [string]$tunnelHost) {
     $proc = $null
     for ($i = 0; $i -lt 30; $i++) {
         Start-Sleep -Milliseconds 400
-        $found = Find-DevSpaceServeProcess
-        if ($found) {
-            $proc = Get-Process -Id $found.ProcessId -ErrorAction SilentlyContinue
-            if ($proc) { break }
+        $proc = Resolve-DevSpaceServeProcessHandle -Current $proc
+        if ($proc) { break }
+    }
+    if ($null -eq $proc) {
+        # Prefer rebinding to a healthy WMI orphan over starting a second serve
+        # (double-start races: first holds 7676, fallback dies with ExitCode=null).
+        if (Test-LocalDevSpaceHealthy) {
+            $proc = Resolve-DevSpaceServeProcessHandle -Current $null
+            if ($proc) {
+                Write-SetupLog "Rebound to existing healthy serve PID=$($proc.Id) after WMI discovery lag."
+            }
         }
     }
     if ($null -eq $proc) {
@@ -1000,8 +1055,14 @@ function Start-DevSpaceServer([string]$devspaceCli, [string]$tunnelHost) {
     for ($i = 0; $i -lt 45; $i++) {
         Start-Sleep -Seconds 1
         if (-not (Test-ManagedProcessAlive $proc)) {
-            $tail = Get-LogTail $script:devspaceStderrLog 40
-            throw "DevSpace exited during startup. PID=$($proc.Id); ExitCode=$(Get-SafeExitCode $proc).`n--- stderr tail ---`n$tail"
+            $rebound = Resolve-DevSpaceServeProcessHandle -Current $null
+            if ($rebound -and (Test-LocalDevSpaceHealthy)) {
+                Write-SetupLog "Rebound serve PID $($proc.Id) -> $($rebound.Id) during health wait (tracked handle exited)." "WARN"
+                $proc = $rebound
+            } else {
+                $tail = Get-LogTail $script:devspaceStderrLog 40
+                throw "DevSpace exited during startup. PID=$($proc.Id); ExitCode=$(Get-SafeExitCode $proc).`n--- stderr tail ---`n$tail"
+            }
         }
         if (-not (Test-PortOpen $LocalHost $LocalPort 200)) {
             continue
@@ -1263,7 +1324,14 @@ for ($i = 0; $i -lt 30; $i++) {
     }
     $script:devspaceProcess.Refresh()
     if ($script:devspaceProcess.HasExited) {
-        throw "DevSpace stopped during startup. PID=$($script:devspaceProcess.Id); ExitCode=$(Get-SafeExitCode $script:devspaceProcess)."
+        $priorPid = $script:devspaceProcess.Id
+        $rebound = Resolve-DevSpaceServeProcessHandle -Current $null
+        if ($rebound -and (Test-LocalDevSpaceHealthy)) {
+            Write-SetupLog "Rebound DevSpace PID $priorPid -> $($rebound.Id) during edge wait (tracked handle exited)." "WARN"
+            $script:devspaceProcess = $rebound
+        } else {
+            throw "DevSpace stopped during startup. PID=$priorPid; ExitCode=$(Get-SafeExitCode $script:devspaceProcess)."
+        }
     }
 
     if (Test-CloudflaredEdgeRegistered -logPath $logFile) {

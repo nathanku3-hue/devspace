@@ -91,6 +91,33 @@ Describe "DevSpace setup probe client persistence" {
     }
 }
 
+Describe "DevSpace serve command-line detection" {
+    It "matches main checkout dist/cli.js serve paths" {
+        $main = '"D:\nodejs\node.exe" "E:\Code\devspace\devspace-src\dist\cli.js" serve'
+        Test-IsDevSpaceServeCommandLine $main | Should Be $true
+    }
+
+    It "matches worktree dist/cli.js serve paths" {
+        $worktree = '"D:\nodejs\node.exe" "E:\Code\devspace\devspace-src\.worktrees\devspace-af004239f60aa680\dist\cli.js" serve'
+        Test-IsDevSpaceServeCommandLine $worktree | Should Be $true
+    }
+
+    It "rejects non-serve cli invocations" {
+        $build = '"D:\nodejs\node.exe" "E:\Code\devspace\devspace-src\dist\cli.js" build'
+        Test-IsDevSpaceServeCommandLine $build | Should Be $false
+    }
+
+    It "rejects unrelated node processes" {
+        $other = '"D:\nodejs\node.exe" "C:\Users\Lenovo\AppData\Roaming\npm\node_modules\@openai\codex\bin\codex.js" mcp-server'
+        Test-IsDevSpaceServeCommandLine $other | Should Be $false
+    }
+
+    It "rejects empty or null command lines" {
+        Test-IsDevSpaceServeCommandLine $null | Should Be $false
+        Test-IsDevSpaceServeCommandLine "" | Should Be $false
+    }
+}
+
 Describe "DevSpace launch build marker verification" {
     It "finds tool markers split across modular JavaScript output" {
         $testRoot = Join-Path ([System.IO.Path]::GetTempPath()) ("devspace-launch-build-test-" + [Guid]::NewGuid().ToString("N"))

@@ -123,3 +123,29 @@ function Assert-ExpectedToolInventory {
 
     return $actual
 }
+
+function Test-IsDevSpaceServeCommandLine {
+    param([AllowNull()][string]$CommandLine)
+
+    if ([string]::IsNullOrWhiteSpace($CommandLine)) {
+        return $false
+    }
+
+    # Match main checkout and git worktrees under devspace-src:
+    #   ...\devspace-src\dist\cli.js serve
+    #   ...\devspace-src\.worktrees\<id>\dist\cli.js serve
+    # Do not require dist to be an immediate child of devspace-src (worktree gap).
+    $cliPathMatch = $CommandLine -match 'devspace-src(?:[\\/]+\.worktrees[\\/]+[^\\/"'']+)?[\\/]+dist[\\/]+cli\.js'
+    if (-not $cliPathMatch) {
+        # Broader fallback: any path segment .../dist/cli.js under a devspace-src tree
+        # (covers deeper nesting while still requiring the repo folder name).
+        $cliPathMatch = $CommandLine -match 'devspace-src[\\/].*[\\/]dist[\\/]cli\.js'
+    }
+    if (-not $cliPathMatch) {
+        return $false
+    }
+
+    # Require serve as its own argv token, not a path substring.
+    return [bool]($CommandLine -match '(?i)(?:^|[\s"''])serve(?:[\s"'']|$)')
+}
+
