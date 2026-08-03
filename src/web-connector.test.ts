@@ -312,6 +312,23 @@ test("independent sessions survive source disconnect and retrieve the callback",
       throw new Error("unexpected review_status");
     },
   };
+  const webChat = {
+    startChat: () => {
+      throw new Error("unexpected web_chat_start");
+    },
+    sendChat: () => {
+      throw new Error("unexpected web_chat_send");
+    },
+    getChatStatus: () => {
+      throw new Error("unexpected web_chat_status");
+    },
+    closeChat: async () => {
+      throw new Error("unexpected web_chat_close");
+    },
+    acceptReply: () => {
+      throw new Error("unexpected web_chat_reply");
+    },
+  };
   const sourceServer = createMcpServer(
     config,
     workspaces,
@@ -319,6 +336,7 @@ test("independent sessions survive source disconnect and retrieve the callback",
     browser,
     proof,
     reviewReturn,
+    webChat,
   );
   const spawnedServer = createMcpServer(
     config,
@@ -327,6 +345,7 @@ test("independent sessions survive source disconnect and retrieve the callback",
     browser,
     proof,
     reviewReturn,
+    webChat,
   );
   const statusServer = createMcpServer(
     config,
@@ -335,6 +354,7 @@ test("independent sessions survive source disconnect and retrieve the callback",
     browser,
     proof,
     reviewReturn,
+    webChat,
   );
   const sourceClient = new Client({ name: "web-connector-source", version: "1.0.0" });
   const spawnedClient = new Client({ name: "web-connector-spawned", version: "1.0.0" });
@@ -366,6 +386,11 @@ test("independent sessions survive source disconnect and retrieve the callback",
         "review_status",
         "review_submit",
         "safe_rename_file",
+        "web_chat_close",
+        "web_chat_reply",
+        "web_chat_send",
+        "web_chat_start",
+        "web_chat_status",
         "web_connector_probe",
         "web_connector_start",
         "web_connector_status",

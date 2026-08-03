@@ -37,10 +37,16 @@ const fixtureHtml = `
         }, 50);
       });
       send.addEventListener('click', () => {
-        const conversationId = 'fixture-conversation-' + crypto.randomUUID().replaceAll('-', '');
+        const submitted = composer.value;
+        const historyItems = JSON.parse(document.body.dataset.submittedHistory || '[]');
+        historyItems.push(submitted);
+        document.body.dataset.submittedHistory = JSON.stringify(historyItems);
         document.body.dataset.submitCount = String(Number(document.body.dataset.submitCount || '0') + 1);
-        document.body.dataset.submitted = composer.value;
-        history.pushState({}, '', '/c/' + conversationId);
+        document.body.dataset.submitted = submitted;
+        if (!location.pathname.startsWith('/c/')) {
+          const conversationId = 'fixture-conversation-' + crypto.randomUUID().replaceAll('-', '');
+          history.pushState({}, '', '/c/' + conversationId);
+        }
         composer.value = '';
         send.disabled = true;
       });
@@ -609,6 +615,59 @@ test("WEB-LAUNCH-0 submits one exact prompt and returns acknowledgement only", a
       /rejects carriage returns/i,
     );
     assert.equal(await gitStatus(process.cwd()), originalStatus);
+  } finally {
+    await controller?.close();
+    await browser.close();
+    await rm(parent, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+  }
+});
+
+test("WEB-CHAT-3 sends a second turn through the same retained conversation page", async () => {
+  const parent = await mkdtemp(join(tmpdir(), "devspace-web-chat-3-"));
+  const browser = await launchInstalledChrome();
+  const originalStatus = await gitStatus(process.cwd());
+  let controller: WebLaunchBrowserController | undefined;
+  try {
+    const context = await browser.newContext();
+    await context.route("https://chatgpt.com/**", (route) =>
+      route.fulfill({ status: 200, contentType: "text/html", body: fixtureHtml }),
+    );
+    controller = new WebLaunchBrowserController([parent], {
+      contextFactory: async () => context,
+      now: () => new Date("2026-08-03T14:00:00.000Z"),
+    });
+
+    const handle = await controller.launchRetainedWebConversation("first retained turn");
+    const conversationPages = context
+      .pages()
+      .filter((page) => chatGptConversationIdentityFromUrl(page.url()) !== undefined);
+    assert.equal(conversationPages.length, 1);
+    const page = conversationPages[0]!;
+    const firstUrl = page.url();
+
+    await handle.send("second retained turn");
+
+    assert.equal(
+      context.pages().filter((candidate) => chatGptConversationIdentityFromUrl(candidate.url()))
+        .length,
+      1,
+    );
+    assert.equal(page.url(), firstUrl);
+    assert.deepEqual(
+      await page.evaluate(() => JSON.parse(document.body.dataset.submittedHistory ?? "[]")),
+      ["first retained turn", "second retained turn"],
+    );
+    assert.equal(await page.evaluate(() => document.body.dataset.submitCount), "2");
+    assert.deepEqual(Object.keys(handle).sort(), [
+      "close",
+      "conversationIdentitySha256",
+      "send",
+    ]);
+    assert.match(handle.conversationIdentitySha256, /^[a-f0-9]{64}$/);
+    assert.equal(await gitStatus(process.cwd()), originalStatus);
+
+    await handle.close();
+    assert.equal(page.isClosed(), true);
   } finally {
     await controller?.close();
     await browser.close();

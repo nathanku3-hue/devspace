@@ -54,6 +54,18 @@ export interface WebLaunchAcknowledgement extends Record<string, unknown> {
   assistantOutputCaptured: false;
 }
 
+export interface RetainedWebConversationHandle {
+  conversationIdentitySha256: string;
+  send(prompt: string): Promise<void>;
+  close(): Promise<void>;
+}
+
+interface LaunchedConversationPage {
+  page: Page;
+  conversationIdentity: string;
+  timestamp: string;
+}
+
 interface BrowserProfileLease {
   release(): Promise<void>;
 }
@@ -132,19 +144,59 @@ export class WebLaunchBrowserController {
   }
 
   async launchWebConversation(prompt: string): Promise<WebLaunchAcknowledgement> {
-    if (prompt.length === 0) {
-      throw new WebLaunchBrowserError("WEB-LAUNCH-0 requires a non-empty prompt");
-    }
-    if (prompt.length > 100_000) {
-      throw new WebLaunchBrowserError("WEB-LAUNCH-0 prompt exceeds 100000 characters");
-    }
-    if (prompt.includes("\r")) {
-      throw new WebLaunchBrowserError(
-        "WEB-LAUNCH-0 rejects carriage returns because the browser cannot preserve them exactly",
-      );
-    }
+    const launched = await this.#launchConversationPage(prompt, "WEB-LAUNCH-0", "web-launch-0");
+    return {
+      slice: "WEB-LAUNCH-0",
+      launchSuccess: true,
+      conversationIdentitySha256: sha256(launched.conversationIdentity),
+      timestamp: launched.timestamp,
+      assistantOutputCaptured: false,
+    };
+  }
+
+  async launchRetainedWebConversation(
+    prompt: string,
+  ): Promise<RetainedWebConversationHandle> {
+    const launched = await this.#launchConversationPage(prompt, "WEB-CHAT-3", "web-chat-3");
+    let closed = false;
+    return {
+      conversationIdentitySha256: sha256(launched.conversationIdentity),
+      send: async (nextPrompt: string) => {
+        if (closed || launched.page.isClosed()) {
+          throw new WebLaunchBrowserError("WEB-CHAT-3 retained conversation is closed");
+        }
+        assertBrowserPrompt(nextPrompt, "WEB-CHAT-3");
+        await waitForRetainedConversationReady(
+          launched.page,
+          launched.conversationIdentity,
+        );
+        await injectAndSubmitPrompt(launched.page, nextPrompt, {
+          sendReadyTimeoutMs: 15_000,
+        });
+        const currentIdentity = chatGptConversationIdentityFromUrl(launched.page.url());
+        if (currentIdentity !== launched.conversationIdentity) {
+          throw new WebLaunchBrowserError(
+            "WEB-CHAT-3 retained conversation identity changed during send",
+          );
+        }
+        await launched.page.bringToFront().catch(() => undefined);
+      },
+      close: async () => {
+        if (closed) return;
+        closed = true;
+        await launched.page.close().catch(() => undefined);
+      },
+    };
+  }
+
+  async #launchConversationPage(
+    prompt: string,
+    slice: "WEB-LAUNCH-0" | "WEB-CHAT-3",
+    windowName: "web-launch-0" | "web-chat-3",
+  ): Promise<LaunchedConversationPage> {
+    assertBrowserPrompt(prompt, slice);
     if (this.#launchInFlight) {
-      throw new WebLaunchBrowserError("WEB-LAUNCH-0 already has a launch in progress");
+      throw new WebLaunchBrowserError(`${slice} already has a launch in progress`);
     }
 
     this.#launchInFlight = true;
@@ -162,28 +214,29 @@ export class WebLaunchBrowserController {
       await page.goto(CHATGPT_URL, { waitUntil: "domcontentloaded", timeout: 30_000 });
       await assertAuthenticated(page);
       if (chatGptConversationIdentityFromUrl(page.url())) {
-        throw new WebLaunchBrowserError("WEB-LAUNCH-0 did not open a fresh ChatGPT conversation");
+        throw new WebLaunchBrowserError(`${slice} did not open a fresh ChatGPT conversation`);
       }
 
-      await page.evaluate((launchId) => {
-        window.name = `devspace:web-launch-0:${launchId}`;
-      }, randomUUID());
+      await page.evaluate(
+        ({ launchId, marker }) => {
+          window.name = `devspace:${marker}:${launchId}`;
+        },
+        { launchId: randomUUID(), marker: windowName },
+      );
       await injectAndSubmitPrompt(page, prompt);
 
       const conversationIdentity = await waitForChatGptConversationIdentity(page);
       if (existingIdentities.has(conversationIdentity)) {
         throw new WebLaunchBrowserError(
-          "WEB-LAUNCH-0 reused an existing ChatGPT conversation identity",
+          `${slice} reused an existing ChatGPT conversation identity`,
         );
       }
 
       await page.bringToFront().catch(() => undefined);
       return {
-        slice: "WEB-LAUNCH-0",
-        launchSuccess: true,
-        conversationIdentitySha256: sha256(conversationIdentity),
+        page,
+        conversationIdentity,
         timestamp: this.#now().toISOString(),
-        assistantOutputCaptured: false,
       };
     } catch (error) {
       await page?.close().catch(() => undefined);
@@ -284,6 +337,47 @@ export class WebLaunchBrowserController {
     for (const stale of pages.slice(1)) await stale.close().catch(() => undefined);
     if (!isReusableSeedPage(seed.url())) await seed.goto("about:blank");
   }
+}
+
+function assertBrowserPrompt(
+  prompt: string,
+  slice: "WEB-LAUNCH-0" | "WEB-CHAT-3",
+): void {
+  if (prompt.length === 0) {
+    throw new WebLaunchBrowserError(`${slice} requires a non-empty prompt`);
+  }
+  if (prompt.length > 100_000) {
+    throw new WebLaunchBrowserError(`${slice} prompt exceeds 100000 characters`);
+  }
+  if (prompt.includes("\r")) {
+    throw new WebLaunchBrowserError(
+      `${slice} rejects carriage returns because the browser cannot preserve them exactly`,
+    );
+  }
+}
+
+async function waitForRetainedConversationReady(
+  page: Page,
+  expectedIdentity: string,
+  timeoutMs = 30_000,
+): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (page.isClosed()) {
+      throw new WebLaunchBrowserError("WEB-CHAT-3 retained conversation is closed");
+    }
+    const currentIdentity = chatGptConversationIdentityFromUrl(page.url());
+    if (currentIdentity !== expectedIdentity) {
+      throw new WebLaunchBrowserError(
+        "WEB-CHAT-3 retained conversation identity changed before send",
+      );
+    }
+    if ((await credibleLocators(page.locator(STOP_SELECTOR))).length === 0) return;
+    await page.waitForTimeout(100);
+  }
+  throw new WebLaunchBrowserError(
+    "WEB-CHAT-3 retained conversation did not become ready for another turn",
+  );
 }
 
 async function claimLaunchPage(context: BrowserContext): Promise<Page> {
