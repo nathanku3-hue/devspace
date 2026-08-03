@@ -516,3 +516,134 @@ Chatshare OAuth and authenticated DevSpace MCP execution are confirmed working a
 ```javascript
 sessionStorage.getItem("chatshare-oauth-callback-rescue-status")
 ```
+
+# Google Gemini Custom MCP OAuth Lessons
+
+Date: 2026-08-03
+Runtime: Windows PowerShell 5.1, Node.js v25.2.1, stable Cloudflare Worker proxy plus a rotating Cloudflare Quick Tunnel
+
+## Confirmed outcome
+
+Gemini connected without manually entering an OAuth client ID or client secret.
+
+Live evidence showed the complete path:
+
+1. Gemini dynamically registered an OAuth client.
+2. DevSpace presented the owner-approval flow and returned the authorization redirect.
+3. Gemini exchanged the authorization code successfully.
+4. Requests with the `Google` user agent created authenticated MCP sessions and completed MCP requests with HTTP 200.
+
+The visible Gemini message recommending manual client credentials was therefore a generic fallback message, not proof that DevSpace lacked Dynamic Client Registration.
+
+## Failure chain and root causes
+
+### 1. The copied redirect URI did not reveal Gemini's complete registration set
+
+Gemini displayed one production callback URI under:
+
+```text
+oauth-redirect.googleusercontent.com
+```
+
+Allowing only that hostname did not fix registration. Instrumented live traffic showed that Gemini submitted six redirect URIs spanning three environments:
+
+```text
+oauth-redirect-sandbox.googleusercontent.com
+oauth-redirect-test.googleusercontent.com
+oauth-redirect.googleusercontent.com
+```
+
+DevSpace correctly rejected the entire registration when any supplied redirect URI was outside the allowlist.
+
+Lesson: for Dynamic Client Registration, inspect the actual registration payload. A copied or displayed callback URI may represent only one member of the client's full redirect set.
+
+### 2. Registration diagnostics initially hid the decision-relevant error
+
+The generic request log recorded only an HTTP 400 on the mounted OAuth router. It did not preserve the OAuth error description or the identities of rejected redirect hosts.
+
+A bounded diagnostic layer was added around `/register`. It records:
+
+- OAuth error and description;
+- submitted metadata field names;
+- redirect URI origins only, never full callback paths;
+- requested token endpoint authentication method.
+
+That diagnostic exposed the missing sandbox and test hosts immediately.
+
+Lesson: log enough structured OAuth metadata to identify policy failures, but redact user-bound callback paths and authorization material.
+
+### 3. Gemini requires `client_secret_basic` compatibility
+
+Gemini registered with:
+
+```text
+token_endpoint_auth_method=client_secret_basic
+```
+
+The underlying MCP SDK advertised only `client_secret_post` and `none`, and its token middleware read `client_id` and `client_secret` only from the request body. Host allowlisting alone would therefore have moved the failure from registration to token exchange.
+
+DevSpace now:
+
+1. Advertises `client_secret_basic` in authorization-server metadata.
+2. Accepts HTTP Basic client credentials on `/token` and `/revoke`.
+3. Decodes them into the SDK's expected request-body fields before SDK authentication.
+4. Preserves the SDK's existing client-secret validation and token logic.
+
+Lesson: OAuth compatibility includes both redirect policy and client authentication method. Registration success is not the terminal gate.
+
+### 4. Worktree launches exposed a separate process-custody defect
+
+The setup script's old process search required this immediate shape:
+
+```text
+devspace-src\dist\cli.js serve
+```
+
+It missed worktree runtimes shaped like:
+
+```text
+devspace-src\.worktrees\<id>\dist\cli.js serve
+```
+
+This could leave a healthy server listening while the launcher believed the tracked process had exited, then attempt a second launch or fail startup on a stale process handle.
+
+The launcher now resolves the serve process by exact CLI path when available, falls back to the listener owning the configured port, refuses a duplicate launch when `/healthz` is already live, and rebinds stale process handles during startup and monitoring.
+
+Lesson: process custody must bind to the actual executable path or listening socket, not a repository-layout assumption.
+
+## Verification performed
+
+- Exact Gemini registration payload with production, test, and sandbox callbacks returned HTTP 201.
+- Authorization-server metadata advertised `client_secret_basic`.
+- A Gemini-style client registered with `client_secret_basic`.
+- HTTP Basic token authentication reached authorization-code validation rather than failing client authentication.
+- Windows production build passed under Node.js v25.2.1.
+- PowerShell syntax validation passed.
+- Setup Pester suite passed 5/5.
+- `git diff --check` passed.
+- Live Gemini owner approval returned HTTP 302.
+- Live token exchange returned HTTP 200.
+- Live authenticated Google MCP sessions returned HTTP 200.
+
+The repository-wide development typecheck still has an unrelated pre-existing error in `src/review-return.test.ts`; the production build for this repair passes.
+
+## Durable procedure for future MCP OAuth clients
+
+1. Capture the real Dynamic Client Registration payload before changing policy.
+2. Validate every supplied redirect URI; do not infer the full set from one UI-displayed callback.
+3. Add only exact callback hosts unless a wildcard is independently justified.
+4. Record sanitized redirect origins and OAuth error descriptions on registration failure.
+5. Compare `token_endpoint_auth_method` with both discovery metadata and server middleware behavior.
+6. Verify registration, authorization, token exchange, and authenticated MCP execution as separate gates.
+7. Restart from the exact worktree containing the repair and verify runtime source custody.
+8. Resolve detached Windows processes using executable identity and listener ownership, not a fixed checkout path.
+
+## Files associated with the Gemini repair
+
+- `scripts/setup-devspace.ps1`
+- `src/server.ts`
+- `lessons.md`
+
+## Final status
+
+Google Gemini Custom MCP OAuth and authenticated DevSpace MCP execution were confirmed working on 2026-08-03 with Gemini's Client ID and Client secret fields left blank.

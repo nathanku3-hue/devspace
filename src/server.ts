@@ -311,6 +311,66 @@ function requestLogFields(req: Request, config: ServerConfig): Record<string, un
   };
 }
 
+function oauthRegistrationError(body: unknown): {
+  error?: string;
+  errorDescription?: string;
+} {
+  if (!body || typeof body !== "object") return {};
+  const value = body as Record<string, unknown>;
+  return {
+    error: typeof value.error === "string" ? value.error : undefined,
+    errorDescription:
+      typeof value.error_description === "string" ? value.error_description : undefined,
+  };
+}
+
+function oauthRedirectIdentity(value: unknown): string {
+  if (typeof value !== "string") return `non-string:${typeof value}`;
+  try {
+    const parsed = new URL(value);
+    return `${parsed.protocol}//${parsed.host}`;
+  } catch {
+    return "invalid-url";
+  }
+}
+
+function addOAuthClientSecretBasicMetadata(body: unknown): unknown {
+  if (!body || typeof body !== "object" || Array.isArray(body)) return body;
+  const metadata = body as Record<string, unknown>;
+  for (const field of [
+    "token_endpoint_auth_methods_supported",
+    "revocation_endpoint_auth_methods_supported",
+  ]) {
+    const methods = metadata[field];
+    if (Array.isArray(methods) && !methods.includes("client_secret_basic")) {
+      metadata[field] = ["client_secret_basic", ...methods];
+    }
+  }
+  return metadata;
+}
+
+function applyOAuthBasicClientCredentials(req: Request): void {
+  const authorization = req.header("authorization");
+  if (!authorization?.startsWith("Basic ")) return;
+
+  let decoded: string;
+  try {
+    decoded = Buffer.from(authorization.slice(6).trim(), "base64").toString("utf8");
+  } catch {
+    return;
+  }
+
+  const separator = decoded.indexOf(":");
+  if (separator < 0) return;
+  const body =
+    req.body && typeof req.body === "object"
+      ? (req.body as Record<string, unknown>)
+      : {};
+  if (body.client_id === undefined) body.client_id = decoded.slice(0, separator);
+  if (body.client_secret === undefined) body.client_secret = decoded.slice(separator + 1);
+  req.body = body;
+}
+
 function logToolCall(config: ServerConfig, fields: ToolLogFields): void {
   if (!config.logging.toolCalls) return;
 
@@ -1748,6 +1808,57 @@ export function createServer(config = loadConfig()): RunningServer {
         path,
         status: res.statusCode,
         durationMs: Math.round(performance.now() - startedAt),
+        ...requestLogFields(req, config),
+      });
+    });
+
+    next();
+  });
+
+  app.use("/.well-known/oauth-authorization-server", (_req, res, next) => {
+    const originalJson = res.json.bind(res);
+    res.json = ((body: unknown) =>
+      originalJson(addOAuthClientSecretBasicMetadata(body))) as typeof res.json;
+    next();
+  });
+
+  app.use(
+    ["/token", "/revoke"],
+    express.urlencoded({ extended: false }),
+    (req, _res, next) => {
+      applyOAuthBasicClientCredentials(req);
+      next();
+    },
+  );
+
+  app.use("/register", express.json(), (req, res, next) => {
+    const requestId = res.locals.requestId as string | undefined;
+    const metadata =
+      req.body && typeof req.body === "object"
+        ? (req.body as Record<string, unknown>)
+        : {};
+    let responseBody: unknown;
+    const originalJson = res.json.bind(res);
+    res.json = ((body: unknown) => {
+      responseBody = body;
+      return originalJson(body);
+    }) as typeof res.json;
+
+    res.on("finish", () => {
+      if (res.statusCode < 400) return;
+      const error = oauthRegistrationError(responseBody);
+      logEvent(config.logging, "warn", "oauth_client_registration_failed", {
+        requestId,
+        status: res.statusCode,
+        metadataKeys: Object.keys(metadata).sort(),
+        redirectUriIdentities: Array.isArray(metadata.redirect_uris)
+          ? metadata.redirect_uris.map(oauthRedirectIdentity)
+          : [oauthRedirectIdentity(metadata.redirect_uris)],
+        tokenEndpointAuthMethod:
+          typeof metadata.token_endpoint_auth_method === "string"
+            ? metadata.token_endpoint_auth_method
+            : undefined,
+        ...error,
         ...requestLogFields(req, config),
       });
     });
