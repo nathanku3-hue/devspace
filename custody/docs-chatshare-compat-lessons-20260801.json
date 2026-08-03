@@ -1,0 +1,9 @@
+{
+  "schema": "devspace-custody/v1",
+  "recorded_at": "2026-08-03T10:32:00+08:00",
+  "source_branch": "docs/chatshare-compat-lessons-20260801",
+  "source_commit": "350704d7801670912263b7f7b003103f5594d1da",
+  "source_tree": "b371ba27237acd00665aeb7b7874ce3741876c75",
+  "classification": "clean source head; receipt-only rescue descendant",
+  "reason": "The clean local source branch had no remote ref containing its exact head."
+}
