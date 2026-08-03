@@ -23,6 +23,11 @@ assert.equal(loadConfig({ ...baseEnv, DEVSPACE_TOOL_MODE: "minimal" }).minimalTo
 assert.equal(loadConfig({ ...baseEnv, DEVSPACE_TOOL_MODE: "full" }).minimalTools, false);
 assert.equal(loadConfig({ ...baseEnv, DEVSPACE_MINIMAL_TOOLS: "0" }).minimalTools, false);
 assert.equal(loadConfig({ ...baseEnv, DEVSPACE_MINIMAL_TOOLS: "1" }).minimalTools, true);
+assert.equal(loadConfig(baseEnv).portfolioPolicyPath, undefined);
+assert.equal(
+  loadConfig({ ...baseEnv, DEVSPACE_PORTFOLIO_POLICY: join(emptyConfigDir, "portfolio-policy.json") }).portfolioPolicyPath,
+  join(emptyConfigDir, "portfolio-policy.json"),
+);
 assert.equal(loadConfig(baseEnv).skillsEnabled, true);
 assert.equal(loadConfig({ ...baseEnv, DEVSPACE_SKILLS: "0" }).skillsEnabled, false);
 assert.equal(loadConfig({ ...baseEnv, DEVSPACE_SKILLS: "1" }).skillsEnabled, true);

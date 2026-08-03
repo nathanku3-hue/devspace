@@ -13,6 +13,8 @@ import { WorkspaceRegistry } from "./workspaces.js";
 const execFileAsync = promisify(execFile);
 const root = await mkdtemp(join(tmpdir(), "devspace-workspace-test-"));
 const legacyGlobalRoot = await mkdtemp(join(tmpdir(), "devspace-legacy-worktree-root-test-"));
+const portfolioPolicyPath = join(root, "portfolio-policy.json");
+const terminalReceiptPath = join(root, "terminal-custody-receipt.json");
 
 try {
   const agentDir = join(root, ".pi", "agent");
@@ -27,6 +29,7 @@ try {
     DEVSPACE_ALLOWED_ROOTS: root,
     DEVSPACE_WORKTREE_ROOT: legacyGlobalRoot,
     DEVSPACE_AGENT_DIR: agentDir,
+    DEVSPACE_PORTFOLIO_POLICY: portfolioPolicyPath,
     DEVSPACE_OAUTH_OWNER_TOKEN: "test-owner-token-that-is-long-enough",
     PORT: "1",
   });
@@ -56,6 +59,7 @@ try {
   );
 
   const gitRoot = join(root, "git-project");
+  const escapeRoot = join(root, "escape-project");
   await createTestRepository(gitRoot);
   await writeFile(join(gitRoot, "AGENTS.md"), "git root instructions\n");
   await writeFile(join(gitRoot, "README.md"), "hello\n");
@@ -65,6 +69,32 @@ try {
   await git(gitRoot, ["add", "."]);
   await git(gitRoot, ["commit", "-m", "Initial commit"]);
   await git(gitRoot, ["branch", "existing-worktree-branch"]);
+  await writeFile(terminalReceiptPath, `${JSON.stringify({ custodyVerified: true }, null, 2)}\n`);
+  await writeFile(portfolioPolicyPath, `${JSON.stringify({
+    schema: "portfolio-custody-policy/v1",
+    repositories: [gitRoot, escapeRoot].map((canonicalPath) => ({
+      id: canonicalPath === gitRoot ? "git-project" : "escape-project",
+      canonicalPath,
+      remote: null,
+      declaredIntegrationBranch: null,
+      permittedPrimaryBranches: ["main", "master"],
+      vendorClassification: "test-fixture",
+      maximumActiveWorktrees: 10,
+      maximumInactiveWorktrees: 10,
+      terminalCustodyMode: "external-receipt",
+      externalEvidenceRoot: join(root, "evidence"),
+      externalArchiveRoot: join(root, "archive"),
+      physicalParityRequired: true,
+      primaryCleanRequired: false,
+      exceptions: [{
+        id: "fixture-terminal-custody",
+        kind: "terminal-custody",
+        owner: "test",
+        reviewCondition: "while the fixture is executing",
+        receiptPath: terminalReceiptPath,
+      }],
+    })),
+  }, null, 2)}\n`);
   await mkdir(join(gitRoot, "untracked", "active"), { recursive: true });
   await writeFile(join(gitRoot, "untracked", "active", "AGENTS.md"), "untracked active instructions\n");
   await mkdir(join(gitRoot, "tmp", "replay"), { recursive: true });
@@ -227,7 +257,6 @@ try {
 
   await registry.closeWorkspace({ workspaceId: attachedWorktree.workspace.id });
 
-  const escapeRoot = join(root, "escape-project");
   await createTestRepository(escapeRoot);
   await writeFile(join(escapeRoot, "README.md"), "escape\n");
   await git(escapeRoot, ["add", "."]);
@@ -247,6 +276,7 @@ try {
     const aliasConfig = loadConfig({
       DEVSPACE_ALLOWED_ROOTS: aliasRoot,
       DEVSPACE_AGENT_DIR: agentDir,
+      DEVSPACE_PORTFOLIO_POLICY: portfolioPolicyPath,
       DEVSPACE_OAUTH_OWNER_TOKEN: "test-owner-token-that-is-long-enough",
       PORT: "1",
     });

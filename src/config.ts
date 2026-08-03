@@ -29,6 +29,7 @@ export interface ServerConfig {
   toolNaming: ToolNamingMode;
   widgets: WidgetMode;
   stateDir: string;
+  portfolioPolicyPath?: string;
   skillsEnabled: boolean;
   skillPaths: string[];
   agentDir: string;
@@ -326,6 +327,9 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ServerConfig {
     toolNaming: parseToolNaming(env.DEVSPACE_TOOL_NAMING),
     widgets: parseWidgetMode(env.DEVSPACE_WIDGETS),
     stateDir: resolve(expandHomePath(env.DEVSPACE_STATE_DIR ?? files.config.stateDir ?? defaultStateDir())),
+    portfolioPolicyPath: env.DEVSPACE_PORTFOLIO_POLICY
+      ? resolve(expandHomePath(env.DEVSPACE_PORTFOLIO_POLICY))
+      : undefined,
     skillsEnabled: env.DEVSPACE_SKILLS === undefined ? true : parseBoolean(env.DEVSPACE_SKILLS),
     skillPaths: parsePathList(env.DEVSPACE_SKILL_PATHS),
     agentDir: resolve(expandHomePath(env.DEVSPACE_AGENT_DIR ?? files.config.agentDir ?? defaultAgentDir())),

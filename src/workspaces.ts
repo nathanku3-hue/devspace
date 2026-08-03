@@ -166,7 +166,7 @@ export class WorkspaceRegistry {
       const result = await removeManagedWorktree({
         sourceRoot,
         worktreePath: root,
-        allowedRoots: this.config.allowedRoots,
+        config: this.config,
         pruneStaleMetadata: input.pruneStaleMetadata,
       });
       removed = result.removed;

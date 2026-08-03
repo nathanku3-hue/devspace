@@ -4,6 +4,11 @@ import { lstat, mkdir, realpath, rm, stat } from "node:fs/promises";
 import { basename, dirname, join, relative, resolve } from "node:path";
 import { promisify } from "node:util";
 import type { ServerConfig } from "./config.js";
+import {
+  assertWorktreeClosurePolicy,
+  assertWorktreeCreationPolicy,
+  repositoryPolicyFor,
+} from "./portfolio-policy.js";
 import { assertAllowedPath, isPathInsideRoot } from "./roots.js";
 
 const execFileAsync = promisify(execFile);
@@ -74,6 +79,7 @@ export async function createManagedWorktree(input: {
   await assertDirectory(sourcePath, input.sourcePath);
 
   const sourceRoot = await resolveOwningRepositoryRoot(sourcePath, input.config.allowedRoots);
+  await assertWorktreeCreationPolicy(sourceRoot, input.config);
   const branch = normalizeBranch(input.branch);
   const createBranch = input.createBranch ?? false;
 
@@ -144,10 +150,11 @@ export async function createManagedWorktree(input: {
 export async function removeManagedWorktree(input: {
   sourceRoot: string;
   worktreePath: string;
-  allowedRoots: string[];
+  config: ServerConfig;
   pruneStaleMetadata?: boolean;
 }): Promise<RemovedManagedWorktree> {
-  const sourceRoot = await resolveOwningRepositoryRoot(input.sourceRoot, input.allowedRoots);
+  const sourceRoot = await resolveOwningRepositoryRoot(input.sourceRoot, input.config.allowedRoots);
+  await repositoryPolicyFor(sourceRoot, input.config);
   const managedRoot = await validateManagedWorktreeRoot(sourceRoot);
   const worktreePath = resolve(input.worktreePath);
   assertLogicalManagedPath(worktreePath, sourceRoot);
@@ -195,6 +202,7 @@ export async function removeManagedWorktree(input: {
 
     const headSha = (await git(["rev-parse", "HEAD"], canonicalPath)).trim();
     const branch = await currentBranch(canonicalPath);
+    await assertWorktreeClosurePolicy(sourceRoot, canonicalPath, input.config);
     try {
       await git(["worktree", "remove", "--", canonicalPath], sourceRoot);
     } catch (error) {
