@@ -7,6 +7,7 @@ import { promisify } from "node:util";
 import { loadConfig } from "./config.js";
 import { publishGitChanges } from "./git-publish.js";
 import { GitWorktreeError } from "./git-worktrees.js";
+import { authorizeNativeTaskPublish, runNativeTaskValidation } from "./native-task.js";
 import { SqliteWorkspaceStore } from "./workspace-store.js";
 import { WorkspaceRegistry } from "./workspaces.js";
 
@@ -240,6 +241,29 @@ try {
     branch: "persistent-worktree-branch",
     createBranch: true,
   });
+  const taskBranch = await git(gitRoot, ["branch", "--show-current"]);
+  const taskContext = await persistentRegistry.openWorkspace({
+    path: gitRoot,
+    taskBrief: {
+      productResult: "Publish one resumed native task result.",
+      journeyState: "The repository and exact authority are accepted.",
+      doNow: "Resume the existing edit and validate it.",
+      doneWhen: "Validation and exact Git custody are retained.",
+      stopOnlyIf: ["The accepted path boundary is insufficient."],
+      repository: gitRoot,
+      allowedPaths: ["README.md"],
+      validation: [{ argv: [process.execPath, "-e", "process.exit(0)"], cwd: ".", timeoutSeconds: 30 }],
+      git: {
+        remote: "origin",
+        branch: taskBranch,
+        paths: ["README.md"],
+        commit: true,
+        push: false,
+      },
+    },
+  });
+  const taskId = taskContext.workspace.task!.taskId;
+  const taskDigest = taskContext.workspace.task!.taskDigest;
   firstStore.close();
 
   const secondStore = new SqliteWorkspaceStore(stateDir);
@@ -248,12 +272,71 @@ try {
   const restoredWorktree = restoredRegistry.getWorkspace(persistentWorktree.workspace.id);
   assert.equal(restoredWorktree.sourceRoot, await realpath(gitRoot));
   assert.equal(restoredWorktree.worktree?.branch, "persistent-worktree-branch");
-  await restoredRegistry.closeWorkspace({ workspaceId: persistentWorktree.workspace.id });
+
+  const resumed = await restoredRegistry.openWorkspace({ taskId });
+  assert.equal(resumed.workspace.id, taskContext.workspace.id);
+  assert.equal(resumed.workspace.task?.taskId, taskId);
+  assert.equal(resumed.workspace.task?.taskDigest, taskDigest);
+  assert.equal(resumed.workspace.task?.git.branch, taskBranch);
+  assert.deepEqual(resumed.workspace.task?.allowedPaths, ["README.md"]);
+  await assert.rejects(
+    () => restoredRegistry.openWorkspace({ taskId, path: gitRoot }),
+    /cannot replace path, worktree, or task authority/,
+  );
+
+  const validation = runNativeTaskValidation(resumed.workspace.task!);
+  assert.equal(validation.outcome, "DONE");
+  restoredRegistry.persistTaskResult(resumed.workspace);
+  secondStore.close();
+
+  const thirdStore = new SqliteWorkspaceStore(stateDir);
+  const validatedRegistry = new WorkspaceRegistry(config, thirdStore);
+  const validated = await validatedRegistry.openWorkspace({ taskId });
+  assert.equal(validated.workspace.task?.outcome, "DONE");
+  assert.equal(validated.workspace.task?.lastValidation?.outcome, "DONE");
   assert.throws(
-    () => restoredRegistry.getWorkspace(persistentWorktree.workspace.id),
+    () => authorizeNativeTaskPublish(validated.workspace.task, gitRoot, gitRoot, ["dirty.txt"], {}),
+    /does not authorize writing dirty\.txt|does not authorize Git custody/,
+  );
+  assert.deepEqual(
+    authorizeNativeTaskPublish(validated.workspace.task, gitRoot, gitRoot, ["README.md"], {}),
+    { remote: "origin", branch: taskBranch, push: false },
+  );
+  await writeFile(join(gitRoot, "README.md"), "resumed native task\n");
+  const taskPublished = await publishGitChanges({
+    cwd: gitRoot,
+    workspaceRoot: gitRoot,
+    allowedRoots: [gitRoot],
+    paths: ["README.md"],
+    message: "publish resumed native task",
+    remote: "origin",
+    branch: taskBranch,
+    push: false,
+  });
+  validated.workspace.task!.gitCustody = {
+    ...taskPublished,
+    publishedAt: new Date().toISOString(),
+  };
+  validatedRegistry.persistTaskResult(validated.workspace);
+  thirdStore.close();
+
+  const fourthStore = new SqliteWorkspaceStore(stateDir);
+  const completedRegistry = new WorkspaceRegistry(config, fourthStore);
+  const completed = await completedRegistry.openWorkspace({ taskId });
+  assert.equal(completed.workspace.task?.taskDigest, taskDigest);
+  assert.equal(completed.workspace.task?.gitCustody?.commit, taskPublished.commit);
+  assert.equal(completed.workspace.task?.gitCustody?.branch, taskBranch);
+  assert.deepEqual(completed.workspace.task?.gitCustody?.paths, ["README.md"]);
+  assert.throws(
+    () => authorizeNativeTaskPublish(completed.workspace.task, gitRoot, gitRoot, ["README.md"], {}),
+    /already published/,
+  );
+  await completedRegistry.closeWorkspace({ workspaceId: persistentWorktree.workspace.id });
+  assert.throws(
+    () => completedRegistry.getWorkspace(persistentWorktree.workspace.id),
     /Unknown or closed workspaceId/,
   );
-  secondStore.close();
+  fourthStore.close();
 
   await registry.closeWorkspace({ workspaceId: attachedWorktree.workspace.id });
 

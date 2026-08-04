@@ -279,6 +279,33 @@ const workspaceAvailableAgentsFileOutputSchema = z.object({
   path: z.string(),
 });
 
+const nativeTaskValidationOutputSchema = z.object({
+  taskId: z.string(),
+  outcome: z.enum(["READY", "DONE", "UNVERIFIED", "BLOCKED"]),
+  productResult: z.string(),
+  blocker: z.string(),
+  completedAt: z.string(),
+  validation: z.array(z.object({
+    argv: z.array(z.string()),
+    cwd: z.string(),
+    passed: z.boolean(),
+    exitCode: z.number().nullable(),
+    durationMs: z.number(),
+    output: z.string(),
+  })),
+});
+
+const nativeTaskGitCustodyOutputSchema = z.object({
+  commit: z.string(),
+  branch: z.string(),
+  remote: z.string(),
+  pushed: z.boolean(),
+  paths: z.array(z.string()),
+  stat: z.string(),
+  pushOutput: z.string().optional(),
+  publishedAt: z.string(),
+});
+
 const reviewFileOutputSchema = z.object({
   path: z.string(),
   previousPath: z.string().optional(),
@@ -572,13 +599,20 @@ export function createMcpServer(
     {
       title: "Open workspace",
       description:
-        "Open a local project directory as a coding workspace. Call this once per project folder or worktree before reading, editing, searching, writing, showing changes, or running commands. Reuse the returned workspaceId for later calls in the same folder; do not call open_workspace again unless switching folders/worktrees, changing checkout/worktree mode, the workspaceId is rejected as unknown, or the user explicitly asks to reopen. By default this opens the actual checkout. Worktree mode is detached by default; pass branch to attach an existing local branch, or pass branch with createBranch=true to create it from baseRef. Returns a workspaceId, loaded root project instructions, and nested instruction file paths the model should read before working in those directories.",
+        "Open a local project directory, optionally with a sealed taskBrief, or resume an existing native task by taskId after a fresh conversation or DevSpace restart. Use exactly open_workspace(path, taskBrief) to create a native task or open_workspace(taskId) to continue it; continuation rejects replacement path, worktree, or authority fields. Returns the retained task digest, outcome, validation, and Git custody result when present.",
       inputSchema: {
         path: z
           .string()
+          .optional()
           .describe(
-            "Absolute path, or a leading-tilde home path such as ~/project, to a local project directory inside an allowed root.",
+            "Absolute path, or a leading-tilde home path such as ~/project, to a local project directory inside an allowed root. Omit when resuming by taskId.",
           ),
+        taskId: z
+          .string()
+          .trim()
+          .min(1)
+          .optional()
+          .describe("DevSpace-generated native task identifier. When supplied, omit path, taskBrief, mode, baseRef, branch, and createBranch."),
         mode: z
           .enum(["checkout", "worktree"])
           .optional()
@@ -648,14 +682,17 @@ export function createMcpServer(
         taskId: z.string().optional(),
         taskDigest: z.string().optional(),
         taskOutcome: z.enum(["READY", "DONE", "UNVERIFIED", "BLOCKED"]).optional(),
+        taskValidation: nativeTaskValidationOutputSchema.optional(),
+        taskGitCustody: nativeTaskGitCustodyOutputSchema.optional(),
       },
       ...toolWidgetDescriptorMeta(config, "workspace"),
       annotations: OPEN_WORKSPACE_TOOL_ANNOTATIONS,
     },
-    async ({ path, mode, baseRef, branch, createBranch, taskBrief }) => {
+    async ({ path, taskId, mode, baseRef, branch, createBranch, taskBrief }) => {
       const startedAt = performance.now();
       const { workspace, agentsFiles, availableAgentsFiles } = await workspaces.openWorkspace({
         path,
+        taskId,
         mode,
         baseRef,
         branch,
@@ -697,6 +734,13 @@ export function createMcpServer(
             `Mode: ${workspace.mode}`,
             workspace.task ? `Task: ${workspace.task.taskId}` : undefined,
             workspace.task ? `Product result: ${workspace.task.productResult}` : undefined,
+            workspace.task ? `Task outcome: ${workspace.task.outcome}` : undefined,
+            workspace.task?.lastValidation
+              ? `Retained validation: ${workspace.task.lastValidation.outcome}`
+              : undefined,
+            workspace.task?.gitCustody
+              ? `Retained Git custody: ${workspace.task.gitCustody.commit} on ${workspace.task.gitCustody.remote}/${workspace.task.gitCustody.branch}`
+              : undefined,
             loadedAgentsFiles.length > 0
               ? `Loaded project instructions: ${loadedAgentsFiles.map((file) => file.path).join(", ")}`
               : undefined,
@@ -748,6 +792,8 @@ export function createMcpServer(
           taskId: workspace.task?.taskId,
           taskDigest: workspace.task?.taskDigest,
           taskOutcome: workspace.task?.outcome,
+          taskValidation: workspace.task?.lastValidation,
+          taskGitCustody: workspace.task?.gitCustody,
         },
       };
     },
@@ -768,6 +814,7 @@ export function createMcpServer(
         outcome: z.enum(["DONE", "UNVERIFIED", "BLOCKED"]),
         productResult: z.string(),
         blocker: z.string(),
+        completedAt: z.string(),
         validation: z.array(z.object({
           argv: z.array(z.string()),
           cwd: z.string(),
@@ -792,6 +839,7 @@ export function createMcpServer(
         throw new Error("No native task is bound to this workspace. Open it with taskBrief first.");
       }
       const result = runNativeTaskValidation(workspace.task);
+      workspaces.persistTaskResult(workspace);
       const passed = result.validation.filter((item) => item.passed).length;
       const resultText = [
         `Outcome: ${result.outcome}`,
@@ -814,6 +862,7 @@ export function createMcpServer(
           outcome: result.outcome,
           productResult: result.productResult,
           blocker: result.blocker,
+          completedAt: result.completedAt,
           validation: result.validation,
         },
       };
@@ -1640,6 +1689,13 @@ export function createMcpServer(
           branch: authorization?.branch ?? branch,
           push: authorization?.push ?? push,
         });
+        if (workspace.task) {
+          workspace.task.gitCustody = {
+            ...result,
+            publishedAt: new Date().toISOString(),
+          };
+          workspaces.persistTaskResult(workspace);
+        }
         const resultText = [
           `Created commit ${result.commit} on ${result.branch}.`,
           result.pushed

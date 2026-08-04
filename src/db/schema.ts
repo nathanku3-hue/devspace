@@ -1,4 +1,4 @@
-import { index, integer, primaryKey, sqliteTable, text } from "drizzle-orm/sqlite-core";
+import { index, integer, primaryKey, sqliteTable, text, uniqueIndex } from "drizzle-orm/sqlite-core";
 
 export const workspaceSessions = sqliteTable(
   "workspace_sessions",
@@ -19,6 +19,27 @@ export const workspaceSessions = sqliteTable(
   (table) => [
     index("workspace_sessions_root_idx").on(table.root, table.lastUsedAt),
     index("workspace_sessions_status_idx").on(table.status, table.lastUsedAt),
+  ],
+);
+
+export const nativeTasks = sqliteTable(
+  "native_tasks",
+  {
+    taskId: text("task_id").primaryKey(),
+    taskDigest: text("task_digest").notNull(),
+    briefJson: text("brief_json").notNull(),
+    workspaceId: text("workspace_id")
+      .notNull()
+      .references(() => workspaceSessions.id, { onDelete: "cascade" }),
+    outcome: text("outcome").notNull(),
+    latestValidationJson: text("latest_validation_json"),
+    gitCustodyJson: text("git_custody_json"),
+    createdAt: text("created_at").notNull(),
+    updatedAt: text("updated_at").notNull(),
+  },
+  (table) => [
+    uniqueIndex("native_tasks_workspace_id_idx").on(table.workspaceId),
+    index("native_tasks_outcome_idx").on(table.outcome, table.updatedAt),
   ],
 );
 
@@ -79,5 +100,7 @@ export const oauthRefreshTokens = sqliteTable(
 
 export type WorkspaceSessionRow = typeof workspaceSessions.$inferSelect;
 export type NewWorkspaceSessionRow = typeof workspaceSessions.$inferInsert;
+export type NativeTaskRow = typeof nativeTasks.$inferSelect;
+export type NewNativeTaskRow = typeof nativeTasks.$inferInsert;
 export type LoadedAgentFileRow = typeof loadedAgentFiles.$inferSelect;
 export type NewLoadedAgentFileRow = typeof loadedAgentFiles.$inferInsert;

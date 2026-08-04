@@ -32,6 +32,7 @@ const redirectUri = "https://chatgpt.com/connector_platform_oauth_redirect";
 
 try {
   await testDatabaseConfiguration(join(root, "database-configuration"));
+  testNativeTaskMigrationPreservesExistingState(join(root, "native-task-migration"));
   testRedirectHostPolicy(join(root, "redirect-host-policy"));
   await testAuthorizationResourceCompatibility(join(root, "authorization-resource"));
   await testDeviceBoundAuthorization(join(root, "device-bound-authorization"));
@@ -60,6 +61,7 @@ async function testDatabaseConfiguration(stateDir: string): Promise<void> {
       { version: 3, name: "oauth-device-bound-tokens" },
       { version: 4, name: "workspace-branch-metadata" },
       { version: 5, name: "workspace-head-metadata" },
+      { version: 6, name: "native-task-continuation" },
     ]);
   } finally {
     database.close();
@@ -68,6 +70,43 @@ async function testDatabaseConfiguration(stateDir: string): Promise<void> {
   if (process.platform !== "win32") {
     assert.equal((await stat(stateDir)).mode & 0o777, 0o700);
     assert.equal((await stat(databasePath(stateDir))).mode & 0o777, 0o600);
+  }
+}
+
+function testNativeTaskMigrationPreservesExistingState(stateDir: string): void {
+  const database = openDatabase(stateDir);
+  database.sqlite.prepare(`
+    insert into workspace_sessions (
+      id, root, status, mode, managed, created_at, last_used_at
+    ) values (?, ?, 'active', 'checkout', 'false', ?, ?)
+  `).run("ws_existing", stateDir, "2026-08-04T00:00:00.000Z", "2026-08-04T00:00:00.000Z");
+  database.sqlite.prepare(
+    "insert into oauth_clients (client_id, client_json, issued_at) values (?, ?, ?)",
+  ).run("existing-client", JSON.stringify({ redirect_uris: ["https://chatgpt.com/callback"] }), 1);
+  database.sqlite.exec("drop table native_tasks");
+  database.sqlite.prepare("delete from devspace_schema_migrations where version = 6").run();
+  database.close();
+
+  const migrated = openDatabase(stateDir);
+  try {
+    const workspaceRow = migrated.sqlite
+      .prepare("select root from workspace_sessions where id = ?")
+      .get("ws_existing") as { root: string } | undefined;
+    const clientRow = migrated.sqlite
+      .prepare("select client_id from oauth_clients where client_id = ?")
+      .get("existing-client") as { client_id: string } | undefined;
+    const migrationRow = migrated.sqlite
+      .prepare("select name from devspace_schema_migrations where version = 6")
+      .get() as { name: string } | undefined;
+    const taskCount = migrated.sqlite
+      .prepare("select count(*) as count from native_tasks")
+      .get() as { count: number };
+    assert.equal(workspaceRow?.root, stateDir);
+    assert.equal(clientRow?.client_id, "existing-client");
+    assert.equal(migrationRow?.name, "native-task-continuation");
+    assert.equal(taskCount.count, 0);
+  } finally {
+    migrated.close();
   }
 }
 
