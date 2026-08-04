@@ -1,0 +1,131 @@
+{
+  "schema": "devspace-native-task-live-1/v1",
+  "status": "SHIPPED",
+  "functionalScore": 84,
+  "acceptedAt": "2026-08-04T16:49:07.892Z",
+  "productResult": "Accepted result authority produced an externally validated Git-custodied repository change and recovered the exact result after DevSpace process and ChatGPT conversation loss.",
+  "taskSelection": {
+    "originalAcceptedTask": "Add an assertion that sealed.brief is frozen.",
+    "originalTaskAlreadyShippedAt": "7d4154efe8a2e5ce17a7d0f49b69aeb1a728410e",
+    "executedBoundedTask": "Prove the sealed native-task brief is detached from later caller mutation through one bounded test change.",
+    "substitutionReason": "The original assertion already existed in a clean remote-equal commit, so repeating it would have been a no-op rather than a result-delivery proof."
+  },
+  "devspaceExecutable": {
+    "commit": "0c7a0610f1f71001ffd1547e95dcfd778942553e",
+    "branch": "product/native-chatgpt-bridge-1",
+    "remote": "origin",
+    "dirty": false,
+    "validated": {
+      "reviewReturn": "11/11",
+      "nativeTask": "pass",
+      "workspaces": "pass",
+      "oauthStore": "pass",
+      "typecheck": "pass",
+      "powershell": "5/5",
+      "build": "pass"
+    },
+    "toolInventory": {
+      "expectedIncludesValidateTask": true,
+      "localIncludesValidateTask": true,
+      "publicIncludesValidateTask": true
+    }
+  },
+  "compilerRepair": {
+    "commit": "5aa2d786934fa20b5b60d02c811e942656c8db3b",
+    "branch": "product/review-return-2",
+    "remote": "origin",
+    "path": "src/review-return.test.ts",
+    "pushed": true
+  },
+  "nativeIntegration": {
+    "commit": "0c7a0610f1f71001ffd1547e95dcfd778942553e",
+    "paths": [
+      "scripts/setup-devspace.ps1",
+      "src/review-return.test.ts"
+    ],
+    "pushed": true
+  },
+  "deliveryTask": {
+    "taskId": "task_1ebf8f7d-cb87-4cda-ba15-ad4f080f27af",
+    "taskDigest": "sha256:66df6cd781d263b688a23f4f63a9b0c4059e60dccaa88ab5aac4e3d0b8eae75e",
+    "repository": "E:\\Code\\meta-harness\\.worktrees\\devspace-4059c98f70463e1c",
+    "allowedPaths": [
+      "tests/native-task-brief.test.js"
+    ],
+    "validation": {
+      "argv": [
+        "D:\\nodejs\\node.exe",
+        "--test",
+        "tests/native-task-brief.test.js",
+        "tests/work-session.test.js"
+      ],
+      "cwd": ".",
+      "outcome": "DONE",
+      "exitCode": 0,
+      "testsPassed": 7,
+      "testsFailed": 0,
+      "completedAt": "2026-08-04T16:41:54.977Z",
+      "outputSha256": "149b11efc15a0dcc4bb6f8830d929883c8530cc4d36562536634ab8fa69cd1f9"
+    },
+    "gitCustody": {
+      "commit": "17f9645bee3df91a36d4a0b5e2827475522a5d60",
+      "branch": "product/native-task-brief-1",
+      "remote": "origin",
+      "paths": [
+        "tests/native-task-brief.test.js"
+      ],
+      "pushed": true,
+      "publishedAt": "2026-08-04T16:42:12.951Z"
+    }
+  },
+  "firstFreshConversation": {
+    "conversationIdentitySha256": "ccc620c795a4c0ec4e64d4c72739e5372e90fdc47be96db4b8314f7bebe639b9",
+    "launchedAt": "2026-08-04T16:40:51.843Z",
+    "assistantOutputCaptured": false,
+    "resultVerifiedFrom": [
+      "native_tasks persistence",
+      "Git branch and origin",
+      "DevSpace tool logs"
+    ]
+  },
+  "restartProof": {
+    "executableCommit": "0c7a0610f1f71001ffd1547e95dcfd778942553e",
+    "preRestartListenerPid": 17300,
+    "postRestartListenerPid": 27164,
+    "postRestartCloudflaredPid": 6368,
+    "postRestartCommandLine": "D:\\nodejs\\node.exe E:\\Code\\devspace\\devspace-src\\.worktrees\\devspace-4859ae9d61326563\\dist\\cli.js serve",
+    "genuineProcessReplacement": true
+  },
+  "secondFreshConversation": {
+    "conversationIdentitySha256": "7d17c269b48d8409d09ff6497e0de05350ddca58fde73067064cf5973b2d6d4f",
+    "launchedAt": "2026-08-04T16:48:40.191Z",
+    "taskIdOnlyOpenRecordedAt": "2026-08-04T16:48:57.740Z",
+    "retainedTaskLastUsedAt": "2026-08-04T16:49:07.891Z",
+    "recovered": {
+      "taskDigestExact": true,
+      "outcomeDone": true,
+      "validationExact": true,
+      "gitCommitExact": true,
+      "branchExact": true,
+      "remoteExact": true,
+      "pathsExact": true,
+      "pushedExact": true
+    },
+    "republish": {
+      "refused": true,
+      "refusedAt": "2026-08-04T16:49:07.892Z",
+      "error": "Task task_1ebf8f7d-cb87-4cda-ba15-ad4f080f27af was already published as 17f9645bee3df91a36d4a0b5e2827475522a5d60"
+    }
+  },
+  "laterCoherentBranchAdvance": {
+    "commit": "33d81761aaaecb25e9de9d232f432467b665b3ec",
+    "summary": "Deep-freeze native task authority through a separately sealed and published native task.",
+    "originEqual": true,
+    "doesNotAlterRetainedCustodyCommit": true
+  },
+  "nonBlockingHousekeeping": [
+    "Meta-Harness worktree retains one untracked NUL command-output artifact.",
+    "Gemini worktree cleanup remains separate from the shipped product verdict.",
+    "runtime.json retained stale PID/start metadata after the second restart; kernel listener PID and command line provide the restart proof."
+  ]
+}
