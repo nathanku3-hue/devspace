@@ -69,6 +69,7 @@ $ExpectedTools = @(
     "review_status",
     "review_submit",
     "safe_rename_file",
+    "validate_task",
     "web_connector_probe",
     "web_connector_start",
     "web_connector_status",
