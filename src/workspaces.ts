@@ -8,6 +8,11 @@ import { createManagedWorktree, removeManagedWorktree } from "./git-worktrees.js
 import { git } from "./git.js";
 import { assertAllowedPath, isPathInsideRoot, resolveAllowedPath } from "./roots.js";
 import {
+  bindNativeTask,
+  type BoundNativeTask,
+  type NativeTaskBriefInput,
+} from "./native-task.js";
+import {
   loadWorkspaceSkills,
   markSkillActivated,
   resolveSkillReadPath,
@@ -43,6 +48,7 @@ export interface Workspace {
   skills: LoadedSkills["skills"];
   skillDiagnostics: LoadedSkills["diagnostics"];
   activatedSkillDirs: Set<string>;
+  task?: BoundNativeTask;
 }
 
 export interface WorkspaceContext {
@@ -63,6 +69,7 @@ export interface OpenWorkspaceInput {
   baseRef?: string;
   branch?: string;
   createBranch?: boolean;
+  taskBrief?: NativeTaskBriefInput;
 }
 
 export interface ClosedWorkspace {
@@ -95,10 +102,11 @@ export class WorkspaceRegistry {
         options.baseRef,
         options.branch,
         options.createBranch,
+        options.taskBrief,
       );
     }
 
-    return this.openCheckoutWorkspace(options.path);
+    return this.openCheckoutWorkspace(options.path, options.taskBrief);
   }
 
   getWorkspace(workspaceId: string): Workspace {
@@ -233,7 +241,10 @@ export class WorkspaceRegistry {
     return assertAllowedPath(directory, [workspace.root]);
   }
 
-  private async openCheckoutWorkspace(path: string): Promise<WorkspaceContext> {
+  private async openCheckoutWorkspace(
+    path: string,
+    taskBrief: NativeTaskBriefInput | undefined,
+  ): Promise<WorkspaceContext> {
     const root = assertAllowedPath(path, this.config.allowedRoots);
     await mkdir(root, { recursive: true });
 
@@ -242,7 +253,7 @@ export class WorkspaceRegistry {
       throw new Error(`Workspace root must be a directory: ${path}`);
     }
 
-    return this.createWorkspaceContext({ root, mode: "checkout" });
+    return this.createWorkspaceContext({ root, mode: "checkout", taskBrief });
   }
 
   private async openWorktreeWorkspace(
@@ -250,6 +261,7 @@ export class WorkspaceRegistry {
     baseRef: string | undefined,
     branch: string | undefined,
     createBranch: boolean | undefined,
+    taskBrief: NativeTaskBriefInput | undefined,
   ): Promise<WorkspaceContext> {
     const worktree = await createManagedWorktree({
       sourcePath: path,
@@ -264,6 +276,7 @@ export class WorkspaceRegistry {
       mode: "worktree",
       sourceRoot: worktree.sourceRoot,
       worktree,
+      taskBrief,
     });
   }
 
@@ -272,6 +285,7 @@ export class WorkspaceRegistry {
     mode: WorkspaceMode;
     sourceRoot?: string;
     worktree?: WorkspaceWorktree;
+    taskBrief?: NativeTaskBriefInput;
   }): Promise<WorkspaceContext> {
     const workspace: Workspace = {
       id: `ws_${randomUUID()}`,
@@ -281,6 +295,9 @@ export class WorkspaceRegistry {
       worktree: input.worktree,
       ...this.loadSkillsForWorkspace(input.root),
       activatedSkillDirs: new Set(),
+      task: input.taskBrief
+        ? bindNativeTask(input.taskBrief, input.sourceRoot ?? input.root, input.root)
+        : undefined,
     };
 
     this.store?.createSession({
