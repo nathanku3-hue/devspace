@@ -123,3 +123,209 @@ function Assert-ExpectedToolInventory {
 
     return $actual
 }
+
+function ConvertTo-NormalizedDevSpacePath {
+    param([string]$Path)
+
+    if ([string]::IsNullOrWhiteSpace($Path)) {
+        return ""
+    }
+    return $Path.Trim().Trim('"').Replace('/', '\').TrimEnd('\')
+}
+
+function Get-DevSpaceProcessId {
+    param($Process)
+
+    if ($null -eq $Process) {
+        return 0
+    }
+    if ($null -ne $Process.PSObject.Properties['ProcessId']) {
+        return [int]$Process.ProcessId
+    }
+    if ($null -ne $Process.PSObject.Properties['Id']) {
+        return [int]$Process.Id
+    }
+    return 0
+}
+
+function Get-DevSpaceProcessStartIdentity {
+    param($Process)
+
+    if ($null -eq $Process) {
+        return ""
+    }
+    $value = $null
+    if ($null -ne $Process.PSObject.Properties['CreationDate']) {
+        $value = $Process.CreationDate
+    } elseif ($null -ne $Process.PSObject.Properties['StartTime']) {
+        $value = $Process.StartTime
+    }
+    if ($null -eq $value) {
+        return ""
+    }
+    try {
+        if ($value -is [DateTime]) {
+            return ([DateTime]$value).ToUniversalTime().ToString('o')
+        }
+        return ([DateTimeOffset]::Parse([string]$value)).ToUniversalTime().ToString('o')
+    } catch {
+        return ([string]$value).Trim()
+    }
+}
+
+function Test-DevSpaceServeCommandLine {
+    param(
+        [string]$CommandLine,
+        [Parameter(Mandatory = $true)][string]$ExpectedCliPath
+    )
+
+    if ([string]::IsNullOrWhiteSpace($CommandLine)) {
+        return $false
+    }
+    $normalizedCommand = $CommandLine.Replace('/', '\')
+    $normalizedExpected = ConvertTo-NormalizedDevSpacePath $ExpectedCliPath
+    if ([string]::IsNullOrWhiteSpace($normalizedExpected)) {
+        return $false
+    }
+    if ($normalizedCommand -notmatch '(?i)(^|\s)serve(?=$|\s)') {
+        return $false
+    }
+    $pathPattern = '(?i)(^|[\s"])' + [regex]::Escape($normalizedExpected) + '(?=$|[\s"])'
+    return [regex]::IsMatch($normalizedCommand, $pathPattern)
+}
+
+function Get-DevSpaceCliPathFromCommandLine {
+    param([string]$CommandLine)
+
+    if ([string]::IsNullOrWhiteSpace($CommandLine)) {
+        return ""
+    }
+    $normalized = $CommandLine.Replace('/', '\')
+    if ($normalized -notmatch '(?i)(^|\s)serve(?=$|\s)') {
+        return ""
+    }
+    $quoted = [regex]::Match($normalized, '(?i)"(?<path>[a-z]:\\[^"]*\\dist\\cli\.js)"')
+    if ($quoted.Success) {
+        return ConvertTo-NormalizedDevSpacePath $quoted.Groups['path'].Value
+    }
+    $unquoted = [regex]::Match($normalized, '(?i)(?<path>[a-z]:\\[^\s"]*\\dist\\cli\.js)(?=\s+serve(?:\s|$))')
+    if ($unquoted.Success) {
+        return ConvertTo-NormalizedDevSpacePath $unquoted.Groups['path'].Value
+    }
+    return ""
+}
+
+function New-ResolvedDevSpaceProcess {
+    param(
+        [Parameter(Mandatory = $true)]$Process,
+        [Parameter(Mandatory = $true)][string]$CliPath,
+        [Parameter(Mandatory = $true)][string]$Resolution
+    )
+
+    return [pscustomobject]@{
+        ProcessId           = Get-DevSpaceProcessId $Process
+        CommandLine         = [string]$Process.CommandLine
+        CliPath             = ConvertTo-NormalizedDevSpacePath $CliPath
+        ProcessStartIdentity = Get-DevSpaceProcessStartIdentity $Process
+        Resolution          = $Resolution
+    }
+}
+
+function Select-DevSpaceServeProcess {
+    param(
+        [object[]]$Processes = @(),
+        [Parameter(Mandatory = $true)][string]$ExpectedCliPath,
+        [int]$ListenerProcessId = 0,
+        [bool]$HealthVerified = $false
+    )
+
+    $exactMatches = @($Processes | Where-Object {
+        Test-DevSpaceServeCommandLine -CommandLine ([string]$_.CommandLine) -ExpectedCliPath $ExpectedCliPath
+    })
+
+    if ($ListenerProcessId -gt 0) {
+        $exactListener = $exactMatches | Where-Object {
+            (Get-DevSpaceProcessId $_) -eq $ListenerProcessId
+        } | Select-Object -First 1
+        if ($null -ne $exactListener) {
+            return New-ResolvedDevSpaceProcess -Process $exactListener -CliPath $ExpectedCliPath -Resolution 'exact-cli-listener'
+        }
+    } elseif ($exactMatches.Count -gt 0) {
+        $exact = $exactMatches | Sort-Object @{ Expression = { Get-DevSpaceProcessId $_ } } | Select-Object -First 1
+        return New-ResolvedDevSpaceProcess -Process $exact -CliPath $ExpectedCliPath -Resolution 'exact-cli'
+    }
+
+    if ($ListenerProcessId -gt 0 -and $HealthVerified) {
+        $owner = $Processes | Where-Object {
+            (Get-DevSpaceProcessId $_) -eq $ListenerProcessId
+        } | Select-Object -First 1
+        if ($null -ne $owner) {
+            $actualCliPath = Get-DevSpaceCliPathFromCommandLine ([string]$owner.CommandLine)
+            if (-not [string]::IsNullOrWhiteSpace($actualCliPath)) {
+                return New-ResolvedDevSpaceProcess -Process $owner -CliPath $actualCliPath -Resolution 'health-verified-port-owner'
+            }
+        }
+    }
+
+    return $null
+}
+
+function Assert-DevSpaceLaunchCanProceed {
+    param(
+        [bool]$HealthyListener,
+        $ResolvedProcess,
+        [int]$ListenerProcessId = 0
+    )
+
+    if ($HealthyListener -and $null -eq $ResolvedProcess) {
+        throw "DevSpace is healthy on port 7676 (PID=$ListenerProcessId) but its exact process identity could not be verified. Refusing a second launch."
+    }
+}
+
+function New-DevSpaceRuntimeProcessRecord {
+    param([Parameter(Mandatory = $true)]$ResolvedProcess)
+
+    if ([int]$ResolvedProcess.ProcessId -le 0) {
+        throw "Cannot persist DevSpace runtime state without a listener PID."
+    }
+    if ([string]::IsNullOrWhiteSpace([string]$ResolvedProcess.CliPath)) {
+        throw "Cannot persist DevSpace runtime state without a CLI path."
+    }
+    if ([string]::IsNullOrWhiteSpace([string]$ResolvedProcess.ProcessStartIdentity)) {
+        throw "Cannot persist DevSpace runtime state without a process start identity."
+    }
+    return [ordered]@{
+        devspacePid                    = [int]$ResolvedProcess.ProcessId
+        devspaceCliPath                = ConvertTo-NormalizedDevSpacePath ([string]$ResolvedProcess.CliPath)
+        devspaceProcessStartIdentity   = [string]$ResolvedProcess.ProcessStartIdentity
+        devspaceProcessResolution      = [string]$ResolvedProcess.Resolution
+    }
+}
+
+function Get-VerifiedDevSpaceStopProcessId {
+    param(
+        [Parameter(Mandatory = $true)]$RuntimeState,
+        [Parameter(Mandatory = $true)]$CurrentProcess
+    )
+
+    $currentPid = Get-DevSpaceProcessId $CurrentProcess
+    if ($currentPid -le 0 -or $currentPid -ne [int]$RuntimeState.devspacePid) {
+        return $null
+    }
+    $persistedCliPath = ConvertTo-NormalizedDevSpacePath ([string]$RuntimeState.devspaceCliPath)
+    $persistedStartIdentity = [string]$RuntimeState.devspaceProcessStartIdentity
+    if (
+        [string]::IsNullOrWhiteSpace($persistedCliPath) -or
+        [string]::IsNullOrWhiteSpace($persistedStartIdentity)
+    ) {
+        return $null
+    }
+    if (-not (Test-DevSpaceServeCommandLine -CommandLine ([string]$CurrentProcess.CommandLine) -ExpectedCliPath $persistedCliPath)) {
+        return $null
+    }
+    $currentStartIdentity = Get-DevSpaceProcessStartIdentity $CurrentProcess
+    if (-not [System.StringComparer]::Ordinal.Equals($persistedStartIdentity, $currentStartIdentity)) {
+        return $null
+    }
+    return $currentPid
+}

@@ -42,6 +42,8 @@ $script:intentionalStop = $false
 $script:leaveRunning = $false
 $script:cloudflaredProcess = $null
 $script:devspaceProcess = $null
+$script:devspaceCliPath = $null
+$script:devspaceProcessIdentity = $null
 $script:setupLogFile = Join-Path $env:TEMP "devspace_setup.log"
 $script:runtimePidFile = Join-Path $env:USERPROFILE ".devspace\runtime.json"
 $script:probeClientFile = Join-Path $env:USERPROFILE ".devspace\setup-probe-client.json"
@@ -562,7 +564,7 @@ function Get-DevSpaceGitIdentity {
 
 function Save-RuntimeState {
     param(
-        [int]$DevSpacePid,
+        [Parameter(Mandatory = $true)]$DevSpaceProcess,
         [int]$CloudflaredPid,
         [string]$TunnelUrl,
         [string]$TunnelHost,
@@ -574,17 +576,21 @@ function Save-RuntimeState {
     if (!(Test-Path $dir)) {
         New-Item -ItemType Directory -Path $dir -Force | Out-Null
     }
+    $runtimeProcess = New-DevSpaceRuntimeProcessRecord -ResolvedProcess $DevSpaceProcess
     $state = @{
-        devspacePid     = $DevSpacePid
-        cloudflaredPid  = $CloudflaredPid
-        tunnelUrl       = $TunnelUrl
-        tunnelHost      = $TunnelHost
-        publicBaseUrl   = $PublicProxyBase
-        startedAt       = (Get-Date).ToString("o")
-        stdoutLog       = $script:devspaceStdoutLog
-        stderrLog       = $script:devspaceStderrLog
-        cloudflaredLog  = $script:cloudflaredLogFile
-        source          = @{
+        devspacePid                   = $runtimeProcess.devspacePid
+        devspaceCliPath               = $runtimeProcess.devspaceCliPath
+        devspaceProcessStartIdentity  = $runtimeProcess.devspaceProcessStartIdentity
+        devspaceProcessResolution     = $runtimeProcess.devspaceProcessResolution
+        cloudflaredPid                 = $CloudflaredPid
+        tunnelUrl                      = $TunnelUrl
+        tunnelHost                     = $TunnelHost
+        publicBaseUrl                  = $PublicProxyBase
+        startedAt                      = (Get-Date).ToString("o")
+        stdoutLog                      = $script:devspaceStdoutLog
+        stderrLog                      = $script:devspaceStderrLog
+        cloudflaredLog                 = $script:cloudflaredLogFile
+        source                         = @{
             repository             = $GitIdentity.repository
             commit                 = $GitIdentity.commit
             branch                 = $GitIdentity.branch
@@ -593,7 +599,7 @@ function Save-RuntimeState {
             cliSha256              = $GitIdentity.cliSha256
             setupScriptSha256      = $GitIdentity.setupScriptSha256
         }
-        toolInventory   = @{
+        toolInventory                  = @{
             expected   = @($ExpectedTools)
             local      = @($LocalTools)
             public     = @($PublicTools)
@@ -601,97 +607,175 @@ function Save-RuntimeState {
         }
     }
     ($state | ConvertTo-Json -Depth 8) | Set-Content -Path $script:runtimePidFile -Encoding UTF8
-    Write-SetupLog "Wrote runtime state with source and tool fingerprints: $script:runtimePidFile"
+    Write-SetupLog "Wrote runtime state for listener PID=$($runtimeProcess.devspacePid), CLI=$($runtimeProcess.devspaceCliPath): $script:runtimePidFile"
+}
+
+function Get-DevSpaceProcessTable {
+    return @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue)
+}
+
+function Get-ListenerProcessId([int]$port) {
+    try {
+        $owner = Get-NetTCPConnection -LocalPort $port -State Listen -ErrorAction SilentlyContinue |
+            Select-Object -ExpandProperty OwningProcess -Unique |
+            Select-Object -First 1
+        if ($owner) { return [int]$owner }
+    } catch {}
+    return 0
+}
+
+function Resolve-DevSpaceServeProcess {
+    param([Parameter(Mandatory = $true)][string]$ExpectedCliPath)
+
+    $listenerPid = Get-ListenerProcessId -port $LocalPort
+    $healthy = $listenerPid -gt 0 -and (Test-LocalDevSpaceHealthy)
+    return Select-DevSpaceServeProcess `
+        -Processes (Get-DevSpaceProcessTable) `
+        -ExpectedCliPath $ExpectedCliPath `
+        -ListenerProcessId $listenerPid `
+        -HealthVerified $healthy
+}
+
+function Test-DevSpaceCloudflaredProcess {
+    param($Process)
+
+    if ($null -eq $Process) { return $false }
+    $commandLine = [string]$Process.CommandLine
+    return (
+        [System.StringComparer]::OrdinalIgnoreCase.Equals([string]$Process.Name, 'cloudflared.exe') -and
+        $commandLine -match "127\.0\.0\.1:$LocalPort"
+    )
 }
 
 function Stop-DevSpaceRuntime {
     Write-SetupLog "Stopping DevSpace runtime..."
-    $pids = @()
+    $state = $null
     if (Test-Path $script:runtimePidFile) {
         try {
             $state = Get-Content $script:runtimePidFile -Raw | ConvertFrom-Json
-            if ($state.devspacePid) { $pids += [int]$state.devspacePid }
-            if ($state.cloudflaredPid) { $pids += [int]$state.cloudflaredPid }
-        } catch {}
+        } catch {
+            Write-SetupLog "Runtime state is unreadable; refusing PID-based shutdown." "WARN"
+        }
     }
-    foreach ($procId in $pids) {
-        try {
-            Stop-Process -Id $procId -Force -ErrorAction SilentlyContinue
-            Write-SetupLog "  Stopped PID $procId"
-        } catch {}
+
+    $processes = Get-DevSpaceProcessTable
+    $listenerPid = Get-ListenerProcessId -port $LocalPort
+    $healthyListener = $listenerPid -gt 0 -and (Test-LocalDevSpaceHealthy)
+    $stopped = New-Object 'System.Collections.Generic.HashSet[int]'
+
+    if ($null -ne $state -and $state.devspacePid) {
+        $recordedProcess = $processes | Where-Object {
+            (Get-DevSpaceProcessId $_) -eq [int]$state.devspacePid
+        } | Select-Object -First 1
+        $verifiedRecordedPid = $null
+        if ($null -ne $recordedProcess) {
+            $verifiedRecordedPid = Get-VerifiedDevSpaceStopProcessId -RuntimeState $state -CurrentProcess $recordedProcess
+        }
+        if ($null -ne $verifiedRecordedPid) {
+            Stop-Process -Id $verifiedRecordedPid -Force -ErrorAction SilentlyContinue
+            [void]$stopped.Add([int]$verifiedRecordedPid)
+            Write-SetupLog "  Stopped identity-verified runtime PID $verifiedRecordedPid"
+        } else {
+            Write-SetupLog "  Ignored stale or PID-reused runtime record for PID $($state.devspacePid)." "WARN"
+        }
     }
-    # Port-based sweep for orphans
-    foreach ($port in @($LocalPort, $DeviceProofPort)) {
-        try {
-            Get-NetTCPConnection -LocalPort $port -State Listen -ErrorAction SilentlyContinue | ForEach-Object {
-                Stop-Process -Id $_.OwningProcess -Force -ErrorAction SilentlyContinue
-                Write-SetupLog "  Freed port $port (PID $($_.OwningProcess))"
-            }
-        } catch {}
+
+    if ($listenerPid -gt 0) {
+        if (-not $healthyListener) {
+            throw "Port $LocalPort is owned by PID $listenerPid but /healthz does not prove it is DevSpace. Refusing to stop it."
+        }
+        $expectedCliPath = if ($null -ne $state -and -not [string]::IsNullOrWhiteSpace([string]$state.devspaceCliPath)) {
+            [string]$state.devspaceCliPath
+        } elseif (-not [string]::IsNullOrWhiteSpace($script:devspaceCliPath)) {
+            $script:devspaceCliPath
+        } else {
+            'Z:\__unmatched__\dist\cli.js'
+        }
+        $resolvedListener = Select-DevSpaceServeProcess `
+            -Processes $processes `
+            -ExpectedCliPath $expectedCliPath `
+            -ListenerProcessId $listenerPid `
+            -HealthVerified $true
+        Assert-DevSpaceLaunchCanProceed -HealthyListener $true -ResolvedProcess $resolvedListener -ListenerProcessId $listenerPid
+        if (-not $stopped.Contains([int]$resolvedListener.ProcessId)) {
+            Stop-Process -Id $resolvedListener.ProcessId -Force -ErrorAction SilentlyContinue
+            [void]$stopped.Add([int]$resolvedListener.ProcessId)
+            Write-SetupLog "  Stopped verified listener PID $($resolvedListener.ProcessId) ($($resolvedListener.CliPath))"
+        }
     }
-    Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object {
-        $cmd = if ($_.CommandLine) { $_.CommandLine } else { "" }
-        $_.Name -eq "cloudflared.exe" -or $cmd -match 'devspace-src.*cli\.js.*serve'
-    } | ForEach-Object {
-        Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue
+
+    if ($null -ne $state -and $state.cloudflaredPid) {
+        $cloudflared = $processes | Where-Object {
+            (Get-DevSpaceProcessId $_) -eq [int]$state.cloudflaredPid
+        } | Select-Object -First 1
+        if (Test-DevSpaceCloudflaredProcess $cloudflared) {
+            Stop-Process -Id ([int]$state.cloudflaredPid) -Force -ErrorAction SilentlyContinue
+            Write-SetupLog "  Stopped verified cloudflared PID $($state.cloudflaredPid)"
+        } else {
+            Write-SetupLog "  Ignored stale or unrelated cloudflared PID $($state.cloudflaredPid)." "WARN"
+        }
     }
+
     if (Test-Path $script:runtimePidFile) {
         Remove-Item $script:runtimePidFile -Force -ErrorAction SilentlyContinue
     }
     Write-SetupLog "Stop complete."
 }
 
-function Find-DevSpaceServeProcess {
-    Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object {
-        $cmd = if ($_.CommandLine) { $_.CommandLine } else { "" }
-        $cmd -match 'devspace-src[\\/]+dist[\\/]+cli\.js' -and $cmd -match 'serve'
-    } | Select-Object -First 1
-}
-
 function Stop-DevSpaceRelatedProcesses {
-    Write-Host "Stopping existing cloudflared, ngrok, and any process holding DevSpace ports..."
+    param([Parameter(Mandatory = $true)][string]$ExpectedCliPath)
 
-    $targets = Get-CimInstance Win32_Process | Where-Object {
-        $cmd = if ($null -ne $_.CommandLine) { $_.CommandLine } else { "" }
-        $name = $_.Name
-        $name -eq "cloudflared.exe" -or
-        $name -eq "ngrok.exe" -or
-        $cmd -like "*@waishnav/devspace*" -or
-        $cmd -match 'cli\.js["\s]+serve' -or
-        $cmd -match 'dist[/\\]cli\.js' -or
-        $cmd -like "*chatgpt-push*" -or
-        ($cmd -like "*devspace*" -and $cmd -like "*serve*")
+    Write-Host "Stopping only identity-verified DevSpace runtime processes..."
+    $processes = Get-DevSpaceProcessTable
+    $listenerPid = Get-ListenerProcessId -port $LocalPort
+    $healthyListener = $listenerPid -gt 0 -and (Test-LocalDevSpaceHealthy)
+    $resolvedListener = Select-DevSpaceServeProcess `
+        -Processes $processes `
+        -ExpectedCliPath $ExpectedCliPath `
+        -ListenerProcessId $listenerPid `
+        -HealthVerified $healthyListener
+
+    if ($listenerPid -gt 0 -and -not $healthyListener) {
+        throw "Port $LocalPort is owned by PID $listenerPid but /healthz does not prove it is DevSpace. Refusing cleanup."
     }
+    Assert-DevSpaceLaunchCanProceed `
+        -HealthyListener $healthyListener `
+        -ResolvedProcess $resolvedListener `
+        -ListenerProcessId $listenerPid
 
-    foreach ($proc in $targets) {
-        $cmdPreview = if ($proc.CommandLine) { $proc.CommandLine.Substring(0, [Math]::Min(100, $proc.CommandLine.Length)) } else { $proc.Name }
-        Write-Host "  Stopping PID $($proc.ProcessId): $cmdPreview"
-        Stop-Process -Id $proc.ProcessId -Force -ErrorAction SilentlyContinue
-    }
-
-    # Always free listeners on MCP / device-proof ports (catches unknown binaries).
-    foreach ($port in @($LocalPort, $DeviceProofPort)) {
-        try {
-            $listeners = Get-NetTCPConnection -LocalPort $port -State Listen -ErrorAction SilentlyContinue
-            foreach ($listener in $listeners) {
-                $owner = $listener.OwningProcess
-                if ($owner -and $owner -ne $PID) {
-                    $ownerCmd = (Get-CimInstance Win32_Process -Filter "ProcessId=$owner" -ErrorAction SilentlyContinue).CommandLine
-                    Write-Host "  Freeing port $port (PID $owner) $ownerCmd"
-                    Stop-Process -Id $owner -Force -ErrorAction SilentlyContinue
-                }
-            }
-        } catch {
+    $targets = New-Object 'System.Collections.Generic.HashSet[int]'
+    foreach ($process in $processes) {
+        if (Test-DevSpaceServeCommandLine -CommandLine ([string]$process.CommandLine) -ExpectedCliPath $ExpectedCliPath) {
+            [void]$targets.Add((Get-DevSpaceProcessId $process))
         }
+        if (Test-DevSpaceCloudflaredProcess $process) {
+            [void]$targets.Add((Get-DevSpaceProcessId $process))
+        }
+    }
+    if ($null -ne $resolvedListener) {
+        [void]$targets.Add([int]$resolvedListener.ProcessId)
+    }
+
+    foreach ($procId in $targets) {
+        if ($procId -le 0 -or $procId -eq $PID) { continue }
+        $record = $processes | Where-Object { (Get-DevSpaceProcessId $_) -eq $procId } | Select-Object -First 1
+        $preview = if ($record -and $record.CommandLine) {
+            ([string]$record.CommandLine).Substring(0, [Math]::Min(120, ([string]$record.CommandLine).Length))
+        } else {
+            "PID $procId"
+        }
+        Write-Host "  Stopping verified PID ${procId}: $preview"
+        Stop-Process -Id $procId -Force -ErrorAction SilentlyContinue
     }
 
     Start-Sleep -Milliseconds 800
-
     if (Test-PortOpen $LocalHost $LocalPort 200) {
-        throw "Port $LocalPort is still in use after cleanup. Close the process using it and retry."
+        $remainingOwner = Get-ListenerProcessId -port $LocalPort
+        throw "Port $LocalPort remains in use by PID $remainingOwner after verified cleanup. Refusing a second launch."
     }
     if (Test-PortOpen $LocalHost $DeviceProofPort 200) {
-        throw "Port $DeviceProofPort is still in use after cleanup. Close the process using it and retry."
+        $remainingOwner = Get-ListenerProcessId -port $DeviceProofPort
+        throw "Device-proof port $DeviceProofPort remains in use by PID $remainingOwner after verified cleanup."
     }
 }
 
@@ -899,6 +983,7 @@ function Test-ProxyUsesTunnel([string]$expectedTunnelHost, [int]$attempts = 8) {
 }
 
 function Start-DevSpaceServer([string]$devspaceCli, [string]$tunnelHost) {
+    $script:devspaceCliPath = ConvertTo-NormalizedDevSpacePath $devspaceCli
     $proxyHost = ([System.Uri]$PublicProxyBase).Host
 
     $configDir = Join-Path $env:USERPROFILE ".devspace"
@@ -979,14 +1064,24 @@ function Start-DevSpaceServer([string]$devspaceCli, [string]$tunnelHost) {
     $proc = $null
     for ($i = 0; $i -lt 30; $i++) {
         Start-Sleep -Milliseconds 400
-        $found = Find-DevSpaceServeProcess
-        if ($found) {
-            $proc = Get-Process -Id $found.ProcessId -ErrorAction SilentlyContinue
+        $resolved = Resolve-DevSpaceServeProcess -ExpectedCliPath $devspaceCli
+        if ($null -ne $resolved) {
+            $proc = Get-Process -Id $resolved.ProcessId -ErrorAction SilentlyContinue
             if ($proc) { break }
         }
     }
     if ($null -eq $proc) {
-        Write-SetupLog "WMI launcher did not yield serve PID; falling back to Start-Process." "WARN"
+        $listenerPid = Get-ListenerProcessId -port $LocalPort
+        $healthyListener = $listenerPid -gt 0 -and (Test-LocalDevSpaceHealthy)
+        $resolved = Resolve-DevSpaceServeProcess -ExpectedCliPath $devspaceCli
+        Assert-DevSpaceLaunchCanProceed `
+            -HealthyListener $healthyListener `
+            -ResolvedProcess $resolved `
+            -ListenerProcessId $listenerPid
+        if ($listenerPid -gt 0) {
+            throw "Port $LocalPort became occupied by PID $listenerPid during launch and cannot be safely adopted. Refusing a second launch."
+        }
+        Write-SetupLog "WMI launcher did not yield the expected serve process; falling back to Start-Process." "WARN"
         $proc = Start-Process -FilePath $nodeExe `
             -ArgumentList @($devspaceCli, "serve") `
             -WorkingDirectory $PSScriptRoot `
@@ -998,7 +1093,7 @@ function Start-DevSpaceServer([string]$devspaceCli, [string]$tunnelHost) {
     if ($null -eq $proc) {
         throw "DevSpace failed to start: no node serve process found."
     }
-    Write-SetupLog "DevSpace started PID=$($proc.Id); logs: $script:devspaceStdoutLog | $script:devspaceStderrLog"
+    Write-SetupLog "DevSpace candidate started PID=$($proc.Id); logs: $script:devspaceStdoutLog | $script:devspaceStderrLog"
 
     # Wait until local MCP port is listening and healthz works.
     $ready = $false
@@ -1036,21 +1131,32 @@ function Start-DevSpaceServer([string]$devspaceCli, [string]$tunnelHost) {
         throw "DevSpace did not become healthy on http://${LocalHost}:${LocalPort}/healthz within timeout.`n--- stderr tail ---`n$tail"
     }
 
-    Write-SetupLog "Local DevSpace is healthy on port $LocalPort (tunnel host allowlisted)."
+    $listenerPid = Get-ListenerProcessId -port $LocalPort
+    $resolvedListener = Resolve-DevSpaceServeProcess -ExpectedCliPath $devspaceCli
+    Assert-DevSpaceLaunchCanProceed `
+        -HealthyListener $true `
+        -ResolvedProcess $resolvedListener `
+        -ListenerProcessId $listenerPid
+    if ($null -eq $resolvedListener -or [int]$resolvedListener.ProcessId -ne $listenerPid) {
+        throw "Healthy DevSpace listener PID $listenerPid did not resolve to the expected runtime process."
+    }
+    $proc = Get-Process -Id $listenerPid -ErrorAction SilentlyContinue
+    if ($null -eq $proc) {
+        throw "Healthy DevSpace listener PID $listenerPid could not be opened for monitoring."
+    }
+    $script:devspaceProcessIdentity = $resolvedListener
+    Write-SetupLog "Local DevSpace is healthy on port $LocalPort; bound listener PID=$listenerPid CLI=$($resolvedListener.CliPath)."
     return $proc
 }
 
 function Stop-TrackedProcesses {
-    foreach ($process in @($script:devspaceProcess, $script:cloudflaredProcess)) {
-        if ($null -eq $process) { continue }
-        try {
-            $process.Refresh()
-            if (-not $process.HasExited) {
-                Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue
-            }
-        } catch {
+    if ($null -eq $script:cloudflaredProcess) { return }
+    try {
+        $record = Get-CimInstance Win32_Process -Filter "ProcessId=$($script:cloudflaredProcess.Id)" -ErrorAction SilentlyContinue
+        if (Test-DevSpaceCloudflaredProcess $record) {
+            Stop-Process -Id $script:cloudflaredProcess.Id -Force -ErrorAction SilentlyContinue
         }
-    }
+    } catch {}
 }
 
 # --- main ---
@@ -1067,8 +1173,11 @@ if ($Stop) {
 
 try {
 Write-SetupLog "==== DevSpace setup starting (log: $script:setupLogFile) ===="
+$devspaceSourceDir = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
+$devspaceCli = Join-Path $devspaceSourceDir "dist\cli.js"
+$script:devspaceCliPath = ConvertTo-NormalizedDevSpacePath $devspaceCli
 Set-DevSpaceStartupShortcut
-Stop-DevSpaceRelatedProcesses
+Stop-DevSpaceRelatedProcesses -ExpectedCliPath $devspaceCli
 
 # Scan for local or system proxy before starting cloudflared
 $detectedProxy = $null
@@ -1132,8 +1241,6 @@ if ([string]::IsNullOrWhiteSpace($authToken)) {
     throw "Proxy authentication token not found. Set DEVSPACE_PROXY_AUTH_TOKEN or place it in '$configDir\proxy_token.txt'."
 }
 
-$devspaceSourceDir = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
-$devspaceCli = Join-Path $devspaceSourceDir "dist\cli.js"
 $prepareLaunchScript = Join-Path $devspaceSourceDir "scripts\prepare-devspace-launch.ps1"
 
 Write-Host "Preparing local DevSpace build..."
@@ -1262,14 +1369,23 @@ for ($i = 0; $i -lt 30; $i++) {
     Start-Sleep -Seconds 1
     Write-Host "." -NoNewline
 
-    $script:cloudflaredProcess.Refresh()
-    if ($script:cloudflaredProcess.HasExited) {
+    if (-not (Test-ManagedProcessAlive $script:cloudflaredProcess)) {
         throw "Cloudflare Tunnel stopped during startup. ExitCode=$(Get-SafeExitCode $script:cloudflaredProcess). See $logFile"
     }
-    $script:devspaceProcess.Refresh()
-    if ($script:devspaceProcess.HasExited) {
-        throw "DevSpace stopped during startup. PID=$($script:devspaceProcess.Id); ExitCode=$(Get-SafeExitCode $script:devspaceProcess)."
+    $resolvedListener = Resolve-DevSpaceServeProcess -ExpectedCliPath $devspaceCli
+    if (-not (Test-LocalDevSpaceHealthy) -or $null -eq $resolvedListener) {
+        $oldPid = if ($script:devspaceProcess) { $script:devspaceProcess.Id } else { 'n/a' }
+        throw "DevSpace listener custody was lost during startup. Tracked PID=$oldPid."
     }
+    if ($null -eq $script:devspaceProcess -or $script:devspaceProcess.Id -ne [int]$resolvedListener.ProcessId) {
+        $oldPid = if ($script:devspaceProcess) { $script:devspaceProcess.Id } else { 'n/a' }
+        $script:devspaceProcess = Get-Process -Id $resolvedListener.ProcessId -ErrorAction SilentlyContinue
+        if ($null -eq $script:devspaceProcess) {
+            throw "Resolved DevSpace listener PID $($resolvedListener.ProcessId) could not be opened during startup."
+        }
+        Write-SetupLog "Re-bound DevSpace monitoring to listener: oldPID=$oldPid newPID=$($resolvedListener.ProcessId)" "WARN"
+    }
+    $script:devspaceProcessIdentity = $resolvedListener
 
     if (Test-CloudflaredEdgeRegistered -logPath $logFile) {
         $edgeReady = $true
@@ -1384,13 +1500,27 @@ $publicTools = Invoke-AuthenticatedToolsList `
 $publicTools = Assert-ExpectedToolInventory -EndpointLabel "Public Worker" -ExpectedTools $ExpectedTools -ActualTools $publicTools
 
 $gitIdentity = Get-DevSpaceGitIdentity -RepositoryRoot $devspaceSourceDir -CliPath $devspaceCli -SetupScriptPath $PSCommandPath
+$listenerPid = Get-ListenerProcessId -port $LocalPort
+$script:devspaceProcessIdentity = Resolve-DevSpaceServeProcess -ExpectedCliPath $devspaceCli
+Assert-DevSpaceLaunchCanProceed `
+    -HealthyListener (Test-LocalDevSpaceHealthy) `
+    -ResolvedProcess $script:devspaceProcessIdentity `
+    -ListenerProcessId $listenerPid
+if ($null -eq $script:devspaceProcessIdentity -or [int]$script:devspaceProcessIdentity.ProcessId -ne $listenerPid) {
+    throw "Runtime state cannot be written because resolved PID $($script:devspaceProcessIdentity.ProcessId) is not listener PID $listenerPid."
+}
+$script:devspaceProcess = Get-Process -Id $listenerPid -ErrorAction SilentlyContinue
+if ($null -eq $script:devspaceProcess) {
+    throw "Runtime listener PID $listenerPid could not be opened before state persistence."
+}
+
 Write-SetupLog "Runtime source: commit=$($gitIdentity.commit) branch=$($gitIdentity.branch) dirty=$($gitIdentity.dirty) dirtyFingerprint=$($gitIdentity.dirtyFingerprintSha256)"
 Write-SetupLog "Setup finished. Exact connector tools: $($ExpectedTools -join ', ')."
 Write-SetupLog "Public MCP base: $PublicProxyBase"
 Write-SetupLog "Active tunnel host: $tunnelHost"
-Write-SetupLog "DevSpace PID=$($script:devspaceProcess.Id); cloudflared PID=$($script:cloudflaredProcess.Id)"
+Write-SetupLog "DevSpace listener PID=$listenerPid CLI=$($script:devspaceProcessIdentity.CliPath); cloudflared PID=$($script:cloudflaredProcess.Id)"
 Save-RuntimeState `
-    -DevSpacePid $script:devspaceProcess.Id `
+    -DevSpaceProcess $script:devspaceProcessIdentity `
     -CloudflaredPid $script:cloudflaredProcess.Id `
     -TunnelUrl $tunnelUrl `
     -TunnelHost $tunnelHost `
@@ -1442,27 +1572,34 @@ if (-not $Monitor) {
 
         Start-Sleep -Seconds 5
 
-        $dsAlive = Test-ManagedProcessAlive $script:devspaceProcess
         $cfAlive = Test-ManagedProcessAlive $script:cloudflaredProcess
         $localOk = Test-LocalDevSpaceHealthy
-
-        # Re-bind process handles if WMI-launched PIDs were recycled
-        if (-not $dsAlive -or -not $localOk) {
-            $found = Find-DevSpaceServeProcess
-            if ($found) {
-                $script:devspaceProcess = Get-Process -Id $found.ProcessId -ErrorAction SilentlyContinue
-                $dsAlive = $null -ne $script:devspaceProcess
-                $localOk = Test-LocalDevSpaceHealthy
+        $resolvedListener = $null
+        if ($localOk) {
+            $resolvedListener = Resolve-DevSpaceServeProcess -ExpectedCliPath $devspaceCli
+            if ($null -ne $resolvedListener) {
+                if ($null -eq $script:devspaceProcess -or $script:devspaceProcess.Id -ne [int]$resolvedListener.ProcessId) {
+                    $oldPid = if ($script:devspaceProcess) { $script:devspaceProcess.Id } else { 'n/a' }
+                    $script:devspaceProcess = Get-Process -Id $resolvedListener.ProcessId -ErrorAction SilentlyContinue
+                    Write-SetupLog "Re-bound monitor to actual listener: oldPID=$oldPid newPID=$($resolvedListener.ProcessId)" "WARN"
+                }
+                $script:devspaceProcessIdentity = $resolvedListener
+            } else {
+                Write-SetupLog "Healthy listener exists but its process identity is unresolved; monitoring will not trust the stale handle." "WARN"
+                $script:devspaceProcess = $null
             }
         }
+        $dsAlive = Test-ManagedProcessAlive $script:devspaceProcess
 
         if (-not $cfAlive) {
             Write-SetupLog "cloudflared not alive — background services may need re-run of setup." "WARN"
         }
         if (-not $localOk) {
             Write-SetupLog "Local healthz down. Check logs: $script:devspaceStderrLog" "WARN"
+        } elseif (-not $dsAlive) {
+            Write-SetupLog "Local healthz is up but the listener process handle is not safely bound." "WARN"
         } else {
-            Write-Host ("[{0}] healthz ok (devspace PID={1})" -f (Get-Date -Format "HH:mm:ss"), $script:devspaceProcess.Id)
+            Write-Host ("[{0}] healthz ok (listener PID={1})" -f (Get-Date -Format "HH:mm:ss"), $script:devspaceProcess.Id)
         }
     }
 }

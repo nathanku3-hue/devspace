@@ -94,3 +94,119 @@ Describe "DevSpace setup probe client persistence" {
         $loaded | Should Be $null
     }
 }
+
+Describe "DevSpace runtime process custody" {
+    $expectedCli = "E:\Code\devspace\devspace-src\.worktrees\devspace-native\dist\cli.js"
+    $startedAt = [DateTime]::SpecifyKind([DateTime]::Parse("2026-08-05T01:00:00"), [DateTimeKind]::Utc)
+
+    It "prefers the exact expected CLI path when multiple cli.js serve processes exist" {
+        $processes = @(
+            [pscustomobject]@{
+                ProcessId = 101
+                CommandLine = '"D:\nodejs\node.exe" "E:\Code\devspace\devspace-src\.worktrees\other\dist\cli.js" serve'
+                CreationDate = $startedAt
+            },
+            [pscustomobject]@{
+                ProcessId = 202
+                CommandLine = '"D:\nodejs\node.exe" "E:\Code\devspace\devspace-src\.worktrees\devspace-native\dist\cli.js" serve'
+                CreationDate = $startedAt.AddSeconds(1)
+            }
+        )
+
+        $resolved = Select-DevSpaceServeProcess `
+            -Processes $processes `
+            -ExpectedCliPath $expectedCli `
+            -ListenerProcessId 202 `
+            -HealthVerified $true
+
+        $resolved.ProcessId | Should Be 202
+        $resolved.Resolution | Should Be "exact-cli-listener"
+        $resolved.CliPath | Should Be $expectedCli
+    }
+
+    It "uses the health-verified port owner as the fallback listener" {
+        $actualCli = "E:\Code\devspace\devspace-src\.worktrees\devspace-live\dist\cli.js"
+        $processes = @(
+            [pscustomobject]@{
+                ProcessId = 303
+                CommandLine = "`"D:\nodejs\node.exe`" `"$actualCli`" serve"
+                CreationDate = $startedAt
+            }
+        )
+
+        $resolved = Select-DevSpaceServeProcess `
+            -Processes $processes `
+            -ExpectedCliPath $expectedCli `
+            -ListenerProcessId 303 `
+            -HealthVerified $true
+
+        $resolved.ProcessId | Should Be 303
+        $resolved.Resolution | Should Be "health-verified-port-owner"
+        $resolved.CliPath | Should Be $actualCli
+    }
+
+    It "does not authorize stopping a stale or PID-reused runtime record" {
+        $runtimeState = [pscustomobject]@{
+            devspacePid = 404
+            devspaceCliPath = $expectedCli
+            devspaceProcessStartIdentity = $startedAt.ToString('o')
+        }
+        $reusedProcess = [pscustomobject]@{
+            ProcessId = 404
+            CommandLine = "`"D:\nodejs\node.exe`" `"$expectedCli`" serve"
+            CreationDate = $startedAt.AddHours(1)
+        }
+
+        $verifiedPid = Get-VerifiedDevSpaceStopProcessId `
+            -RuntimeState $runtimeState `
+            -CurrentProcess $reusedProcess
+        $stopped = @()
+        if ($null -ne $verifiedPid) { $stopped += $verifiedPid }
+
+        $stopped.Count | Should Be 0
+    }
+
+    It "refuses a duplicate launch when a healthy listener cannot be identified" {
+        $unresolved = Select-DevSpaceServeProcess `
+            -Processes @([pscustomobject]@{ ProcessId = 505; CommandLine = $null; CreationDate = $startedAt }) `
+            -ExpectedCliPath $expectedCli `
+            -ListenerProcessId 505 `
+            -HealthVerified $true
+
+        { Assert-DevSpaceLaunchCanProceed -HealthyListener $true -ResolvedProcess $unresolved -ListenerProcessId 505 } | Should Throw
+    }
+
+    It "persists the listener PID instead of a launcher or stale fallback handle" {
+        $actualCli = "E:\Code\devspace\devspace-src\.worktrees\devspace-listener\dist\cli.js"
+        $processes = @(
+            [pscustomobject]@{
+                ProcessId = 600
+                CommandLine = "`"D:\nodejs\node.exe`" `"$expectedCli`" serve"
+                CreationDate = $startedAt
+            },
+            [pscustomobject]@{
+                ProcessId = 601
+                CommandLine = "`"D:\nodejs\node.exe`" `"$actualCli`" serve"
+                CreationDate = $startedAt.AddSeconds(2)
+            }
+        )
+        $resolved = Select-DevSpaceServeProcess `
+            -Processes $processes `
+            -ExpectedCliPath $expectedCli `
+            -ListenerProcessId 601 `
+            -HealthVerified $true
+        $record = New-DevSpaceRuntimeProcessRecord -ResolvedProcess $resolved
+
+        $record.devspacePid | Should Be 601
+        $record.devspacePid | Should Not Be 600
+        $record.devspaceCliPath | Should Be $actualCli
+        $record.devspaceProcessStartIdentity | Should Be $startedAt.AddSeconds(2).ToString('o')
+    }
+
+    It "recognizes exact worktree CLI paths" {
+        $commandLine = '"D:\nodejs\node.exe" "E:/Code/devspace/devspace-src/.worktrees/devspace-native/dist/cli.js" serve'
+
+        (Test-DevSpaceServeCommandLine -CommandLine $commandLine -ExpectedCliPath $expectedCli) | Should Be $true
+        (Get-DevSpaceCliPathFromCommandLine $commandLine) | Should Be $expectedCli
+    }
+}
