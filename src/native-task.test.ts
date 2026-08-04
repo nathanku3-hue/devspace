@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -220,6 +220,68 @@ try {
     root,
   );
   assert.equal((await runNativeTaskValidation(blockedTask)).outcome, "BLOCKED");
+
+  const cancellationPidPath = join(root, "cancelled-child.pid");
+  const cancellationScript = [
+    "const { spawn } = require('node:child_process');",
+    "const { writeFileSync } = require('node:fs');",
+    "const child = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { windowsHide: true });",
+    "writeFileSync(process.argv[1], String(child.pid));",
+    "setInterval(() => {}, 1000);",
+  ].join("\n");
+  const cancellationTask = bindNativeTask(
+    brief({
+      validation: [
+        {
+          argv: [process.execPath, "-e", cancellationScript, cancellationPidPath],
+          cwd: ".",
+          timeoutSeconds: 30,
+        },
+      ],
+    }),
+    root,
+    root,
+  );
+  const progress: string[] = [];
+  const abortController = new AbortController();
+  const cancellation = runNativeTaskValidation(cancellationTask, process.env, {
+    signal: abortController.signal,
+    onProgress: (update) => {
+      progress.push(update.phase);
+    },
+  });
+  let cancelledChildPid = 0;
+  const cancellationDeadline = Date.now() + 5000;
+  while (Date.now() < cancellationDeadline) {
+    try {
+      cancelledChildPid = Number((await readFile(cancellationPidPath, "utf8")).trim());
+      if (Number.isInteger(cancelledChildPid) && cancelledChildPid > 0) break;
+    } catch {
+      // The validation fixture has not spawned its child yet.
+    }
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+  assert.ok(cancelledChildPid > 0, "validation child PID was not recorded");
+  abortController.abort();
+  await assert.rejects(
+    cancellation,
+    (error: unknown) => error instanceof Error && error.name === "AbortError",
+  );
+  const childExitDeadline = Date.now() + 5000;
+  while (Date.now() < childExitDeadline) {
+    try {
+      process.kill(cancelledChildPid, 0);
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    } catch {
+      cancelledChildPid = 0;
+      break;
+    }
+  }
+  assert.equal(cancelledChildPid, 0, "cancelled validation left a descendant alive");
+  assert.equal(cancellationTask.outcome, "READY");
+  assert.equal(cancellationTask.lastValidation, undefined);
+  assert.ok(progress.includes("started"));
+  assert.ok(progress.includes("command_started"));
 
   const noCommitTask = bindNativeTask(
     brief({

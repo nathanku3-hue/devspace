@@ -125,11 +125,19 @@ function shellCommand(command: string): string {
   return `git() { command git.exe "$@"; }\n${command}`;
 }
 
-export async function runShellTool(input: BashToolInput, context: ToolContext): Promise<ToolResponse> {
+export interface ShellExecutionOptions {
+  signal?: AbortSignal;
+}
+
+export async function runShellTool(
+  input: BashToolInput,
+  context: ToolContext,
+  options: ShellExecutionOptions = {},
+): Promise<ToolResponse> {
   const tool = createBashTool(context.cwd);
   const timeout = input.timeout === undefined ? 30 : Math.min(input.timeout, 300);
 
-  return runTool((params) => tool.execute("run_shell", params), {
+  return runTool((params) => tool.execute("run_shell", params, options.signal), {
     command: shellCommand(input.command),
     timeout,
   }, context);

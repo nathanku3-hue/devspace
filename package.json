@@ -25,7 +25,7 @@
     "build:app": "vite build",
     "dev": "node scripts/dev-server.mjs",
     "start": "node dist/cli.js serve",
-    "test": "tsx src/config.test.ts && tsx src/roots.test.ts && tsx src/skills.test.ts && tsx src/native-task.test.ts && tsx src/workspaces.test.ts && tsx src/portfolio-policy.test.ts && tsx src/review-checkpoints.test.ts && tsx src/device-authorization.test.ts && tsx src/oauth-store.test.ts && tsx src/read-files.test.ts && tsx src/git-publish.test.ts && tsx src/cli.test.ts && tsx src/safe-rename.test.ts && tsx --test src/web-launch.test.ts src/web-launch-profile-lease.test.ts src/web-connector.test.ts src/review-return.test.ts && npm run test:powershell",
+    "test": "tsx src/config.test.ts && tsx src/roots.test.ts && tsx src/skills.test.ts && tsx src/execution-gate.test.ts && tsx src/long-task-operations.test.ts && tsx src/process-control.test.ts && tsx src/pi-tools.test.ts && tsx src/native-task.test.ts && tsx src/workspaces.test.ts && tsx src/portfolio-policy.test.ts && tsx src/review-checkpoints.test.ts && tsx src/device-authorization.test.ts && tsx src/oauth-store.test.ts && tsx src/read-files.test.ts && tsx src/git-publish.test.ts && tsx src/cli.test.ts && tsx src/safe-rename.test.ts && tsx --test src/web-launch.test.ts src/web-launch-profile-lease.test.ts src/web-connector.test.ts src/review-return.test.ts && npm run test:powershell",
     "test:web-launch": "tsx --test src/web-launch.test.ts",
     "test:web-launch-browser": "tsx --test src/web-launch-browser.fixture.test.ts",
     "test:web-connector": "tsx --test src/web-connector.test.ts",

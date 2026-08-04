@@ -53,6 +53,10 @@ $LocalHost = "127.0.0.1"
 $LocalPort = 7676
 $DeviceProofPort = 7677
 $PrimaryAllowedRoot = "E:\Code"
+$PortfolioPolicyPath = "E:\Code\.portfolio-custody\policy\portfolio-policy.json"
+if (-not (Test-Path -LiteralPath $PortfolioPolicyPath -PathType Leaf)) {
+    throw "DevSpace portfolio custody policy is missing: $PortfolioPolicyPath"
+}
 # Temporary custody-migration allowance. This permits DevSpace to open and
 # rescue existing managed worktrees in place; it is not an approved destination
 # for newly created worktrees and should be removed after migration acceptance.
@@ -61,8 +65,10 @@ $AllowedRoots = @($PrimaryAllowedRoot, $LegacyWorktreeMigrationRoot)
 $AllowedRootsEnv = $AllowedRoots -join ","
 $ExpectedTools = @(
     "bash",
+    "cancel_long_task",
     "close_workspace",
     "edit",
+    "long_task_status",
     "open_workspace",
     "publish_git_changes",
     "read",
@@ -71,6 +77,7 @@ $ExpectedTools = @(
     "review_status",
     "review_submit",
     "safe_rename_file",
+    "start_long_task",
     "validate_task",
     "web_connector_probe",
     "web_connector_start",
@@ -1023,7 +1030,9 @@ function Start-DevSpaceServer([string]$devspaceCli, [string]$tunnelHost) {
     # No space after commas; parser trims, but keep the value clean.
     $env:DEVSPACE_ALLOWED_HOSTS = "$proxyHost,$tunnelHost,localhost,127.0.0.1"
     $env:DEVSPACE_ALLOWED_ROOTS = $AllowedRootsEnv
+    $env:DEVSPACE_PORTFOLIO_POLICY = $PortfolioPolicyPath
     $env:DEVSPACE_TRUST_PROXY = "true"
+    Write-SetupLog "Portfolio custody policy: $PortfolioPolicyPath"
     $env:DEVSPACE_OAUTH_ALLOWED_REDIRECT_HOSTS = "chatgpt.com,claude.ai,perplexity.ai,*.perplexity.ai,www.perplexity.com,enterprise.perplexity.com,n.perplexity.com,staging.perplexity.com,chatshare.xyz,*.chatshare.xyz,localhost,127.0.0.1"
     $env:DEVSPACE_OAUTH_REDIRECT_URI_ALIASES = "https://chatgpt.com/connector/oauth/=https://chatshare.xyz/connector/oauth/"
     $env:DEVSPACE_DEVICE_AUTH = "true"
@@ -1057,6 +1066,7 @@ function Start-DevSpaceServer([string]$devspaceCli, [string]$tunnelHost) {
         "set DEVSPACE_PUBLIC_BASE_URL=$($env:DEVSPACE_PUBLIC_BASE_URL)"
         "set DEVSPACE_ALLOWED_HOSTS=$($env:DEVSPACE_ALLOWED_HOSTS)"
         "set DEVSPACE_ALLOWED_ROOTS=$($env:DEVSPACE_ALLOWED_ROOTS)"
+        "set DEVSPACE_PORTFOLIO_POLICY=$($env:DEVSPACE_PORTFOLIO_POLICY)"
         "set DEVSPACE_TRUST_PROXY=$($env:DEVSPACE_TRUST_PROXY)"
         "set DEVSPACE_OAUTH_ALLOWED_REDIRECT_HOSTS=$($env:DEVSPACE_OAUTH_ALLOWED_REDIRECT_HOSTS)"
         "set DEVSPACE_OAUTH_REDIRECT_URI_ALIASES=$($env:DEVSPACE_OAUTH_REDIRECT_URI_ALIASES)"

@@ -52,7 +52,14 @@ import {
   authorizeNativeTaskPublish,
   runNativeTaskValidation,
   taskInstruction,
+  type NativeTaskValidationProgress,
+  type NativeTaskValidationResult,
 } from "./native-task.js";
+import { ExecutionGate } from "./execution-gate.js";
+import {
+  LongTaskOperationManager,
+  type LongTaskOperationSnapshot,
+} from "./long-task-operations.js";
 import { formatAgentsPath, WorkspaceRegistry } from "./workspaces.js";
 import { ReviewReturnController } from "./review-return.js";
 import { registerReviewReturnTools } from "./review-return-tools.js";
@@ -62,8 +69,16 @@ import { WebLaunchBrowserController } from "./web-launch-browser.js";
 import { registerWebLaunchTool } from "./web-launch-tools.js";
 
 type Transport = StreamableHTTPServerTransport;
+interface LongTaskToolResult {
+  output: string;
+  taskValidation?: NativeTaskValidationResult;
+}
+
 const WORKSPACE_APP_URI = "ui://devspace/workspace-app.html";
 const WORKSPACE_APP_MANIFEST_ENTRY = "workspace-app.html";
+const PROGRESS_HEARTBEAT_MS = 5_000;
+const shellExecutionGate = new ExecutionGate("shell", 2, 4);
+const longTaskOperations = new LongTaskOperationManager<LongTaskToolResult>(100);
 const READ_ONLY_TOOL_ANNOTATIONS = {
   readOnlyHint: true,
   destructiveHint: false,
@@ -251,7 +266,7 @@ function serverInstructions(config: ServerConfig, toolNames: ToolNames): string 
       ? " After creating, editing, or overwriting files, call show_changes once after the related file changes are complete so the user can see the aggregate diff."
       : "";
 
-  return `Use DevSpace as a local coding workspace. Call ${toolNames.openWorkspace} once per project folder or worktree to obtain a workspaceId. Reuse that same workspaceId for all later file, search, edit, write, show-changes, shell, and Git publication tools in that folder; do not call ${toolNames.openWorkspace} again unless switching folders/worktrees, changing checkout/worktree mode, the workspaceId is rejected as unknown, or the user explicitly asks to reopen. Close managed worktree sessions with ${toolNames.closeWorkspace}; it refuses dirty worktrees and removes clean worktrees through Git. When the user explicitly requests one fresh ChatGPT Web conversation with a supplied prompt, invoke web_launch; do not infer this trigger from text typed in another composer. WEB-LAUNCH-0 returns only launch acknowledgement and does not capture assistant output or continue the spawned conversation. When the user explicitly requests one bounded proof that a fresh ChatGPT Web conversation can discover and invoke DevSpace, invoke web_connector_start, retain the returned proofId, and later invoke web_connector_status with that proofId. Do not invoke web_connector_probe directly unless the current launched conversation contains the exact one-time challenge supplied by WEB-CONNECTOR-1. When the user explicitly requests one PRODUCT structured review return, invoke review_start with immutable candidate, evidence, and role-policy digests, retain the returned reviewId, and later invoke review_status with that reviewId. Do not invoke review_submit directly unless the current launched conversation contains the exact REVIEW-RETURN-2 PRODUCT packet. ${agentsMd}${skills}${inspection}Batch known context reads with ${toolNames.readBatch} to reduce host approval prompts. Prefer ${toolNames.edit} for targeted modifications, ${toolNames.write} only for new files or complete rewrites, and ${toolNames.shell} for tests, builds, Git inspection, package scripts, and commands that are better executed by the shell. When the user explicitly requests a commit or push, use publish_git_changes with the existing workspaceId, a workingDirectory relative to the workspace root, and exact file paths. Do not construct /mnt paths, Windows absolute paths, or shell cd commands for workspace navigation; use the workingDirectory field. Do not use ${toolNames.shell} to edit working-tree contents or mutate the Git index, history, remotes, or branches. Avoid shell redirection, heredocs, tee, sed -i, perl -i, node/python/ruby scripts, generated scripts, or other commands whose purpose is to write project files. Use ${toolNames.edit} or ${toolNames.write} for content changes.${showChanges}`;
+  return `Use DevSpace as a local coding workspace. Call ${toolNames.openWorkspace} once per project folder or worktree to obtain a workspaceId. Reuse that same workspaceId for all later file, search, edit, write, show-changes, shell, and Git publication tools in that folder; do not call ${toolNames.openWorkspace} again unless switching folders/worktrees, changing checkout/worktree mode, the workspaceId is rejected as unknown, or the user explicitly asks to reopen. Close managed worktree sessions with ${toolNames.closeWorkspace}; it refuses dirty worktrees and removes clean worktrees through Git. When the user explicitly requests one fresh ChatGPT Web conversation with a supplied prompt, invoke web_launch; do not infer this trigger from text typed in another composer. WEB-LAUNCH-0 returns only launch acknowledgement and does not capture assistant output or continue the spawned conversation. When the user explicitly requests one bounded proof that a fresh ChatGPT Web conversation can discover and invoke DevSpace, invoke web_connector_start, retain the returned proofId, and later invoke web_connector_status with that proofId. Do not invoke web_connector_probe directly unless the current launched conversation contains the exact one-time challenge supplied by WEB-CONNECTOR-1. When the user explicitly requests one PRODUCT structured review return, invoke review_start with immutable candidate, evidence, and role-policy digests, retain the returned reviewId, and later invoke review_status with that reviewId. Do not invoke review_submit directly unless the current launched conversation contains the exact REVIEW-RETURN-2 PRODUCT packet. ${agentsMd}${skills}${inspection}Batch known context reads with ${toolNames.readBatch} to reduce host approval prompts. Prefer ${toolNames.edit} for targeted modifications, ${toolNames.write} only for new files or complete rewrites, and ${toolNames.shell} for short tests, builds, Git inspection, package scripts, and commands that are better executed by the shell. For shell commands or native-task validation expected to exceed 60 seconds, use start_long_task, poll long_task_status with its operationId, and use cancel_long_task when cancellation is required. When the user explicitly requests a commit or push, use publish_git_changes with the existing workspaceId, a workingDirectory relative to the workspace root, and exact file paths. Do not construct /mnt paths, Windows absolute paths, or shell cd commands for workspace navigation; use the workingDirectory field. Do not use ${toolNames.shell} to edit working-tree contents or mutate the Git index, history, remotes, or branches. Avoid shell redirection, heredocs, tee, sed -i, perl -i, node/python/ruby scripts, generated scripts, or other commands whose purpose is to write project files. Use ${toolNames.edit} or ${toolNames.write} for content changes.${showChanges}`;
 }
 function resultOutputSchema(extra: z.ZodRawShape = {}): z.ZodRawShape {
   return {
@@ -294,6 +309,31 @@ const nativeTaskValidationOutputSchema = z.object({
     output: z.string(),
   })),
 });
+
+const longTaskOperationOutputSchema = {
+  operationId: z.string(),
+  kind: z.enum(["shell", "validation"]),
+  workspaceId: z.string(),
+  status: z.enum([
+    "queued",
+    "running",
+    "cancelling",
+    "succeeded",
+    "failed",
+    "cancelled",
+  ]),
+  createdAt: z.string(),
+  startedAt: z.string().optional(),
+  completedAt: z.string().optional(),
+  progress: z.string(),
+  result: z
+    .object({
+      output: z.string(),
+      taskValidation: nativeTaskValidationOutputSchema.optional(),
+    })
+    .optional(),
+  error: z.string().optional(),
+};
 
 const nativeTaskGitCustodyOutputSchema = z.object({
   commit: z.string(),
@@ -385,6 +425,66 @@ function logFailedToolResponse(
 
 function textBlock(text: string): ToolContent {
   return { type: "text", text };
+}
+
+function longTaskOperationText(
+  operation: LongTaskOperationSnapshot<LongTaskToolResult>,
+): string {
+  return [
+    `Operation: ${operation.operationId}`,
+    `Kind: ${operation.kind}`,
+    `Status: ${operation.status}`,
+    `Progress: ${operation.progress}`,
+    operation.result?.output ? `Result:\n${operation.result.output}` : undefined,
+    operation.error ? `Error: ${operation.error}` : undefined,
+  ]
+    .filter(Boolean)
+    .join("\n");
+}
+
+function sendToolProgress(
+  extra: any,
+  progress: number,
+  total: number | undefined,
+  message: string,
+): void {
+  const progressToken = extra?._meta?.progressToken;
+  if (progressToken === undefined) return;
+  void extra
+    .sendNotification({
+      method: "notifications/progress",
+      params: {
+        progressToken,
+        progress,
+        ...(total === undefined ? {} : { total }),
+        message,
+      },
+    })
+    .catch(() => undefined);
+}
+
+function sendValidationProgress(extra: any, update: NativeTaskValidationProgress): void {
+  sendToolProgress(
+    extra,
+    Math.max(0, Math.round(update.elapsedMs / 1000)),
+    undefined,
+    update.message,
+  );
+}
+
+function startProgressHeartbeat(extra: any, label: string): () => void {
+  const startedAt = Date.now();
+  sendToolProgress(extra, 0, undefined, `${label} started.`);
+  const timer = setInterval(() => {
+    const elapsedSeconds = Math.round((Date.now() - startedAt) / 1000);
+    sendToolProgress(
+      extra,
+      elapsedSeconds,
+      undefined,
+      `${label} is still running (${elapsedSeconds}s).`,
+    );
+  }, PROGRESS_HEARTBEAT_MS);
+  return () => clearInterval(timer);
 }
 
 function textSummary(content: ToolContent[]): {
@@ -592,6 +692,182 @@ export function createMcpServer(
   registerWebLaunchTool({ server, browser: webLaunchBrowser });
   registerWebConnectorTools({ server, proof: webConnectorProof });
   registerReviewReturnTools({ server, review: reviewReturn });
+
+  registerAppTool(
+    server,
+    "start_long_task",
+    {
+      title: "Start long task",
+      description:
+        "Start a shell command or native-task validation asynchronously and return an operationId immediately. Use this for work expected to exceed 60 seconds, then poll long_task_status. Results are retained across MCP requests for the current DevSpace runtime.",
+      inputSchema: {
+        workspaceId: z.string().describe("Workspace identifier returned by open_workspace."),
+        kind: z.enum(["shell", "validation"]),
+        command: z
+          .string()
+          .optional()
+          .describe("Required only for kind=shell."),
+        workingDirectory: z
+          .string()
+          .optional()
+          .describe("Optional workspace-relative directory for kind=shell."),
+        timeout: z
+          .number()
+          .positive()
+          .max(300)
+          .optional()
+          .describe("Shell timeout in seconds. Defaults to 300; maximum 300."),
+      },
+      outputSchema: longTaskOperationOutputSchema,
+      _meta: {},
+      annotations: SHELL_TOOL_ANNOTATIONS,
+    },
+    async ({ workspaceId, kind, command, workingDirectory, timeout }) => {
+      const startedAt = performance.now();
+      const workspace = workspaces.getWorkspace(workspaceId);
+      let operation: LongTaskOperationSnapshot<LongTaskToolResult>;
+
+      if (kind === "shell") {
+        if (workspace.task) {
+          throw new Error(
+            `Generic shell execution is unavailable for task ${workspace.task.taskId}; start validation instead.`,
+          );
+        }
+        const normalizedCommand = command?.trim();
+        if (!normalizedCommand) throw new Error("command is required for kind=shell");
+        const cwd = workspaces.resolveWorkingDirectory(workspace, workingDirectory);
+        operation = longTaskOperations.start("shell", workspaceId, async (context) =>
+          shellExecutionGate.run(
+            async () => {
+              context.update("running", "Shell command is running.");
+              const response = await runShellTool(
+                { command: normalizedCommand, timeout: timeout ?? 300 },
+                { cwd, root: workspace.root },
+                { signal: context.signal },
+              );
+              const output = contentText(response.content);
+              if (response.isError) {
+                throw new Error(output || "Shell command failed without output");
+              }
+              return { output };
+            },
+            {
+              signal: context.signal,
+              onQueued: (position) =>
+                context.update("queued", `Shell command queued at position ${position}.`),
+            },
+          ),
+        );
+      } else {
+        if (command !== undefined || workingDirectory !== undefined || timeout !== undefined) {
+          throw new Error(
+            "command, workingDirectory, and timeout are only valid for kind=shell",
+          );
+        }
+        if (!workspace.task) {
+          throw new Error(
+            "No native task is bound to this workspace. Open it with taskBrief first.",
+          );
+        }
+        operation = longTaskOperations.start("validation", workspaceId, async (context) => {
+          const result = await runNativeTaskValidation(workspace.task!, process.env, {
+            signal: context.signal,
+            onProgress: (update) =>
+              context.update(
+                update.phase === "queued" ? "queued" : "running",
+                update.message,
+              ),
+          });
+          workspaces.persistTaskResult(workspace);
+          const passed = result.validation.filter((item) => item.passed).length;
+          return {
+            output: [
+              `Outcome: ${result.outcome}`,
+              `Validation: ${passed}/${result.validation.length} passed`,
+              `Blocker: ${result.blocker}`,
+            ].join("\n"),
+            taskValidation: result,
+          };
+        });
+      }
+
+      logToolCall(config, {
+        tool: "start_long_task",
+        workspaceId,
+        success: true,
+        durationMs: Math.round(performance.now() - startedAt),
+      });
+      return {
+        content: [textBlock(longTaskOperationText(operation))],
+        structuredContent: { ...operation },
+      };
+    },
+  );
+
+  registerAppTool(
+    server,
+    "long_task_status",
+    {
+      title: "Long task status",
+      description:
+        "Return retained progress and terminal output for a start_long_task operationId. Poll until status is succeeded, failed, or cancelled.",
+      inputSchema: {
+        operationId: z.string().trim().min(1),
+      },
+      outputSchema: longTaskOperationOutputSchema,
+      _meta: {},
+      annotations: READ_ONLY_TOOL_ANNOTATIONS,
+    },
+    async ({ operationId }) => {
+      const startedAt = performance.now();
+      const operation = longTaskOperations.get(operationId);
+      logToolCall(config, {
+        tool: "long_task_status",
+        workspaceId: operation.workspaceId,
+        success: true,
+        durationMs: Math.round(performance.now() - startedAt),
+      });
+      return {
+        content: [textBlock(longTaskOperationText(operation))],
+        structuredContent: { ...operation },
+      };
+    },
+  );
+
+  registerAppTool(
+    server,
+    "cancel_long_task",
+    {
+      title: "Cancel long task",
+      description:
+        "Cancel a queued or running start_long_task operation and terminate its managed process tree. Terminal operations are returned unchanged.",
+      inputSchema: {
+        operationId: z.string().trim().min(1),
+      },
+      outputSchema: longTaskOperationOutputSchema,
+      _meta: {},
+      annotations: {
+        readOnlyHint: false,
+        destructiveHint: true,
+        idempotentHint: true,
+        openWorldHint: false,
+      },
+    },
+    async ({ operationId }) => {
+      const startedAt = performance.now();
+      const operation = longTaskOperations.cancel(operationId);
+      logToolCall(config, {
+        tool: "cancel_long_task",
+        workspaceId: operation.workspaceId,
+        success: true,
+        durationMs: Math.round(performance.now() - startedAt),
+      });
+      return {
+        content: [textBlock(longTaskOperationText(operation))],
+        structuredContent: { ...operation },
+      };
+    },
+  );
 
   registerAppTool(
     server,
@@ -832,13 +1108,16 @@ export function createMcpServer(
         openWorldHint: false,
       },
     },
-    async ({ workspaceId }) => {
+    async ({ workspaceId }, extra) => {
       const startedAt = performance.now();
       const workspace = workspaces.getWorkspace(workspaceId);
       if (!workspace.task) {
         throw new Error("No native task is bound to this workspace. Open it with taskBrief first.");
       }
-      const result = await runNativeTaskValidation(workspace.task);
+      const result = await runNativeTaskValidation(workspace.task, process.env, {
+        signal: extra.signal,
+        onProgress: (update) => sendValidationProgress(extra, update),
+      });
       workspaces.persistTaskResult(workspace);
       const passed = result.validation.filter((item) => item.passed).length;
       const resultText = [
@@ -1250,7 +1529,7 @@ export function createMcpServer(
       ...toolWidgetDescriptorMeta(config, "edit"),
       annotations: EDIT_TOOL_ANNOTATIONS,
     },
-    async ({ workspaceId, validateTask, ...input }) => {
+    async ({ workspaceId, validateTask, ...input }, extra) => {
       const startedAt = performance.now();
       const workspace = workspaces.getWorkspace(workspaceId);
       const absolutePath = workspaces.resolvePath(workspace, input.path);
@@ -1272,7 +1551,10 @@ export function createMcpServer(
 
       const taskValidation = validateTask
         ? workspace.task
-          ? await runNativeTaskValidation(workspace.task)
+          ? await runNativeTaskValidation(workspace.task, process.env, {
+              signal: extra.signal,
+              onProgress: (update) => sendValidationProgress(extra, update),
+            })
           : (() => { throw new Error("validateTask requires a task-bound workspace"); })()
         : undefined;
       const validationPassed = taskValidation?.validation.filter((item) => item.passed).length;
@@ -1773,7 +2055,7 @@ export function createMcpServer(
       ...toolWidgetDescriptorMeta(config, "shell"),
       annotations: SHELL_TOOL_ANNOTATIONS,
     },
-    async ({ workspaceId, workingDirectory, ...input }) => {
+    async ({ workspaceId, workingDirectory, ...input }, extra) => {
       const startedAt = performance.now();
       const workspace = workspaces.getWorkspace(workspaceId);
       if (workspace.task) {
@@ -1785,10 +2067,33 @@ export function createMcpServer(
         workspace,
         workingDirectory,
       );
-      const response = await runShellTool(input, {
-        cwd,
-        root: workspace.root,
-      });
+      const response = await shellExecutionGate.run(
+        async () => {
+          const stopHeartbeat = startProgressHeartbeat(extra, "Shell command");
+          try {
+            return await runShellTool(
+              input,
+              {
+                cwd,
+                root: workspace.root,
+              },
+              { signal: extra.signal },
+            );
+          } finally {
+            stopHeartbeat();
+          }
+        },
+        {
+          signal: extra.signal,
+          onQueued: (position) =>
+            sendToolProgress(
+              extra,
+              0,
+              undefined,
+              `Shell command queued at position ${position}.`,
+            ),
+        },
+      );
 
       if (response.isError) {
         logFailedToolResponse(config, {

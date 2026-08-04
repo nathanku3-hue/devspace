@@ -3,7 +3,30 @@ $supportScript = Join-Path $here "setup-devspace-support.ps1"
 . $supportScript
 
 Describe "DevSpace setup tool inventory assertion" {
+    # Exact 20-tool LONG-TASK-CONTROL-1 inventory (must match setup-devspace.ps1 $ExpectedTools).
     $exactTools = @(
+        "bash",
+        "cancel_long_task",
+        "close_workspace",
+        "edit",
+        "long_task_status",
+        "open_workspace",
+        "publish_git_changes",
+        "read",
+        "read_files",
+        "review_start",
+        "review_status",
+        "review_submit",
+        "safe_rename_file",
+        "start_long_task",
+        "validate_task",
+        "web_connector_probe",
+        "web_connector_start",
+        "web_connector_status",
+        "web_launch",
+        "write"
+    )
+    $legacySeventeenTools = @(
         "bash",
         "close_workspace",
         "edit",
@@ -15,6 +38,7 @@ Describe "DevSpace setup tool inventory assertion" {
         "review_status",
         "review_submit",
         "safe_rename_file",
+        "validate_task",
         "web_connector_probe",
         "web_connector_start",
         "web_connector_status",
@@ -24,6 +48,29 @@ Describe "DevSpace setup tool inventory assertion" {
 
     It "accepts the exact ordinal inventory" {
         { Assert-ExpectedToolInventory -EndpointLabel "test" -ExpectedTools $exactTools -ActualTools $exactTools } | Should Not Throw
+    }
+
+    It "accepts the exact 20-tool LONG-TASK-CONTROL-1 inventory" {
+        $exactTools.Count | Should Be 20
+        $result = Assert-ExpectedToolInventory -EndpointLabel "test" -ExpectedTools $exactTools -ActualTools $exactTools
+        $result.Count | Should Be 20
+        @($result) -contains "start_long_task" | Should Be $true
+        @($result) -contains "long_task_status" | Should Be $true
+        @($result) -contains "cancel_long_task" | Should Be $true
+    }
+
+    It "rejects the legacy 17-tool inventory when actual exposes long-task tools" {
+        { Assert-ExpectedToolInventory `
+            -EndpointLabel "test" `
+            -ExpectedTools $legacySeventeenTools `
+            -ActualTools $exactTools } | Should Throw
+    }
+
+    It "rejects a subset inventory that omits long-task tools" {
+        { Assert-ExpectedToolInventory `
+            -EndpointLabel "test" `
+            -ExpectedTools $exactTools `
+            -ActualTools $legacySeventeenTools } | Should Throw
     }
 
     It "rejects case-only tool name changes" {

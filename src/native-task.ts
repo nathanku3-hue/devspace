@@ -1,8 +1,12 @@
 import { createHash, randomUUID } from "node:crypto";
 import { spawn } from "node:child_process";
 import { basename, relative, resolve, sep } from "node:path";
+import { ExecutionGate } from "./execution-gate.js";
+import { terminateProcessTree } from "./process-control.js";
 
 const MAX_VALIDATION_OUTPUT_BYTES = 16 * 1024 * 1024;
+const VALIDATION_PROGRESS_INTERVAL_MS = 5_000;
+const validationExecutionGate = new ExecutionGate("validation", 1, 2);
 
 export interface NativeTaskValidationCommandInput {
   argv: string[];
@@ -54,6 +58,20 @@ export interface NativeTaskValidationResult {
   validation: NativeTaskValidationResultItem[];
   blocker: string;
   completedAt: string;
+}
+
+export interface NativeTaskValidationProgress {
+  phase: "queued" | "started" | "command_started" | "running" | "command_completed";
+  commandIndex: number;
+  commandCount: number;
+  elapsedMs: number;
+  queuePosition?: number;
+  message: string;
+}
+
+export interface NativeTaskValidationOptions {
+  signal?: AbortSignal;
+  onProgress?: (progress: NativeTaskValidationProgress) => void | Promise<void>;
 }
 
 export interface NativeTaskGitCustodyResult {
@@ -459,10 +477,30 @@ interface ValidationProcessResult {
  * The previous spawnSync implementation froze /healthz and all concurrent MCP
  * clients for the full pytest/build duration (often minutes).
  */
+function abortError(): Error {
+  const error = new Error("Validation cancelled");
+  error.name = "AbortError";
+  return error;
+}
+
+function emitValidationProgress(
+  options: NativeTaskValidationOptions,
+  progress: NativeTaskValidationProgress,
+): void {
+  try {
+    void Promise.resolve(options.onProgress?.(progress)).catch(() => undefined);
+  } catch {
+    // Progress delivery must never change validation correctness.
+  }
+}
+
 function runValidationProcess(
   command: NativeTaskValidationCommand,
   environment: NodeJS.ProcessEnv,
   workspaceRoot: string,
+  options: NativeTaskValidationOptions,
+  commandIndex: number,
+  commandCount: number,
 ): Promise<ValidationProcessResult> {
   const cwd = command.cwd === "." ? workspaceRoot : resolve(workspaceRoot, command.cwd);
   workspaceRelativePath(
@@ -476,41 +514,68 @@ function runValidationProcess(
     let stdout = "";
     let stderr = "";
     let settled = false;
-    let timedOut = false;
-    let outputExceeded = false;
-
-    const settle = (result: Omit<ValidationProcessResult, "durationMs">) => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timer);
-      resolvePromise({ ...result, durationMs: Date.now() - startedAt });
-    };
+    let terminationReason: "timeout" | "output" | "abort" | undefined;
+    let timer: NodeJS.Timeout;
+    let progressTimer: NodeJS.Timeout;
 
     const child = spawn(invocation.executable, invocation.args, {
       cwd,
       env: environment,
       shell: false,
+      detached: process.platform !== "win32",
       windowsHide: true,
       windowsVerbatimArguments: invocation.windowsVerbatimArguments,
       stdio: ["ignore", "pipe", "pipe"],
     });
 
-    const timer = setTimeout(() => {
-      timedOut = true;
-      child.kill();
-    }, command.timeoutSeconds * 1000);
+    const onAbort = () => requestTermination("abort");
+    const settle = (result: Omit<ValidationProcessResult, "durationMs">) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      clearInterval(progressTimer);
+      options.signal?.removeEventListener("abort", onAbort);
+      resolvePromise({ ...result, durationMs: Date.now() - startedAt });
+    };
+    const requestTermination = (reason: "timeout" | "output" | "abort") => {
+      if (terminationReason) return;
+      terminationReason = reason;
+      if (!child.pid) {
+        child.kill();
+        return;
+      }
+      void terminateProcessTree(child.pid).catch(() => {
+        child.kill();
+      });
+    };
+
+    timer = setTimeout(
+      () => requestTermination("timeout"),
+      command.timeoutSeconds * 1000,
+    );
+    progressTimer = setInterval(() => {
+      const elapsedMs = Date.now() - startedAt;
+      emitValidationProgress(options, {
+        phase: "running",
+        commandIndex,
+        commandCount,
+        elapsedMs,
+        message: `Validation ${commandIndex}/${commandCount} is still running (${Math.round(elapsedMs / 1000)}s).`,
+      });
+    }, VALIDATION_PROGRESS_INTERVAL_MS);
+    options.signal?.addEventListener("abort", onAbort, { once: true });
+    if (options.signal?.aborted) onAbort();
 
     const appendOutput = (stream: "stdout" | "stderr", chunk: Buffer | string) => {
       const text = typeof chunk === "string" ? chunk : chunk.toString("utf8");
       if (stream === "stdout") stdout += text;
       else stderr += text;
       if (
-        !outputExceeded &&
+        !terminationReason &&
         Buffer.byteLength(stdout, "utf8") + Buffer.byteLength(stderr, "utf8") >
           MAX_VALIDATION_OUTPUT_BYTES
       ) {
-        outputExceeded = true;
-        child.kill();
+        requestTermination("output");
       }
     };
 
@@ -522,7 +587,11 @@ function runValidationProcess(
     });
 
     child.on("close", (status) => {
-      if (timedOut) {
+      if (terminationReason === "abort") {
+        settle({ status: status ?? null, stdout, stderr, error: abortError() });
+        return;
+      }
+      if (terminationReason === "timeout") {
         const error = new Error(
           `Validation timed out after ${command.timeoutSeconds}s`,
         ) as Error & { code?: string };
@@ -530,7 +599,7 @@ function runValidationProcess(
         settle({ status: status ?? null, stdout, stderr, error });
         return;
       }
-      if (outputExceeded) {
+      if (terminationReason === "output") {
         const error = new Error(
           `Validation output exceeded ${MAX_VALIDATION_OUTPUT_BYTES} bytes`,
         ) as Error & { code?: string };
@@ -546,8 +615,8 @@ function runValidationProcess(
 export async function runNativeTaskValidation(
   task: BoundNativeTask,
   parentEnvironment: NodeJS.ProcessEnv = process.env,
+  options: NativeTaskValidationOptions = {},
 ): Promise<NativeTaskValidationResult> {
-  const completedAt = new Date().toISOString();
   if (task.validation.length === 0) {
     const unverified: NativeTaskValidationResult = {
       taskId: task.taskId,
@@ -555,46 +624,99 @@ export async function runNativeTaskValidation(
       productResult: task.productResult,
       validation: [],
       blocker: "No external validation was declared; DONE is not available.",
-      completedAt,
+      completedAt: new Date().toISOString(),
     };
     task.outcome = unverified.outcome;
     task.lastValidation = unverified;
     return unverified;
   }
 
-  const environment = buildNativeTaskEnvironment(parentEnvironment);
-  const validation: NativeTaskValidationResultItem[] = [];
-  for (const command of task.validation) {
-    const result = await runValidationProcess(command, environment, task.workspaceRoot);
-    validation.push({
-      argv: command.argv,
-      cwd: command.cwd,
-      passed: !result.error && result.status === 0,
-      exitCode: result.status,
-      durationMs: result.durationMs,
-      output: String(result.stderr || result.stdout || result.error?.message || "")
-        .trim()
-        .slice(-4000),
-    });
-  }
+  return validationExecutionGate.run(
+    async () => {
+      const startedAt = Date.now();
+      const commandCount = task.validation.length;
+      emitValidationProgress(options, {
+        phase: "started",
+        commandIndex: 0,
+        commandCount,
+        elapsedMs: 0,
+        message: `Validation started with ${commandCount} command(s).`,
+      });
 
-  const failed = validation.filter((item) => !item.passed);
-  const result: NativeTaskValidationResult = {
-    taskId: task.taskId,
-    outcome: failed.length === 0 ? "DONE" : "BLOCKED",
-    productResult: task.productResult,
-    validation,
-    blocker:
-      failed.length === 0
-        ? "none"
-        : failed
-            .map((item) => `${JSON.stringify(item.argv)} exited ${item.exitCode}: ${item.output || "no output"}`)
-            .join("\n"),
-    completedAt,
-  };
-  task.outcome = result.outcome;
-  task.lastValidation = result;
-  return result;
+      const environment = buildNativeTaskEnvironment(parentEnvironment);
+      const validation: NativeTaskValidationResultItem[] = [];
+      for (const [index, command] of task.validation.entries()) {
+        if (options.signal?.aborted) throw abortError();
+        const commandIndex = index + 1;
+        emitValidationProgress(options, {
+          phase: "command_started",
+          commandIndex,
+          commandCount,
+          elapsedMs: Date.now() - startedAt,
+          message: `Starting validation ${commandIndex}/${commandCount}.`,
+        });
+        const processResult = await runValidationProcess(
+          command,
+          environment,
+          task.workspaceRoot,
+          options,
+          commandIndex,
+          commandCount,
+        );
+        if (processResult.error?.name === "AbortError") throw processResult.error;
+        validation.push({
+          argv: command.argv,
+          cwd: command.cwd,
+          passed: !processResult.error && processResult.status === 0,
+          exitCode: processResult.status,
+          durationMs: processResult.durationMs,
+          output: String(
+            processResult.stderr || processResult.stdout || processResult.error?.message || "",
+          )
+            .trim()
+            .slice(-4000),
+        });
+        emitValidationProgress(options, {
+          phase: "command_completed",
+          commandIndex,
+          commandCount,
+          elapsedMs: Date.now() - startedAt,
+          message: `Validation ${commandIndex}/${commandCount} completed.`,
+        });
+      }
+
+      const failed = validation.filter((item) => !item.passed);
+      const result: NativeTaskValidationResult = {
+        taskId: task.taskId,
+        outcome: failed.length === 0 ? "DONE" : "BLOCKED",
+        productResult: task.productResult,
+        validation,
+        blocker:
+          failed.length === 0
+            ? "none"
+            : failed
+                .map((item) => `${JSON.stringify(item.argv)} exited ${item.exitCode}: ${item.output || "no output"}`)
+                .join("\n"),
+        completedAt: new Date().toISOString(),
+      };
+      task.outcome = result.outcome;
+      task.lastValidation = result;
+      return result;
+    },
+    {
+      signal: options.signal,
+      onQueued: (queuePosition) => {
+        emitValidationProgress(options, {
+          phase: "queued",
+          commandIndex: 0,
+          commandCount: task.validation.length,
+          elapsedMs: 0,
+          queuePosition,
+          message: `Validation queued at position ${queuePosition}.`,
+        });
+      },
+    },
+  );
 }
 
 export interface AuthorizedTaskPublish {
