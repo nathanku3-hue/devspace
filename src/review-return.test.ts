@@ -465,7 +465,7 @@ test("independent sessions survive source disconnect and retrieve the structured
 
     const submitResult = await spawnedClient.callTool({
       name: "review_submit",
-      arguments: validCallback(),
+      arguments: { ...validCallback() },
     });
     assert.deepEqual(submitResult.structuredContent, {
       slice: "REVIEW-RETURN-2",
