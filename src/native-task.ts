@@ -1,6 +1,8 @@
 import { createHash, randomUUID } from "node:crypto";
-import { spawnSync } from "node:child_process";
+import { spawn } from "node:child_process";
 import { basename, relative, resolve, sep } from "node:path";
+
+const MAX_VALIDATION_OUTPUT_BYTES = 16 * 1024 * 1024;
 
 export interface NativeTaskValidationCommandInput {
   argv: string[];
@@ -444,10 +446,107 @@ export function validationInvocation(
   return { executable, args };
 }
 
-export function runNativeTaskValidation(
+interface ValidationProcessResult {
+  status: number | null;
+  stdout: string;
+  stderr: string;
+  error?: Error;
+  durationMs: number;
+}
+
+/**
+ * Run one validation argv asynchronously so the MCP HTTP event loop stays free.
+ * The previous spawnSync implementation froze /healthz and all concurrent MCP
+ * clients for the full pytest/build duration (often minutes).
+ */
+function runValidationProcess(
+  command: NativeTaskValidationCommand,
+  environment: NodeJS.ProcessEnv,
+  workspaceRoot: string,
+): Promise<ValidationProcessResult> {
+  const cwd = command.cwd === "." ? workspaceRoot : resolve(workspaceRoot, command.cwd);
+  workspaceRelativePath(
+    workspaceRoot,
+    cwd === workspaceRoot ? resolve(cwd, ".task-root-probe") : cwd,
+  );
+  const invocation = validationInvocation(command, environment);
+  const startedAt = Date.now();
+
+  return new Promise((resolvePromise) => {
+    let stdout = "";
+    let stderr = "";
+    let settled = false;
+    let timedOut = false;
+    let outputExceeded = false;
+
+    const settle = (result: Omit<ValidationProcessResult, "durationMs">) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolvePromise({ ...result, durationMs: Date.now() - startedAt });
+    };
+
+    const child = spawn(invocation.executable, invocation.args, {
+      cwd,
+      env: environment,
+      shell: false,
+      windowsHide: true,
+      windowsVerbatimArguments: invocation.windowsVerbatimArguments,
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+
+    const timer = setTimeout(() => {
+      timedOut = true;
+      child.kill();
+    }, command.timeoutSeconds * 1000);
+
+    const appendOutput = (stream: "stdout" | "stderr", chunk: Buffer | string) => {
+      const text = typeof chunk === "string" ? chunk : chunk.toString("utf8");
+      if (stream === "stdout") stdout += text;
+      else stderr += text;
+      if (
+        !outputExceeded &&
+        Buffer.byteLength(stdout, "utf8") + Buffer.byteLength(stderr, "utf8") >
+          MAX_VALIDATION_OUTPUT_BYTES
+      ) {
+        outputExceeded = true;
+        child.kill();
+      }
+    };
+
+    child.stdout?.on("data", (chunk) => appendOutput("stdout", chunk));
+    child.stderr?.on("data", (chunk) => appendOutput("stderr", chunk));
+
+    child.on("error", (error) => {
+      settle({ status: null, stdout, stderr, error });
+    });
+
+    child.on("close", (status) => {
+      if (timedOut) {
+        const error = new Error(
+          `Validation timed out after ${command.timeoutSeconds}s`,
+        ) as Error & { code?: string };
+        error.code = "ETIMEDOUT";
+        settle({ status: status ?? null, stdout, stderr, error });
+        return;
+      }
+      if (outputExceeded) {
+        const error = new Error(
+          `Validation output exceeded ${MAX_VALIDATION_OUTPUT_BYTES} bytes`,
+        ) as Error & { code?: string };
+        error.code = "ENOBUFS";
+        settle({ status: status ?? null, stdout, stderr, error });
+        return;
+      }
+      settle({ status: status ?? null, stdout, stderr });
+    });
+  });
+}
+
+export async function runNativeTaskValidation(
   task: BoundNativeTask,
   parentEnvironment: NodeJS.ProcessEnv = process.env,
-): NativeTaskValidationResult {
+): Promise<NativeTaskValidationResult> {
   const completedAt = new Date().toISOString();
   if (task.validation.length === 0) {
     const unverified: NativeTaskValidationResult = {
@@ -464,31 +563,20 @@ export function runNativeTaskValidation(
   }
 
   const environment = buildNativeTaskEnvironment(parentEnvironment);
-  const validation = task.validation.map((command) => {
-    const cwd = command.cwd === "." ? task.workspaceRoot : resolve(task.workspaceRoot, command.cwd);
-    workspaceRelativePath(task.workspaceRoot, cwd === task.workspaceRoot ? resolve(cwd, ".task-root-probe") : cwd);
-    const invocation = validationInvocation(command, environment);
-    const startedAt = Date.now();
-    const result = spawnSync(invocation.executable, invocation.args, {
-      cwd,
-      env: environment,
-      encoding: "utf8",
-      shell: false,
-      windowsHide: true,
-      windowsVerbatimArguments: invocation.windowsVerbatimArguments,
-      timeout: command.timeoutSeconds * 1000,
-      maxBuffer: 16 * 1024 * 1024,
-      stdio: ["ignore", "pipe", "pipe"],
-    });
-    return {
+  const validation: NativeTaskValidationResultItem[] = [];
+  for (const command of task.validation) {
+    const result = await runValidationProcess(command, environment, task.workspaceRoot);
+    validation.push({
       argv: command.argv,
       cwd: command.cwd,
       passed: !result.error && result.status === 0,
       exitCode: result.status,
-      durationMs: Date.now() - startedAt,
-      output: String(result.stderr || result.stdout || result.error?.message || "").trim().slice(-4000),
-    };
-  });
+      durationMs: result.durationMs,
+      output: String(result.stderr || result.stdout || result.error?.message || "")
+        .trim()
+        .slice(-4000),
+    });
+  }
 
   const failed = validation.filter((item) => !item.passed);
   const result: NativeTaskValidationResult = {

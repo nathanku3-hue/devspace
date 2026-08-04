@@ -1,3 +1,89 @@
+# Hung Runtime + Slow MCP Connection Lessons
+
+Date: 2026-08-05
+Worktree: `E:\Code\devspace\devspace-src\.worktrees\devspace-4859ae9d61326563`
+Branch: `product/native-chatgpt-bridge-1`
+Runtime: Windows PowerShell, Node.js v25.2.1, cloudflared Quick Tunnel, Worker proxy
+
+## Outcome
+
+Two coupled failures made DevSpace look "broken after successful setup":
+
+1. Launcher refused cleanup when port `7676` was held but `/healthz` failed, so relaunch deadlocked on a hung listener.
+2. `validate_task` used `spawnSync` for external validation (multi-minute `pytest`), which froze the Node event loop so local `/healthz`, tunnel, Worker, and concurrent MCP clients all timed out.
+
+Both were fixed in-tree: cleanup accepts CLI-path identity for hung owners; validation is async via `spawn`.
+
+## Initial symptoms
+
+```text
+Port 7676 is owned by PID 22080 but /healthz does not prove it is DevSpace. Refusing cleanup.
+```
+
+Later, after a clean setup finished with 17 tools verified:
+
+- Local `http://127.0.0.1:7676/healthz`: TCP connect ~1ms, then curl exit 28 (no body).
+- Tunnel/Worker healthz intermittent timeouts.
+- Many `CLOSE_WAIT` sockets on 7676.
+- cloudflared: `Incoming request ended abruptly: context canceled`.
+
+## Root causes
+
+### 1. Cleanup required `/healthz` even when process identity was known
+
+`Stop-DevSpaceRelatedProcesses` threw whenever the port owner failed the health probe, even if the command line was clearly `dist\cli.js serve` for the expected worktree.
+
+`-Stop` could still kill via `runtime.json` identity, which produced the confusing dual message: setup error, then "Stopped identity-verified runtime PID …".
+
+Lesson: for stop/relaunch safety, **CLI path on the port owner is sufficient identity**. `/healthz` proves liveness, not ownership. A hung DevSpace must still be stoppable.
+
+### 2. `validate_task` blocked the event loop with `spawnSync`
+
+Serve log:
+
+```text
+tool=validate_task durationMs=191653 success=false
+```
+
+Child process:
+
+```text
+python -m pytest tests/test_gv_pit_operated_rotation.py ...
+```
+
+While `spawnSync` ran, the process still accepted TCP connections but did not run Express handlers. Queued healthz and MCP traffic completed in milliseconds only after validation returned.
+
+Lesson: long external validation must use **async `spawn`**. Tool duration may still be minutes; the connector must remain responsive for other sessions and health probes.
+
+## Discriminators that worked
+
+1. TCP open + HTTP timeout on loopback → event-loop freeze or request starvation, not DNS/tunnel alone.
+2. `Get-CimInstance` child of the serve PID matching the sealed validation argv → identify the blocking tool.
+3. Serve log burst of `/healthz` and MCP inits with `durationMs` 0–20 right after a multi-minute `tool_call` → prove request queueing behind a block.
+4. Prove async fix with `setInterval` ticks during a 1.5s validation child (ticks must keep advancing).
+
+## Fixes landed
+
+| Area | Change |
+|------|--------|
+| `scripts/setup-devspace-support.ps1` | Resolve port owner by CLI path without requiring health; `Test-DevSpacePortOwnerStopAllowed` |
+| `scripts/setup-devspace.ps1` | Cleanup/stop allow hung CLI-identified owners; loopback HTTP uses `--noproxy` |
+| `scripts/setup-devspace.Tests.ps1` | Hung owner + foreign owner cleanup cases |
+| `src/native-task.ts` | Async `runValidationProcess` / `runNativeTaskValidation` |
+| `src/server.ts` | `await` validation from `validate_task` and edit-time `validateTask` |
+| Tests | Await async validation in native-task and workspaces tests |
+
+## Operational notes
+
+- Correct launch from this pin:
+  ```powershell
+  powershell -ExecutionPolicy Bypass -File "E:\Code\devspace\devspace-src\.worktrees\devspace-4859ae9d61326563\scripts\setup-devspace.ps1"
+  ```
+- Setup success ("17 tools verified") only proves health at that moment; later multi-minute validation used to freeze the whole server.
+- Prefer narrow sealed validation argv so ChatGPT is not blocked for minutes on one tool call even after the async fix.
+
+---
+
 # Perplexity MCP OAuth Debugging Lessons
 
 Date: 2026-07-16

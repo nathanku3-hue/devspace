@@ -255,19 +255,46 @@ function Select-DevSpaceServeProcess {
         return New-ResolvedDevSpaceProcess -Process $exact -CliPath $ExpectedCliPath -Resolution 'exact-cli'
     }
 
-    if ($ListenerProcessId -gt 0 -and $HealthVerified) {
+    # CLI path on the port owner is sufficient identity for both healthy and hung
+    # listeners. /healthz alone used to be required for this branch, which blocked
+    # cleanup when DevSpace held the port but stopped answering HTTP.
+    if ($ListenerProcessId -gt 0) {
         $owner = $Processes | Where-Object {
             (Get-DevSpaceProcessId $_) -eq $ListenerProcessId
         } | Select-Object -First 1
         if ($null -ne $owner) {
             $actualCliPath = Get-DevSpaceCliPathFromCommandLine ([string]$owner.CommandLine)
             if (-not [string]::IsNullOrWhiteSpace($actualCliPath)) {
-                return New-ResolvedDevSpaceProcess -Process $owner -CliPath $actualCliPath -Resolution 'health-verified-port-owner'
+                $resolution = if ($HealthVerified) {
+                    'health-verified-port-owner'
+                } else {
+                    'cli-path-port-owner'
+                }
+                return New-ResolvedDevSpaceProcess -Process $owner -CliPath $actualCliPath -Resolution $resolution
             }
         }
     }
 
     return $null
+}
+
+function Test-DevSpacePortOwnerStopAllowed {
+    param(
+        [int]$ListenerProcessId = 0,
+        [bool]$HealthyListener = $false,
+        $ResolvedProcess = $null
+    )
+
+    if ($ListenerProcessId -le 0) {
+        return $true
+    }
+    if ($HealthyListener) {
+        return $true
+    }
+    return (
+        $null -ne $ResolvedProcess -and
+        [int]$ResolvedProcess.ProcessId -eq $ListenerProcessId
+    )
 }
 
 function Assert-DevSpaceLaunchCanProceed {

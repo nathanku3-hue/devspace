@@ -145,6 +145,53 @@ Describe "DevSpace runtime process custody" {
         $resolved.CliPath | Should Be $actualCli
     }
 
+    It "resolves a hung port owner via CLI path without /healthz" {
+        $actualCli = "E:\Code\devspace\devspace-src\.worktrees\devspace-hung\dist\cli.js"
+        $processes = @(
+            [pscustomobject]@{
+                ProcessId = 707
+                CommandLine = "`"D:\nodejs\node.exe`" `"$actualCli`" serve"
+                CreationDate = $startedAt
+            }
+        )
+
+        $resolved = Select-DevSpaceServeProcess `
+            -Processes $processes `
+            -ExpectedCliPath $expectedCli `
+            -ListenerProcessId 707 `
+            -HealthVerified $false
+
+        $resolved.ProcessId | Should Be 707
+        $resolved.Resolution | Should Be "cli-path-port-owner"
+        $resolved.CliPath | Should Be $actualCli
+        (Test-DevSpacePortOwnerStopAllowed `
+            -ListenerProcessId 707 `
+            -HealthyListener $false `
+            -ResolvedProcess $resolved) | Should Be $true
+    }
+
+    It "refuses cleanup when the port owner is neither healthy nor a DevSpace CLI" {
+        $processes = @(
+            [pscustomobject]@{
+                ProcessId = 808
+                CommandLine = '"D:\tools\other.exe" --listen 7676'
+                CreationDate = $startedAt
+            }
+        )
+
+        $resolved = Select-DevSpaceServeProcess `
+            -Processes $processes `
+            -ExpectedCliPath $expectedCli `
+            -ListenerProcessId 808 `
+            -HealthVerified $false
+
+        $resolved | Should Be $null
+        (Test-DevSpacePortOwnerStopAllowed `
+            -ListenerProcessId 808 `
+            -HealthyListener $false `
+            -ResolvedProcess $resolved) | Should Be $false
+    }
+
     It "does not authorize stopping a stale or PID-reused runtime record" {
         $runtimeState = [pscustomobject]@{
             devspacePid = 404

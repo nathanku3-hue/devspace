@@ -284,7 +284,7 @@ try {
     /cannot replace path, worktree, or task authority/,
   );
 
-  const validation = runNativeTaskValidation(resumed.workspace.task!);
+  const validation = await runNativeTaskValidation(resumed.workspace.task!);
   assert.equal(validation.outcome, "DONE");
   restoredRegistry.persistTaskResult(resumed.workspace);
   secondStore.close();

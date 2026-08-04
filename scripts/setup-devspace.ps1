@@ -180,7 +180,8 @@ function Test-LocalDevSpaceHealthy {
     if (-not (Test-PortOpen $LocalHost $LocalPort 200)) {
         return $false
     }
-    $health = Get-HttpBody -url "http://${LocalHost}:${LocalPort}/healthz" -timeoutSec 2
+    # Always bypass session/system HTTP_PROXY for loopback probes.
+    $health = Get-HttpBody -url "http://${LocalHost}:${LocalPort}/healthz" -timeoutSec 2 -NoProxy
     return ($health -match 'devspace')
 }
 
@@ -659,8 +660,6 @@ function Stop-DevSpaceRuntime {
     }
 
     $processes = Get-DevSpaceProcessTable
-    $listenerPid = Get-ListenerProcessId -port $LocalPort
-    $healthyListener = $listenerPid -gt 0 -and (Test-LocalDevSpaceHealthy)
     $stopped = New-Object 'System.Collections.Generic.HashSet[int]'
 
     if ($null -ne $state -and $state.devspacePid) {
@@ -680,10 +679,11 @@ function Stop-DevSpaceRuntime {
         }
     }
 
+    # Re-probe after any identity-verified PID stop: the recorded runtime may have
+    # already released the port even when /healthz was down (hung event loop).
+    $listenerPid = Get-ListenerProcessId -port $LocalPort
+    $healthyListener = $listenerPid -gt 0 -and (Test-LocalDevSpaceHealthy)
     if ($listenerPid -gt 0) {
-        if (-not $healthyListener) {
-            throw "Port $LocalPort is owned by PID $listenerPid but /healthz does not prove it is DevSpace. Refusing to stop it."
-        }
         $expectedCliPath = if ($null -ne $state -and -not [string]::IsNullOrWhiteSpace([string]$state.devspaceCliPath)) {
             [string]$state.devspaceCliPath
         } elseif (-not [string]::IsNullOrWhiteSpace($script:devspaceCliPath)) {
@@ -695,9 +695,21 @@ function Stop-DevSpaceRuntime {
             -Processes $processes `
             -ExpectedCliPath $expectedCliPath `
             -ListenerProcessId $listenerPid `
-            -HealthVerified $true
-        Assert-DevSpaceLaunchCanProceed -HealthyListener $true -ResolvedProcess $resolvedListener -ListenerProcessId $listenerPid
-        if (-not $stopped.Contains([int]$resolvedListener.ProcessId)) {
+            -HealthVerified $healthyListener
+        if (-not (Test-DevSpacePortOwnerStopAllowed `
+                -ListenerProcessId $listenerPid `
+                -HealthyListener $healthyListener `
+                -ResolvedProcess $resolvedListener)) {
+            throw "Port $LocalPort is owned by PID $listenerPid but neither /healthz nor process identity proves it is DevSpace. Refusing to stop it."
+        }
+        Assert-DevSpaceLaunchCanProceed `
+            -HealthyListener $healthyListener `
+            -ResolvedProcess $resolvedListener `
+            -ListenerProcessId $listenerPid
+        if ($null -ne $resolvedListener -and -not $stopped.Contains([int]$resolvedListener.ProcessId)) {
+            if (-not $healthyListener) {
+                Write-SetupLog "  Listener PID $listenerPid failed /healthz; stopping via $($resolvedListener.Resolution)." "WARN"
+            }
             Stop-Process -Id $resolvedListener.ProcessId -Force -ErrorAction SilentlyContinue
             [void]$stopped.Add([int]$resolvedListener.ProcessId)
             Write-SetupLog "  Stopped verified listener PID $($resolvedListener.ProcessId) ($($resolvedListener.CliPath))"
@@ -735,8 +747,16 @@ function Stop-DevSpaceRelatedProcesses {
         -ListenerProcessId $listenerPid `
         -HealthVerified $healthyListener
 
-    if ($listenerPid -gt 0 -and -not $healthyListener) {
-        throw "Port $LocalPort is owned by PID $listenerPid but /healthz does not prove it is DevSpace. Refusing cleanup."
+    # Hung DevSpace still holds the port and fails /healthz. CLI path identity is
+    # enough to authorize cleanup; refusing here made relaunch impossible.
+    if (-not (Test-DevSpacePortOwnerStopAllowed `
+            -ListenerProcessId $listenerPid `
+            -HealthyListener $healthyListener `
+            -ResolvedProcess $resolvedListener)) {
+        throw "Port $LocalPort is owned by PID $listenerPid but neither /healthz nor process identity proves it is DevSpace. Refusing cleanup."
+    }
+    if ($listenerPid -gt 0 -and -not $healthyListener -and $null -ne $resolvedListener) {
+        Write-SetupLog "Port $LocalPort owner PID $listenerPid failed /healthz; cleaning up via $($resolvedListener.Resolution)." "WARN"
     }
     Assert-DevSpaceLaunchCanProceed `
         -HealthyListener $healthyListener `
@@ -844,8 +864,9 @@ function Get-HttpBody([string]$url, [int]$timeoutSec = 5, [hashtable]$headers = 
     if ($PreferIpv4) {
         $curlArgs += "-4"
     }
-    # Bypass Clash/session HTTP_PROXY for Worker endpoints (default when URL is our proxy).
-    if ($NoProxy -or $url -like "$PublicProxyBase*") {
+    # Bypass Clash/session HTTP_PROXY for Worker endpoints and loopback probes.
+    $isLoopback = $url -match '(?i)^https?://(127\.0\.0\.1|localhost|\[::1\])(:|/|$)'
+    if ($NoProxy -or $isLoopback -or $url -like "$PublicProxyBase*") {
         $curlArgs += @("--noproxy", "*")
     }
     $curlArgs = $curlArgs + $headerArgs + @($url)

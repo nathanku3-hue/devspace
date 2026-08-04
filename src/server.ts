@@ -838,7 +838,7 @@ export function createMcpServer(
       if (!workspace.task) {
         throw new Error("No native task is bound to this workspace. Open it with taskBrief first.");
       }
-      const result = runNativeTaskValidation(workspace.task);
+      const result = await runNativeTaskValidation(workspace.task);
       workspaces.persistTaskResult(workspace);
       const passed = result.validation.filter((item) => item.passed).length;
       const resultText = [
@@ -1272,7 +1272,7 @@ export function createMcpServer(
 
       const taskValidation = validateTask
         ? workspace.task
-          ? runNativeTaskValidation(workspace.task)
+          ? await runNativeTaskValidation(workspace.task)
           : (() => { throw new Error("validateTask requires a task-bound workspace"); })()
         : undefined;
       const validationPassed = taskValidation?.validation.filter((item) => item.passed).length;

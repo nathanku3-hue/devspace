@@ -141,7 +141,7 @@ try {
     /must pass external validation/,
   );
 
-  const validation = runNativeTaskValidation(task, {
+  const validation = await runNativeTaskValidation(task, {
     ...process.env,
     DEVSPACE_TEST_SECRET: "must-not-cross",
   });
@@ -167,7 +167,7 @@ try {
       root,
       root,
     );
-    const shimValidation = runNativeTaskValidation(shimTask, {
+    const shimValidation = await runNativeTaskValidation(shimTask, {
       ...process.env,
       ComSpec: process.env.ComSpec || process.env.COMSPEC || "cmd.exe",
     });
@@ -182,7 +182,7 @@ try {
       root,
       root,
     );
-    const failingShimValidation = runNativeTaskValidation(failingShimTask, process.env);
+    const failingShimValidation = await runNativeTaskValidation(failingShimTask, process.env);
     assert.equal(failingShimValidation.outcome, "BLOCKED");
     assert.equal(failingShimValidation.validation[0].exitCode, 7);
   }
@@ -204,7 +204,7 @@ try {
   );
 
   const unverifiedTask = bindNativeTask(brief({ validation: [] }), root, root);
-  assert.equal(runNativeTaskValidation(unverifiedTask).outcome, "UNVERIFIED");
+  assert.equal((await runNativeTaskValidation(unverifiedTask)).outcome, "UNVERIFIED");
 
   const blockedTask = bindNativeTask(
     brief({
@@ -219,7 +219,7 @@ try {
     root,
     root,
   );
-  assert.equal(runNativeTaskValidation(blockedTask).outcome, "BLOCKED");
+  assert.equal((await runNativeTaskValidation(blockedTask)).outcome, "BLOCKED");
 
   const noCommitTask = bindNativeTask(
     brief({
@@ -234,7 +234,7 @@ try {
     root,
     root,
   );
-  runNativeTaskValidation(noCommitTask);
+  await runNativeTaskValidation(noCommitTask);
   assert.throws(
     () => authorizeNativeTaskPublish(noCommitTask, root, root, ["src/result.txt"], {}),
     /does not authorize a commit/,
