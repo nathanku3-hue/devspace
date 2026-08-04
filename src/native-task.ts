@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import { spawnSync } from "node:child_process";
-import { relative, resolve, sep } from "node:path";
+import { basename, relative, resolve, sep } from "node:path";
 
 export interface NativeTaskValidationCommandInput {
   argv: string[];
@@ -419,15 +419,26 @@ export function buildNativeTaskEnvironment(
   return environment;
 }
 
-function validationInvocation(
+function quoteCmdArgument(value: string): string {
+  return `"${value.replaceAll('"', '""')}"`;
+}
+
+export function validationInvocation(
   command: NativeTaskValidationCommand,
   environment: NodeJS.ProcessEnv,
-): { executable: string; args: string[] } {
+  platform: NodeJS.Platform = process.platform,
+): { executable: string; args: string[]; windowsVerbatimArguments?: boolean } {
   const [executable, ...args] = command.argv;
-  if (process.platform === "win32" && /^(?:npm|npx|pnpm|yarn)(?:\.cmd)?$/i.test(executable)) {
+  const executableName = basename(executable);
+  if (
+    platform === "win32" &&
+    /^(?:npm|npx|pnpm|yarn)(?:\.cmd)?$/i.test(executableName)
+  ) {
+    const commandLine = [executable, ...args].map(quoteCmdArgument).join(" ");
     return {
       executable: environment.ComSpec || environment.COMSPEC || "cmd.exe",
-      args: ["/d", "/s", "/c", executable, ...args],
+      args: ["/d", "/s", "/c", `"${commandLine}"`],
+      windowsVerbatimArguments: true,
     };
   }
   return { executable, args };
@@ -464,6 +475,7 @@ export function runNativeTaskValidation(
       encoding: "utf8",
       shell: false,
       windowsHide: true,
+      windowsVerbatimArguments: invocation.windowsVerbatimArguments,
       timeout: command.timeoutSeconds * 1000,
       maxBuffer: 16 * 1024 * 1024,
       stdio: ["ignore", "pipe", "pipe"],

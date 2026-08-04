@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, mkdir, rm } from "node:fs/promises";
+import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -8,6 +8,7 @@ import {
   bindNativeTask,
   buildNativeTaskEnvironment,
   runNativeTaskValidation,
+  validationInvocation,
   type NativeTaskBriefInput,
 } from "./native-task.js";
 
@@ -69,6 +70,67 @@ try {
   assert.equal(environment.DEVSPACE_TEST_SECRET, undefined);
   assert.equal(environment.GIT_TERMINAL_PROMPT, "0");
 
+  const comSpec = "C:\\Windows\\System32\\cmd.exe";
+  const invocationEnvironment = { ComSpec: comSpec };
+  const cmdArgs = (argv: string[]) => [
+    "/d",
+    "/s",
+    "/c",
+    `"${argv.map((value) => `"${value}"`).join(" ")}"`,
+  ];
+  const absoluteNpmArgv = ["D:\\nodejs\\npm.cmd", "run", "test:powershell"];
+  assert.deepEqual(
+    validationInvocation(
+      { argv: absoluteNpmArgv, cwd: ".", timeoutSeconds: 30 },
+      invocationEnvironment,
+      "win32",
+    ),
+    {
+      executable: comSpec,
+      args: cmdArgs(absoluteNpmArgv),
+      windowsVerbatimArguments: true,
+    },
+  );
+
+  const spacedNpmArgv = ["C:\\Program Files\\nodejs\\npm.cmd", "run", "build"];
+  assert.deepEqual(
+    validationInvocation(
+      { argv: spacedNpmArgv, cwd: ".", timeoutSeconds: 30 },
+      invocationEnvironment,
+      "win32",
+    ),
+    {
+      executable: comSpec,
+      args: cmdArgs(spacedNpmArgv),
+      windowsVerbatimArguments: true,
+    },
+  );
+
+  for (const executable of ["npm", "npm.cmd"]) {
+    assert.deepEqual(
+      validationInvocation(
+        { argv: [executable, "--version"], cwd: ".", timeoutSeconds: 30 },
+        invocationEnvironment,
+        "win32",
+      ),
+      {
+        executable: comSpec,
+        args: cmdArgs([executable, "--version"]),
+        windowsVerbatimArguments: true,
+      },
+    );
+  }
+
+  const directExeArgv = ["C:\\tools\\validator.exe", "--check"];
+  assert.deepEqual(
+    validationInvocation(
+      { argv: directExeArgv, cwd: ".", timeoutSeconds: 30 },
+      invocationEnvironment,
+      "win32",
+    ),
+    { executable: directExeArgv[0], args: [directExeArgv[1]] },
+  );
+
   assert.throws(
     () =>
       authorizeNativeTaskPublish(task, root, root, ["src/result.txt"], {
@@ -86,6 +148,44 @@ try {
   assert.equal(validation.outcome, "DONE", validation.blocker);
   assert.equal(validation.validation.length, 1);
   assert.equal(validation.validation[0].passed, true);
+
+  if (process.platform === "win32") {
+    const shimDirectory = join(root, "package manager path");
+    const shimPath = join(shimDirectory, "npm.cmd");
+    await mkdir(shimDirectory, { recursive: true });
+    await writeFile(
+      shimPath,
+      '@echo off\r\nif "%~1"=="fail" exit /b 7\r\necho shim-ok\r\nexit /b 0\r\n',
+      "utf8",
+    );
+
+    const shimArgv = [shimPath, "pass"];
+    const shimTask = bindNativeTask(
+      brief({
+        validation: [{ argv: shimArgv, cwd: ".", timeoutSeconds: 30 }],
+      }),
+      root,
+      root,
+    );
+    const shimValidation = runNativeTaskValidation(shimTask, {
+      ...process.env,
+      ComSpec: process.env.ComSpec || process.env.COMSPEC || "cmd.exe",
+    });
+    assert.equal(shimValidation.outcome, "DONE", shimValidation.blocker);
+    assert.deepEqual(shimValidation.validation[0].argv, shimArgv);
+    assert.match(shimValidation.validation[0].output, /shim-ok/);
+
+    const failingShimTask = bindNativeTask(
+      brief({
+        validation: [{ argv: [shimPath, "fail"], cwd: ".", timeoutSeconds: 30 }],
+      }),
+      root,
+      root,
+    );
+    const failingShimValidation = runNativeTaskValidation(failingShimTask, process.env);
+    assert.equal(failingShimValidation.outcome, "BLOCKED");
+    assert.equal(failingShimValidation.validation[0].exitCode, 7);
+  }
 
   assert.deepEqual(
     authorizeNativeTaskPublish(task, root, root, ["src/result.txt"], {}),
