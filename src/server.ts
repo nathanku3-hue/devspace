@@ -609,7 +609,7 @@ export function createMcpServer(
     {
       name: "devspace",
       title: "DevSpace",
-      version: "0.1.0",
+      version: "0.1.1",
       description:
         "Secure local coding workspace for MCP clients. Provides workspace-scoped file, search, edit, write, and shell tools.",
     },
