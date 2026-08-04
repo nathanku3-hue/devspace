@@ -32,6 +32,11 @@ const migrations: Migration[] = [
     name: "workspace-head-metadata",
     up: migrateWorkspaceHeadMetadata,
   },
+  {
+    version: 6,
+    name: "native-task-continuation",
+    up: migrateNativeTaskContinuation,
+  },
 ];
 
 export function migrateDatabase(sqlite: Database.Database): void {
@@ -166,6 +171,29 @@ function migrateWorkspaceBranchMetadata(sqlite: Database.Database): void {
 
 function migrateWorkspaceHeadMetadata(sqlite: Database.Database): void {
   addColumnIfMissing(sqlite, "workspace_sessions", "head_sha", "text");
+}
+
+function migrateNativeTaskContinuation(sqlite: Database.Database): void {
+  sqlite.exec(`
+    create table if not exists native_tasks (
+      task_id text primary key,
+      task_digest text not null,
+      brief_json text not null,
+      workspace_id text not null unique,
+      outcome text not null,
+      latest_validation_json text,
+      git_custody_json text,
+      created_at text not null,
+      updated_at text not null,
+      foreign key (workspace_id) references workspace_sessions(id) on delete cascade
+    );
+
+    create unique index if not exists native_tasks_workspace_id_idx
+      on native_tasks(workspace_id);
+
+    create index if not exists native_tasks_outcome_idx
+      on native_tasks(outcome, updated_at desc);
+  `);
 }
 
 function addColumnIfMissing(

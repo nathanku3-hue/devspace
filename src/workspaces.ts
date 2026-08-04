@@ -8,6 +8,13 @@ import { createManagedWorktree, removeManagedWorktree } from "./git-worktrees.js
 import { git } from "./git.js";
 import { assertAllowedPath, isPathInsideRoot, resolveAllowedPath } from "./roots.js";
 import {
+  bindNativeTask,
+  restoreNativeTask,
+  serializeNativeTaskBrief,
+  type BoundNativeTask,
+  type NativeTaskBriefInput,
+} from "./native-task.js";
+import {
   loadWorkspaceSkills,
   markSkillActivated,
   resolveSkillReadPath,
@@ -43,6 +50,7 @@ export interface Workspace {
   skills: LoadedSkills["skills"];
   skillDiagnostics: LoadedSkills["diagnostics"];
   activatedSkillDirs: Set<string>;
+  task?: BoundNativeTask;
 }
 
 export interface WorkspaceContext {
@@ -58,11 +66,13 @@ export interface WorkspaceReadPath {
 }
 
 export interface OpenWorkspaceInput {
-  path: string;
+  path?: string;
+  taskId?: string;
   mode?: WorkspaceMode;
   baseRef?: string;
   branch?: string;
   createBranch?: boolean;
+  taskBrief?: NativeTaskBriefInput;
 }
 
 export interface ClosedWorkspace {
@@ -87,18 +97,35 @@ export class WorkspaceRegistry {
 
   async openWorkspace(input: string | OpenWorkspaceInput): Promise<WorkspaceContext> {
     const options = typeof input === "string" ? { path: input } : input;
-    const mode = options.mode ?? "checkout";
+    if (options.taskId) {
+      if (
+        options.path !== undefined ||
+        options.mode !== undefined ||
+        options.baseRef !== undefined ||
+        options.branch !== undefined ||
+        options.createBranch !== undefined ||
+        options.taskBrief !== undefined
+      ) {
+        throw new Error("open_workspace(taskId) cannot replace path, worktree, or task authority");
+      }
+      return this.resumeNativeTask(options.taskId);
+    }
+    if (!options.path) {
+      throw new Error("open_workspace requires either path or taskId");
+    }
 
+    const mode = options.mode ?? "checkout";
     if (mode === "worktree") {
       return this.openWorktreeWorkspace(
         options.path,
         options.baseRef,
         options.branch,
         options.createBranch,
+        options.taskBrief,
       );
     }
 
-    return this.openCheckoutWorkspace(options.path);
+    return this.openCheckoutWorkspace(options.path, options.taskBrief);
   }
 
   getWorkspace(workspaceId: string): Workspace {
@@ -114,6 +141,7 @@ export class WorkspaceRegistry {
     }
 
     const root = this.assertWorkspaceRootAllowed(session.root, session.mode, session.sourceRoot);
+    const taskRecord = this.store?.getTaskForWorkspace(session.id);
     const restoredWorkspace: Workspace = {
       id: session.id,
       root,
@@ -133,11 +161,28 @@ export class WorkspaceRegistry {
           : undefined,
       ...this.loadSkillsForWorkspace(root),
       activatedSkillDirs: new Set(),
+      task: taskRecord
+        ? restoreNativeTask(taskRecord, session.sourceRoot ?? root, root)
+        : undefined,
     };
     this.store?.touchSession(workspaceId);
     this.workspaces.set(restoredWorkspace.id, restoredWorkspace);
 
     return restoredWorkspace;
+  }
+
+  persistTaskResult(workspace: Workspace): void {
+    if (!workspace.task || !this.store) return;
+    this.store.updateTaskResult({
+      taskId: workspace.task.taskId,
+      outcome: workspace.task.outcome,
+      latestValidationJson: workspace.task.lastValidation
+        ? JSON.stringify(workspace.task.lastValidation)
+        : undefined,
+      gitCustodyJson: workspace.task.gitCustody
+        ? JSON.stringify(workspace.task.gitCustody)
+        : undefined,
+    });
   }
 
   async closeWorkspace(input: {
@@ -233,7 +278,27 @@ export class WorkspaceRegistry {
     return assertAllowedPath(directory, [workspace.root]);
   }
 
-  private async openCheckoutWorkspace(path: string): Promise<WorkspaceContext> {
+  private async resumeNativeTask(taskId: string): Promise<WorkspaceContext> {
+    if (!this.store) {
+      throw new Error("Native task continuation requires the DevSpace workspace store");
+    }
+    const taskRecord = this.store.getTask(taskId);
+    if (!taskRecord) {
+      throw new Error(`Unknown native taskId: ${taskId}`);
+    }
+    const workspace = this.getWorkspace(taskRecord.workspaceId);
+    if (!workspace.task || workspace.task.taskId !== taskId) {
+      throw new Error(`Task ${taskId} could not be reattached to its sealed workspace`);
+    }
+    const agentsFiles = this.loadInitialAgentsFiles(workspace.root);
+    const availableAgentsFiles = await this.findAvailableAgentsFiles(workspace.root, agentsFiles);
+    return { workspace, agentsFiles, availableAgentsFiles };
+  }
+
+  private async openCheckoutWorkspace(
+    path: string,
+    taskBrief: NativeTaskBriefInput | undefined,
+  ): Promise<WorkspaceContext> {
     const root = assertAllowedPath(path, this.config.allowedRoots);
     await mkdir(root, { recursive: true });
 
@@ -242,7 +307,7 @@ export class WorkspaceRegistry {
       throw new Error(`Workspace root must be a directory: ${path}`);
     }
 
-    return this.createWorkspaceContext({ root, mode: "checkout" });
+    return this.createWorkspaceContext({ root, mode: "checkout", taskBrief });
   }
 
   private async openWorktreeWorkspace(
@@ -250,6 +315,7 @@ export class WorkspaceRegistry {
     baseRef: string | undefined,
     branch: string | undefined,
     createBranch: boolean | undefined,
+    taskBrief: NativeTaskBriefInput | undefined,
   ): Promise<WorkspaceContext> {
     const worktree = await createManagedWorktree({
       sourcePath: path,
@@ -264,6 +330,7 @@ export class WorkspaceRegistry {
       mode: "worktree",
       sourceRoot: worktree.sourceRoot,
       worktree,
+      taskBrief,
     });
   }
 
@@ -272,6 +339,7 @@ export class WorkspaceRegistry {
     mode: WorkspaceMode;
     sourceRoot?: string;
     worktree?: WorkspaceWorktree;
+    taskBrief?: NativeTaskBriefInput;
   }): Promise<WorkspaceContext> {
     const workspace: Workspace = {
       id: `ws_${randomUUID()}`,
@@ -281,6 +349,9 @@ export class WorkspaceRegistry {
       worktree: input.worktree,
       ...this.loadSkillsForWorkspace(input.root),
       activatedSkillDirs: new Set(),
+      task: input.taskBrief
+        ? bindNativeTask(input.taskBrief, input.sourceRoot ?? input.root, input.root)
+        : undefined,
     };
 
     this.store?.createSession({
@@ -294,6 +365,17 @@ export class WorkspaceRegistry {
       branch: workspace.worktree?.branch,
       managed: workspace.worktree?.managed,
     });
+    if (workspace.task) {
+      this.store?.createTask({
+        taskId: workspace.task.taskId,
+        taskDigest: workspace.task.taskDigest,
+        briefJson: serializeNativeTaskBrief(workspace.task),
+        workspaceId: workspace.id,
+        outcome: workspace.task.outcome,
+        latestValidationJson: undefined,
+        gitCustodyJson: undefined,
+      });
+    }
     this.workspaces.set(workspace.id, workspace);
     const agentsFiles = this.loadInitialAgentsFiles(workspace.root);
     const availableAgentsFiles = await this.findAvailableAgentsFiles(workspace.root, agentsFiles);

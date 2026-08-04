@@ -47,6 +47,12 @@ import {
   readWorkspaceFiles,
 } from "./read-files.js";
 import { createWorkspaceStore } from "./workspace-store.js";
+import {
+  assertNativeTaskWritePath,
+  authorizeNativeTaskPublish,
+  runNativeTaskValidation,
+  taskInstruction,
+} from "./native-task.js";
 import { formatAgentsPath, WorkspaceRegistry } from "./workspaces.js";
 import { ReviewReturnController } from "./review-return.js";
 import { registerReviewReturnTools } from "./review-return-tools.js";
@@ -271,6 +277,33 @@ const workspaceAgentsFileOutputSchema = z.object({
 
 const workspaceAvailableAgentsFileOutputSchema = z.object({
   path: z.string(),
+});
+
+const nativeTaskValidationOutputSchema = z.object({
+  taskId: z.string(),
+  outcome: z.enum(["READY", "DONE", "UNVERIFIED", "BLOCKED"]),
+  productResult: z.string(),
+  blocker: z.string(),
+  completedAt: z.string(),
+  validation: z.array(z.object({
+    argv: z.array(z.string()),
+    cwd: z.string(),
+    passed: z.boolean(),
+    exitCode: z.number().nullable(),
+    durationMs: z.number(),
+    output: z.string(),
+  })),
+});
+
+const nativeTaskGitCustodyOutputSchema = z.object({
+  commit: z.string(),
+  branch: z.string(),
+  remote: z.string(),
+  pushed: z.boolean(),
+  paths: z.array(z.string()),
+  stat: z.string(),
+  pushOutput: z.string().optional(),
+  publishedAt: z.string(),
 });
 
 const reviewFileOutputSchema = z.object({
@@ -626,13 +659,20 @@ export function createMcpServer(
     {
       title: "Open workspace",
       description:
-        "Open a local project directory as a coding workspace. Call this once per project folder or worktree before reading, editing, searching, writing, showing changes, or running commands. Reuse the returned workspaceId for later calls in the same folder; do not call open_workspace again unless switching folders/worktrees, changing checkout/worktree mode, the workspaceId is rejected as unknown, or the user explicitly asks to reopen. By default this opens the actual checkout. Worktree mode is detached by default; pass branch to attach an existing local branch, or pass branch with createBranch=true to create it from baseRef. Returns a workspaceId, loaded root project instructions, and nested instruction file paths the model should read before working in those directories.",
+        "Open a local project directory, optionally with a sealed taskBrief, or resume an existing native task by taskId after a fresh conversation or DevSpace restart. Use exactly open_workspace(path, taskBrief) to create a native task or open_workspace(taskId) to continue it; continuation rejects replacement path, worktree, or authority fields. Returns the retained task digest, outcome, validation, and Git custody result when present.",
       inputSchema: {
         path: z
           .string()
+          .optional()
           .describe(
-            "Absolute path, or a leading-tilde home path such as ~/project, to a local project directory inside an allowed root.",
+            "Absolute path, or a leading-tilde home path such as ~/project, to a local project directory inside an allowed root. Omit when resuming by taskId.",
           ),
+        taskId: z
+          .string()
+          .trim()
+          .min(1)
+          .optional()
+          .describe("DevSpace-generated native task identifier. When supplied, omit path, taskBrief, mode, baseRef, branch, and createBranch."),
         mode: z
           .enum(["checkout", "worktree"])
           .optional()
@@ -653,6 +693,30 @@ export function createMcpServer(
           .boolean()
           .optional()
           .describe("Create branch from baseRef before attaching it. Requires branch. Defaults to false."),
+        taskBrief: z
+          .object({
+            productResult: z.string().trim().min(1),
+            journeyState: z.string().trim().min(1),
+            doNow: z.string().trim().min(1),
+            doneWhen: z.string().trim().min(1),
+            stopOnlyIf: z.array(z.string().trim().min(1)).min(1),
+            repository: z.string().trim().min(1),
+            allowedPaths: z.array(z.string().trim().min(1)).min(1),
+            validation: z.array(z.object({
+              argv: z.array(z.string().min(1)).min(1),
+              cwd: z.string().trim().min(1).optional(),
+              timeoutSeconds: z.number().int().min(1).max(3600).optional(),
+            })),
+            git: z.object({
+              remote: z.string().trim().min(1),
+              branch: z.string().trim().min(1),
+              paths: z.array(z.string().trim().min(1)).min(1),
+              commit: z.boolean(),
+              push: z.boolean(),
+            }),
+          })
+          .optional()
+          .describe("Optional accepted product brief. DevSpace seals it, generates taskId, enforces write and Git scope, and requires validate_task before DONE or Git custody."),
       },
       outputSchema: {
         workspaceId: z.string(),
@@ -675,18 +739,25 @@ export function createMcpServer(
         skills: z.array(workspaceSkillOutputSchema),
         skillDiagnostics: z.array(z.unknown()),
         instruction: z.string(),
+        taskId: z.string().optional(),
+        taskDigest: z.string().optional(),
+        taskOutcome: z.enum(["READY", "DONE", "UNVERIFIED", "BLOCKED"]).optional(),
+        taskValidation: nativeTaskValidationOutputSchema.optional(),
+        taskGitCustody: nativeTaskGitCustodyOutputSchema.optional(),
       },
       ...toolWidgetDescriptorMeta(config, "workspace"),
       annotations: OPEN_WORKSPACE_TOOL_ANNOTATIONS,
     },
-    async ({ path, mode, baseRef, branch, createBranch }) => {
+    async ({ path, taskId, mode, baseRef, branch, createBranch, taskBrief }) => {
       const startedAt = performance.now();
       const { workspace, agentsFiles, availableAgentsFiles } = await workspaces.openWorkspace({
         path,
+        taskId,
         mode,
         baseRef,
         branch,
         createBranch,
+        taskBrief,
       });
       if (config.widgets === "changes") {
         void reviewCheckpoints.initializeWorkspace({
@@ -708,9 +779,12 @@ export function createMcpServer(
       const availableAgentsFileOutputs = availableAgentsFiles.map((file) => ({
         path: formatAgentsPath(file.path, workspace.root),
       }));
-      const instruction = config.skillsEnabled
+      const baseInstruction = config.skillsEnabled
         ? "Use this workspaceId in all subsequent tool calls for this project. Do not call open_workspace again for this same folder unless this workspaceId stops working, the user asks to reopen, or you switch to a different folder/worktree. Follow loaded agentsFiles instructions. Use read_files to load multiple known context or instruction files in one approval; use the single-file read tool only when one file is needed. When a task matches an available skill in skills, read its path before proceeding."
         : "Use this workspaceId in all subsequent tool calls for this project. Do not call open_workspace again for this same folder unless this workspaceId stops working, the user asks to reopen, or you switch to a different folder/worktree. Follow loaded agentsFiles instructions. Use read_files to load multiple known context or instruction files in one approval; use the single-file read tool only when one file is needed.";
+      const instruction = workspace.task
+        ? `${taskInstruction(workspace.task)}\n${baseInstruction}`
+        : baseInstruction;
       const resultContent: ToolContent[] = [
         {
           type: "text" as const,
@@ -718,6 +792,15 @@ export function createMcpServer(
             `Opened workspace ${workspace.id}`,
             `Root: ${workspace.root}`,
             `Mode: ${workspace.mode}`,
+            workspace.task ? `Task: ${workspace.task.taskId}` : undefined,
+            workspace.task ? `Product result: ${workspace.task.productResult}` : undefined,
+            workspace.task ? `Task outcome: ${workspace.task.outcome}` : undefined,
+            workspace.task?.lastValidation
+              ? `Retained validation: ${workspace.task.lastValidation.outcome}`
+              : undefined,
+            workspace.task?.gitCustody
+              ? `Retained Git custody: ${workspace.task.gitCustody.commit} on ${workspace.task.gitCustody.remote}/${workspace.task.gitCustody.branch}`
+              : undefined,
             loadedAgentsFiles.length > 0
               ? `Loaded project instructions: ${loadedAgentsFiles.map((file) => file.path).join(", ")}`
               : undefined,
@@ -766,6 +849,81 @@ export function createMcpServer(
           skills: visibleSkills,
           skillDiagnostics: workspace.skillDiagnostics,
           instruction,
+          taskId: workspace.task?.taskId,
+          taskDigest: workspace.task?.taskDigest,
+          taskOutcome: workspace.task?.outcome,
+          taskValidation: workspace.task?.lastValidation,
+          taskGitCustody: workspace.task?.gitCustody,
+        },
+      };
+    },
+  );
+
+  registerAppTool(
+    server,
+    "validate_task",
+    {
+      title: "Validate task",
+      description:
+        "Run the exact external validation declared in the sealed task brief using a minimal allowlisted environment. A task with no declared external validation returns UNVERIFIED and cannot produce DONE or use pre-authorized Git custody.",
+      inputSchema: {
+        workspaceId: z.string().describe("Workspace identifier returned by open_workspace."),
+      },
+      outputSchema: {
+        taskId: z.string(),
+        outcome: z.enum(["DONE", "UNVERIFIED", "BLOCKED"]),
+        productResult: z.string(),
+        blocker: z.string(),
+        completedAt: z.string(),
+        validation: z.array(z.object({
+          argv: z.array(z.string()),
+          cwd: z.string(),
+          passed: z.boolean(),
+          exitCode: z.number().nullable(),
+          durationMs: z.number(),
+          output: z.string(),
+        })),
+      },
+      _meta: {},
+      annotations: {
+        readOnlyHint: false,
+        destructiveHint: false,
+        idempotentHint: false,
+        openWorldHint: false,
+      },
+    },
+    async ({ workspaceId }) => {
+      const startedAt = performance.now();
+      const workspace = workspaces.getWorkspace(workspaceId);
+      if (!workspace.task) {
+        throw new Error("No native task is bound to this workspace. Open it with taskBrief first.");
+      }
+      const result = runNativeTaskValidation(workspace.task);
+      workspaces.persistTaskResult(workspace);
+      const passed = result.validation.filter((item) => item.passed).length;
+      const resultText = [
+        `Outcome: ${result.outcome}`,
+        `Product result: ${result.productResult}`,
+        `Validation: ${result.validation.length === 0 ? "0 declared" : `${passed}/${result.validation.length} passed`}`,
+        `Blocker: ${result.blocker}`,
+      ].join("\n");
+      logToolCall(config, {
+        tool: "validate_task",
+        workspaceId,
+        path: workspace.root,
+        success: result.outcome === "DONE",
+        durationMs: Math.round(performance.now() - startedAt),
+        error: result.outcome === "DONE" ? undefined : result.blocker,
+      });
+      return {
+        content: [textBlock(resultText)],
+        structuredContent: {
+          taskId: result.taskId,
+          outcome: result.outcome,
+          productResult: result.productResult,
+          blocker: result.blocker,
+          completedAt: result.completedAt,
+          validation: result.validation,
         },
       };
     },
@@ -1057,7 +1215,8 @@ export function createMcpServer(
     async ({ workspaceId, ...input }) => {
       const startedAt = performance.now();
       const workspace = workspaces.getWorkspace(workspaceId);
-      workspaces.resolvePath(workspace, input.path);
+      const absolutePath = workspaces.resolvePath(workspace, input.path);
+      assertNativeTaskWritePath(workspace.task, workspace.root, absolutePath);
       const response = await writeFileTool(input, {
         cwd: workspace.root,
         root: workspace.root,
@@ -1135,17 +1294,27 @@ export function createMcpServer(
             }),
           )
           .min(1),
+        validateTask: z
+          .boolean()
+          .optional()
+          .describe("When true on a task-bound workspace, run the exact sealed external validation immediately after the edit."),
       },
       outputSchema: resultOutputSchema({
         status: z.literal("applied"),
+        taskId: z.string().optional(),
+        taskOutcome: z.enum(["DONE", "UNVERIFIED", "BLOCKED"]).optional(),
+        validationPassed: z.number().int().nonnegative().optional(),
+        validationTotal: z.number().int().nonnegative().optional(),
+        blocker: z.string().optional(),
       }),
       ...toolWidgetDescriptorMeta(config, "edit"),
       annotations: EDIT_TOOL_ANNOTATIONS,
     },
-    async ({ workspaceId, ...input }) => {
+    async ({ workspaceId, validateTask, ...input }) => {
       const startedAt = performance.now();
       const workspace = workspaces.getWorkspace(workspaceId);
-      workspaces.resolvePath(workspace, input.path);
+      const absolutePath = workspaces.resolvePath(workspace, input.path);
+      assertNativeTaskWritePath(workspace.task, workspace.root, absolutePath);
       const response = await editFileTool(input, {
         cwd: workspace.root,
         root: workspace.root,
@@ -1161,14 +1330,30 @@ export function createMcpServer(
         return response;
       }
 
+      const taskValidation = validateTask
+        ? workspace.task
+          ? runNativeTaskValidation(workspace.task)
+          : (() => { throw new Error("validateTask requires a task-bound workspace"); })()
+        : undefined;
+      const validationPassed = taskValidation?.validation.filter((item) => item.passed).length;
       const stats = countDiffStats(
         response.details?.patch ?? response.details?.diff,
       );
       const summary = {
         ...stats,
         editCount: input.edits.length,
+        taskOutcome: taskValidation?.outcome,
+        validationPassed,
+        validationTotal: taskValidation?.validation.length,
       };
-      const editResultText = `Edited ${input.path} (+${stats.additions} -${stats.removals}).`;
+      const editResultText = [
+        `Edited ${input.path} (+${stats.additions} -${stats.removals}).`,
+        taskValidation ? `Outcome: ${taskValidation.outcome}` : undefined,
+        taskValidation
+          ? `Validation: ${validationPassed}/${taskValidation.validation.length} passed`
+          : undefined,
+        taskValidation ? `Blocker: ${taskValidation.blocker}` : undefined,
+      ].filter(Boolean).join("\n");
       const editContent = [textBlock(editResultText)];
       logToolCall(config, {
         tool: toolNames.edit,
@@ -1195,6 +1380,11 @@ export function createMcpServer(
         structuredContent: {
           status: "applied",
           result: contentText(editContent),
+          taskId: taskValidation?.taskId,
+          taskOutcome: taskValidation?.outcome,
+          validationPassed,
+          validationTotal: taskValidation?.validation.length,
+          blocker: taskValidation?.blocker,
         },
       };
     },
@@ -1542,16 +1732,30 @@ export function createMcpServer(
       const cwd = workspaces.resolveWorkingDirectory(workspace, workingDirectory);
 
       try {
+        const authorization = authorizeNativeTaskPublish(
+          workspace.task,
+          workspace.root,
+          cwd,
+          paths,
+          { remote, branch, push },
+        );
         const result = await publishGitChanges({
           cwd,
           workspaceRoot: workspace.root,
           allowedRoots: [workspace.root],
           paths,
           message,
-          remote,
-          branch,
-          push,
+          remote: authorization?.remote ?? remote,
+          branch: authorization?.branch ?? branch,
+          push: authorization?.push ?? push,
         });
+        if (workspace.task) {
+          workspace.task.gitCustody = {
+            ...result,
+            publishedAt: new Date().toISOString(),
+          };
+          workspaces.persistTaskResult(workspace);
+        }
         const resultText = [
           `Created commit ${result.commit} on ${result.branch}.`,
           result.pushed
@@ -1632,6 +1836,11 @@ export function createMcpServer(
     async ({ workspaceId, workingDirectory, ...input }) => {
       const startedAt = performance.now();
       const workspace = workspaces.getWorkspace(workspaceId);
+      if (workspace.task) {
+        throw new Error(
+          `Generic shell execution is unavailable for task ${workspace.task.taskId}. Use read/edit/write for repository actions and validate_task for the exact declared external proof.`,
+        );
+      }
       const cwd = workspaces.resolveWorkingDirectory(
         workspace,
         workingDirectory,
@@ -1715,6 +1924,10 @@ export function createMcpServer(
     async ({ workspaceId, sourcePath, targetPath }) => {
       const startedAt = performance.now();
       const workspace = workspaces.getWorkspace(workspaceId);
+      const sourceAbsolutePath = workspaces.resolvePath(workspace, sourcePath);
+      const targetAbsolutePath = workspaces.resolvePath(workspace, targetPath);
+      assertNativeTaskWritePath(workspace.task, workspace.root, sourceAbsolutePath);
+      assertNativeTaskWritePath(workspace.task, workspace.root, targetAbsolutePath);
 
       try {
         await safeRenameFile(workspace.root, sourcePath, targetPath);

@@ -1,7 +1,10 @@
 import { eq } from "drizzle-orm";
+import type { NativeTaskOutcome } from "./native-task.js";
 import { openDatabase, type DatabaseHandle } from "./db/client.js";
 import {
+  nativeTasks,
   workspaceSessions,
+  type NativeTaskRow,
   type WorkspaceSessionRow,
 } from "./db/schema.js";
 
@@ -22,6 +25,18 @@ export interface WorkspaceSession {
   lastUsedAt: string;
 }
 
+export interface NativeTaskRecord {
+  taskId: string;
+  taskDigest: string;
+  briefJson: string;
+  workspaceId: string;
+  outcome: NativeTaskOutcome;
+  latestValidationJson?: string;
+  gitCustodyJson?: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
 export interface WorkspaceStore {
   createSession(input: {
     id: string;
@@ -37,6 +52,15 @@ export interface WorkspaceStore {
   getSession(id: string): WorkspaceSession | undefined;
   touchSession(id: string): void;
   closeSession(id: string, headSha?: string): void;
+  createTask(input: Omit<NativeTaskRecord, "createdAt" | "updatedAt">): NativeTaskRecord;
+  getTask(taskId: string): NativeTaskRecord | undefined;
+  getTaskForWorkspace(workspaceId: string): NativeTaskRecord | undefined;
+  updateTaskResult(input: {
+    taskId: string;
+    outcome: NativeTaskOutcome;
+    latestValidationJson?: string;
+    gitCustodyJson?: string;
+  }): void;
   close?(): void;
 }
 
@@ -127,6 +151,66 @@ export class SqliteWorkspaceStore implements WorkspaceStore {
       .run();
   }
 
+  createTask(input: Omit<NativeTaskRecord, "createdAt" | "updatedAt">): NativeTaskRecord {
+    const now = new Date().toISOString();
+    const task: NativeTaskRecord = {
+      ...input,
+      createdAt: now,
+      updatedAt: now,
+    };
+    this.database.db
+      .insert(nativeTasks)
+      .values({
+        taskId: task.taskId,
+        taskDigest: task.taskDigest,
+        briefJson: task.briefJson,
+        workspaceId: task.workspaceId,
+        outcome: task.outcome,
+        latestValidationJson: task.latestValidationJson ?? null,
+        gitCustodyJson: task.gitCustodyJson ?? null,
+        createdAt: task.createdAt,
+        updatedAt: task.updatedAt,
+      })
+      .run();
+    return task;
+  }
+
+  getTask(taskId: string): NativeTaskRecord | undefined {
+    const row = this.database.db
+      .select()
+      .from(nativeTasks)
+      .where(eq(nativeTasks.taskId, taskId))
+      .get();
+    return row ? rowToNativeTaskRecord(row) : undefined;
+  }
+
+  getTaskForWorkspace(workspaceId: string): NativeTaskRecord | undefined {
+    const row = this.database.db
+      .select()
+      .from(nativeTasks)
+      .where(eq(nativeTasks.workspaceId, workspaceId))
+      .get();
+    return row ? rowToNativeTaskRecord(row) : undefined;
+  }
+
+  updateTaskResult(input: {
+    taskId: string;
+    outcome: NativeTaskOutcome;
+    latestValidationJson?: string;
+    gitCustodyJson?: string;
+  }): void {
+    this.database.db
+      .update(nativeTasks)
+      .set({
+        outcome: input.outcome,
+        latestValidationJson: input.latestValidationJson ?? null,
+        gitCustodyJson: input.gitCustodyJson ?? null,
+        updatedAt: new Date().toISOString(),
+      })
+      .where(eq(nativeTasks.taskId, input.taskId))
+      .run();
+  }
+
   close(): void {
     this.database.close();
   }
@@ -150,5 +234,22 @@ function rowToWorkspaceSession(row: WorkspaceSessionRow): WorkspaceSession {
     managed: row.managed === "true",
     createdAt: row.createdAt,
     lastUsedAt: row.lastUsedAt,
+  };
+}
+
+function rowToNativeTaskRecord(row: NativeTaskRow): NativeTaskRecord {
+  if (!(["READY", "DONE", "UNVERIFIED", "BLOCKED"] as const).includes(row.outcome as NativeTaskOutcome)) {
+    throw new Error(`Persisted task ${row.taskId} has invalid outcome: ${row.outcome}`);
+  }
+  return {
+    taskId: row.taskId,
+    taskDigest: row.taskDigest,
+    briefJson: row.briefJson,
+    workspaceId: row.workspaceId,
+    outcome: row.outcome as NativeTaskOutcome,
+    latestValidationJson: row.latestValidationJson ?? undefined,
+    gitCustodyJson: row.gitCustodyJson ?? undefined,
+    createdAt: row.createdAt,
+    updatedAt: row.updatedAt,
   };
 }
