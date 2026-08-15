@@ -4,16 +4,12 @@
   const fragmentPrefix = "#cs_oauth_callback=";
   const callbackRouteId = "routes/connector.oauth.$callback_id";
   const rescueStatusKey = "chatshare-oauth-callback-rescue-status";
+  const pendingKey = "chatshare-oauth-callback-rescue-pending";
+  const chatAppSearch = "?surface=work";
+  const loginPath = "/pastel/#/login";
 
-  if (!location.hash.startsWith(fragmentPrefix)) return;
-
-  let callbackUrl;
-  try {
-    callbackUrl = new URL(location.hash.slice(fragmentPrefix.length), location.origin);
-  } catch {
-    renderFailure("The rescued OAuth callback URL is invalid.");
-    return;
-  }
+  const callbackUrl = readCallbackUrl();
+  if (!callbackUrl) return;
 
   const validPath =
     callbackUrl.pathname.startsWith("/connector/oauth/") ||
@@ -26,11 +22,19 @@
     return;
   }
 
-  if (location.pathname.startsWith("/pastel")) {
-    history.replaceState(null, "", "/pastel/");
-    renderFailure(
-      "Your Chatshare session is not active. Log in, return to connector settings, and start OAuth again.",
-    );
+  // Chatshare's ChatGPT shell uses location.hash for #settings. Leaving the
+  // rescue fragment in the address bar blocks that router and also prevents
+  // the unauthenticated / -> /pastel/ login bounce from presenting #/login.
+  sessionStorage.setItem(pendingKey, `${callbackUrl.pathname}${callbackUrl.search}`);
+  if (location.hash.startsWith(fragmentPrefix)) {
+    history.replaceState(null, "", nextShellUrl());
+  }
+
+  if (isLoginSurface()) {
+    sessionStorage.setItem(rescueStatusKey, "redirecting-to-login");
+    if (`${location.pathname}${location.hash}` !== loginPath) {
+      location.replace(loginPath);
+    }
     return;
   }
 
@@ -122,6 +126,7 @@
           .then(() => {
             sessionStorage.setItem(attemptKey, "navigated");
             sessionStorage.setItem(rescueStatusKey, "router-navigation-complete");
+            sessionStorage.removeItem(pendingKey);
           })
           .catch((error) => {
             renderFailure(
@@ -131,15 +136,55 @@
         return;
       }
 
+      if (isLoginSurface()) {
+        window.clearInterval(timer);
+        sessionStorage.setItem(rescueStatusKey, "redirecting-to-login");
+        location.replace(loginPath);
+        return;
+      }
+
       if (Date.now() >= deadline) {
         window.clearInterval(timer);
-        renderFailure(
-          `Chatshare did not expose a usable callback router. Rescue status: ${
-            sessionStorage.getItem(rescueStatusKey) ?? "unknown"
-          }.`,
-        );
+        sessionStorage.setItem(rescueStatusKey, "redirecting-to-login");
+        location.replace(loginPath);
       }
     }, 25);
+  }
+
+  function readCallbackUrl() {
+    if (location.hash.startsWith(fragmentPrefix)) {
+      try {
+        return new URL(location.hash.slice(fragmentPrefix.length), location.origin);
+      } catch {
+        renderFailure("The rescued OAuth callback URL is invalid.");
+        return null;
+      }
+    }
+
+    const pending = sessionStorage.getItem(pendingKey);
+    if (!pending || isLoginSurface()) return null;
+    try {
+      return new URL(pending, location.origin);
+    } catch {
+      sessionStorage.removeItem(pendingKey);
+      return null;
+    }
+  }
+
+  function isLoginSurface() {
+    return (
+      location.pathname.startsWith("/pastel") ||
+      Boolean(document.querySelector("script[src*='/pastel/assets/']")) ||
+      Boolean(document.querySelector("link[href*='/pastel/assets/']"))
+    );
+  }
+
+  function nextShellUrl() {
+    if (isLoginSurface()) return loginPath;
+    if (location.search.includes("surface=work")) {
+      return `${location.pathname}${location.search}`;
+    }
+    return `/${chatAppSearch}`;
   }
 
   function renderFailure(message) {

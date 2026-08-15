@@ -649,3 +649,111 @@ a real authenticated `open_workspace E:\code` invocation. The remaining known
 issues are non-blocking callback UX ambiguity, missing timeout behavior in the
 device-proof relay, and temporary live-source custody divergence. These findings
 belong to the Chatshare.xyz compatibility stream, not `WEB-CONNECTOR-1`.
+
+---
+
+# Chatshare Rescue 1.4.0 Hash Collision and Plugin Binding Lessons
+
+Date: 2026-08-16
+Client: `https://chatshare.xyz`
+Server: `https://devspace-proxy.kitlongku.workers.dev`
+Live extension: `E:\Code\devspace\chatshare-oauth-rescue-extension` version `1.4.0`
+Confirmed close: authenticated Chatshare chat opened `E:\code\meta-harness` after a new conversation on the connected connector.
+
+No authorization code, state value, access token, refresh token, owner token, or browser credential is recorded in this document.
+
+## Confirmed outcome
+
+The public path was healthy the entire incident. Local `/healthz`, the current quick tunnel, and the Worker proxy all returned DevSpace JSON. Device-proof auto-approval issued 302s. The break was never a 502/530 custody failure.
+
+Version `1.4.0` unblocked callback consumption. After reload, Chatshare exchanged the code, DevSpace issued a device-bound access and refresh token, and `openai-mcp/1.0.0 (ChatGPT)` created authenticated MCP sessions.
+
+End-to-end close required one more Chatshare-side step: start a **new** chat from the connected plugin. An older conversation continued to report the plugin as not installed even after MCP was live.
+
+## Failure chain
+
+### 1. Rescue landed on a hash that Chatshare already uses
+
+The `1.3.0` DNR rule rewrote the missing callback to:
+
+```text
+https://chatshare.xyz/#cs_oauth_callback=/connector/oauth/<id>?<query>
+```
+
+Chatshare's ChatGPT shell uses `location.hash` for `#settings` and `#settings/Plugins`. Leaving the rescue fragment in the address bar blocked that router. Logged-in users stayed on the hash URL. Logged-out users no longer reached `/pastel/#/login` the way they used to.
+
+`sessionStorage.getItem("chatshare-oauth-callback-rescue-status") === "router-navigation-complete"` only proves the extension navigated. It does not prove Chatshare posted `/aip/connectors/links/oauth/callback` or that DevSpace `/token` ran.
+
+Lesson: do not store a third-party handoff in a fragment the host app already uses for its own client router.
+
+### 2. Console CORS errors were ChatGPT telemetry, not OAuth
+
+Red `chatgpt.com/ces/...` failures from origin `chatshare.xyz` are Statsig analytics blocked by CORS. They are unrelated to DevSpace authorization or MCP.
+
+Lesson: classify connector console noise before treating it as the failure.
+
+### 3. Token absence meant Chatshare never called `/token`
+
+OAuth paths are logged as `/` by the mounted provider. Diagnose token exchange from the OAuth store, not from a `/token` path histogram. A new Chatshare client with zero access and zero refresh tokens means the callback API never reached DevSpace, even if authorize returned 302.
+
+Authorization codes are in-memory. A DevSpace restart invalidates every outstanding code.
+
+Lesson: close OAuth on a persisted token row plus an authenticated `/mcp` session, not on a 302 alone.
+
+### 4. A second connector name is not the same as a connected chat
+
+After reconnect, Chatshare had two plugins: an older dead `DevSpace Local` and a new `DevSpace Local2` that actually held the live token. A conversation that asked for Local2 still reported:
+
+```text
+the requested DevSpace Local2 dev plugin is currently reported as not installed,
+and no callable DevSpace actions are exposed
+```
+
+DevSpace never received `open_workspace`. `E:\code\meta-harness` existed and is inside the allowed root `E:\Code`. The model had no tools in that thread.
+
+`/mcp` HTTP 400 `"No valid MCP session"` is ChatGPT probing without a session id, then retrying initialize. It is not a plugin-install failure.
+
+Lesson: account-level OAuth and MCP health do not attach tools to an old Chatshare conversation. Start a new chat from the connected plugin page. Do not create a third connector.
+
+## Version 1.4.0 repair
+
+1. Intercept the 404 callback as before.
+2. Land on `/?surface=work#cs_oauth_callback=...` so the authenticated ChatGPT shell boots.
+3. Stash the callback path and query in `sessionStorage`.
+4. Clear the rescue hash immediately so `#settings` can work.
+5. If the document is `/pastel/` or the Vue account shell, redirect to `/pastel/#/login`.
+6. If Remix never appears, take the same login redirect instead of leaving the hash URL on screen.
+7. When `__reactRouterDataRouter` is ready, navigate to the original callback path and let Chatshare's own callback component POST `full_redirect_url`.
+
+Verified:
+
+- `test-device-authorization.mjs` passed.
+- `test-callback-rescue.mjs` passed, including hash-cleared before the callback POST.
+- `test-real-routing.mjs` against live Chatshare ended at `/pastel/#/login` when logged out.
+- After extension reload, DevSpace stored a live device-bound token pair and accepted `openai-mcp` sessions.
+- User-confirmed close: a new Local2 chat opened `E:\code\meta-harness`.
+
+## Durable procedure additions
+
+1. If the address bar is stuck on `#cs_oauth_callback=...`, the rescue hash is colliding with Chatshare's hash router. Reload extension `1.4.0` and start a fresh authorization.
+2. Ignore `chatgpt.com/ces/...` CORS lines.
+3. After `router-navigation-complete`, check the OAuth store for a new token pair and the serve log for `openai-mcp` `/mcp` 200s.
+4. If tokens and MCP are live but the model says the plugin is not installed, do not recycle the tunnel. Open a new chat from the connected plugin. Disable the older dead connector.
+5. Treat `open_workspace` on a real allowed path as the close signal.
+
+## Files
+
+- `chatshare-oauth-rescue-extension/callback-bootstrap.js`
+- `chatshare-oauth-rescue-extension/rules.json`
+- `chatshare-oauth-rescue-extension/manifest.json`
+- `chatshare-oauth-rescue-extension/README.md`
+- `chatshare-oauth-rescue-extension/test-callback-rescue.mjs`
+- `chatshare-oauth-rescue-extension/test-real-routing.mjs`
+
+## Final status
+
+Chatshare OAuth, token exchange, MCP tool discovery, and `open_workspace` on `E:\code\meta-harness` are confirmed working as of 2026-08-16 with rescue extension `1.4.0`. The live unpacked path remains `E:\Code\devspace\chatshare-oauth-rescue-extension`. Diagnose later Chatshare routing changes from:
+
+```javascript
+sessionStorage.getItem("chatshare-oauth-callback-rescue-status")
+```
