@@ -126,11 +126,42 @@ try {
     throw new Error(`Unexpected callback body: ${JSON.stringify(receivedBody)}`);
   }
 
+  receivedBody = null;
+  await cdp.call("Runtime.evaluate", { expression: "sessionStorage.clear()", returnByValue: true });
+  const workCallback = `/connector/oauth/test-id?code=dummy-code&state=dummy-work-state`;
+  await cdp.call("Page.navigate", {
+    url: `http://127.0.0.1:${appPort}/?surface=work#cs_oauth_callback=${workCallback}`,
+  });
+
+  await waitFor(async () => {
+    const result = await cdp.call("Runtime.evaluate", {
+      expression:
+        "location.search.includes('surface=work') === false && location.hash.startsWith('#cs_oauth_callback=') === false",
+      returnByValue: true,
+    });
+    return result.result.value === true;
+  }, 8000, "work surface left");
+
+  await waitFor(() => receivedBody !== null, 8000, "work-surface callback POST");
+  await waitFor(async () => {
+    const result = await cdp.call("Runtime.evaluate", {
+      expression: "location.pathname === '/success'",
+      returnByValue: true,
+    });
+    return result.result.value === true;
+  }, 8000, "work-surface success redirect");
+
+  const workExpected = `http://127.0.0.1:${appPort}${workCallback}`;
+  if (receivedBody?.full_redirect_url !== workExpected) {
+    throw new Error(`Unexpected work-surface callback body: ${JSON.stringify(receivedBody)}`);
+  }
+
   console.log(JSON.stringify({
     passed: true,
     productionErrorPrevented: true,
     manifestLoaderDisabledBeforeNavigation: true,
     postedFullRedirectUrlMatches: true,
+    leftWorkSurfaceBeforeCallback: true,
     finalPage: state.result.value,
   }, null, 2));
   cdp.close();

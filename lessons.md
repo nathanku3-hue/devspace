@@ -757,3 +757,62 @@ Chatshare OAuth, token exchange, MCP tool discovery, and `open_workspace` on `E:
 ```javascript
 sessionStorage.getItem("chatshare-oauth-callback-rescue-status")
 ```
+
+---
+
+# Chatshare Rescue 1.5.0 Work-Surface Trap Lessons
+
+Date: 2026-08-17
+Client: `https://chatshare.xyz`
+Server: `https://devspace-proxy.kitlongku.workers.dev`
+Live extension: `E:\Code\devspace\chatshare-oauth-rescue-extension` version `1.5.0`
+Confirmed close: user-reported success after reloading `1.5.0` and starting a fresh Chatshare authorization.
+
+No authorization code, state value, access token, refresh token, owner token, or browser credential is recorded in this document.
+
+## Confirmed outcome
+
+Version `1.4.0` unblocked hash-router collision by landing on `/?surface=work`. That query boots the ChatGPT chat shell, not the settings/connector Remix tree. A logged-in reconnect therefore issued a DevSpace authorization code and then stalled: Chatshare never posted `/aip/connectors/links/oauth/callback` and DevSpace never saw `/token`.
+
+Version `1.5.0` leaves `surface=work` with a full navigation to `/` before the original callback component runs. User-confirmed close followed a reload of the unpacked `1.5.0` extension and a fresh connector authorization.
+
+## Failure
+
+A logged-in reconnect at 13:51 landed on `/?surface=work#cs_oauth_callback=...`. The rescue cleared the hash and the ChatGPT work shell booted (document title `ChatGPT`). DevSpace had already issued the authorization code (`POST /` 302). Chatshare never called `/token`. The tab stayed on `https://chatshare.xyz/?surface=work`.
+
+`/?surface=work` is the chat surface (`/c/...`, plugin hints). Connector OAuth lives on the settings Remix tree at `/` and `/plugins` (`#settings/Plugins`). Client-side `router.navigate('/connector/oauth/...')` on the work surface does not mount the callback component, so `/aip/connectors/links/oauth/callback` never runs.
+
+Unauthenticated `/?surface=work` still 302s to `/pastel/`. That is expected and is not this bug.
+
+## Version 1.5.0 repair
+
+1. DNR lands on `/#cs_oauth_callback=...` again, not `/?surface=work`.
+2. If the document still has `surface=work` (old 1.4.0 DNR, or Chatshare's own redirect), stash the callback and `location.replace('/')` so a new document loads.
+3. `history.replaceState` is only used to clear the rescue hash. It cannot switch from the work document to the settings document.
+4. After `/pastel/#/login`, watch for leaving `#/login` and resume the pending callback on `/`.
+5. Treat `attemptKey === "navigated"` as the only replay lock. A `started` attempt may retry on the app shell.
+
+## Durable procedure additions
+
+1. Do not land a Chatshare OAuth rescue on `/?surface=work`. That query is the chat surface. Connector callback lives on `/` and `/plugins`.
+2. `history.replaceState` cannot switch from the work document to the settings document. Use `location.replace('/')` when `surface=work` is present.
+3. If the address bar is stuck on `/?surface=work` after authorize, the callback was not consumed. Reload `1.5.0` and start a fresh authorization. Do not reopen the spent callback URL.
+4. After `router-navigation-complete`, close on a new token pair plus an authenticated plugin chat. Account-level MCP is not enough.
+
+## Files
+
+- `chatshare-oauth-rescue-extension/callback-bootstrap.js`
+- `chatshare-oauth-rescue-extension/rules.json`
+- `chatshare-oauth-rescue-extension/manifest.json`
+- `chatshare-oauth-rescue-extension/README.md`
+- `chatshare-oauth-rescue-extension/test-callback-rescue.mjs`
+
+## Final status
+
+Chatshare OAuth callback rescue is confirmed working as of 2026-08-17 with rescue extension `1.5.0`. The live unpacked path remains `E:\Code\devspace\chatshare-oauth-rescue-extension`. Diagnose later Chatshare routing changes from:
+
+```javascript
+sessionStorage.getItem("chatshare-oauth-callback-rescue-status")
+```
+
+Expected values: `leaving-work-surface` then `router-navigation-complete`, or `redirecting-to-login` then `resuming-after-login` then `router-navigation-complete`.

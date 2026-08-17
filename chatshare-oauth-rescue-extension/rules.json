@@ -5,7 +5,7 @@
     "action": {
       "type": "redirect",
       "redirect": {
-        "regexSubstitution": "https://chatshare.xyz/?surface=work#cs_oauth_callback=/connector/oauth/\\1?\\2"
+        "regexSubstitution": "https://chatshare.xyz/#cs_oauth_callback=/connector/oauth/\\1?\\2"
       }
     },
     "condition": {
@@ -21,7 +21,7 @@
     "action": {
       "type": "redirect",
       "redirect": {
-        "regexSubstitution": "https://chatshare.xyz/?surface=work#cs_oauth_callback=/connector_platform_oauth_redirect?\\1"
+        "regexSubstitution": "https://chatshare.xyz/#cs_oauth_callback=/connector_platform_oauth_redirect?\\1"
       }
     },
     "condition": {

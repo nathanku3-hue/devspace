@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Chatshare OAuth Callback Rescue",
-  "version": "1.4.0",
+  "version": "1.5.0",
   "description": "Repairs Chatshare OAuth callbacks and silently proves that DevSpace authorization is running on this enrolled PC.",
   "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAtEOYBkTNEpVzH61vqxoxWLrSzYzm6ub53mvDpSOJBkGH9aDbZRu097l/zKzi7uWvNL6sgEOUGPoh/oM7QD9PThZkU+eqdm+cYFOxphLp+xBMqzg6KhjIpfikfxqyXgNnuQtiBBcYzTelqKT0Lz+kcC57yV3RVvuU+Lk3j/sNXDO5oJc0IQFSFm0BN/hQmy4S94Se4Dym/4ry6AZ1Lw9hGSkImqrqXd2HBNiQIGH1VU4ZwoKxCHKwsQYPRHJ3IdmMO6LMIYoAL5BA+iZ7ifiHzrvq6Aakv0/QeTcbHc9MtYvTkCTXoTz+dxF7vdH+uDEL4zoy5xQKsiY+AL4oeFay2wIDAQAB",
   "permissions": [

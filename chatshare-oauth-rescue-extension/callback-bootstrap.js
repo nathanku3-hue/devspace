@@ -5,11 +5,14 @@
   const callbackRouteId = "routes/connector.oauth.$callback_id";
   const rescueStatusKey = "chatshare-oauth-callback-rescue-status";
   const pendingKey = "chatshare-oauth-callback-rescue-pending";
-  const chatAppSearch = "?surface=work";
   const loginPath = "/pastel/#/login";
+  const appShellPath = "/";
 
   const callbackUrl = readCallbackUrl();
-  if (!callbackUrl) return;
+  if (!callbackUrl) {
+    watchLoginThenResume();
+    return;
+  }
 
   const validPath =
     callbackUrl.pathname.startsWith("/connector/oauth/") ||
@@ -26,6 +29,15 @@
   // rescue fragment in the address bar blocks that router and also prevents
   // the unauthenticated / -> /pastel/ login bounce from presenting #/login.
   sessionStorage.setItem(pendingKey, `${callbackUrl.pathname}${callbackUrl.search}`);
+
+  // ?surface=work boots the chat UI, not the settings/connector Remix tree.
+  // replaceState cannot switch documents, so leave that query with a real load.
+  if (isWorkSurface()) {
+    sessionStorage.setItem(rescueStatusKey, "leaving-work-surface");
+    location.replace(appShellPath);
+    return;
+  }
+
   if (location.hash.startsWith(fragmentPrefix)) {
     history.replaceState(null, "", nextShellUrl());
   }
@@ -35,11 +47,12 @@
     if (`${location.pathname}${location.hash}` !== loginPath) {
       location.replace(loginPath);
     }
+    watchLoginThenResume();
     return;
   }
 
   const attemptKey = `chatshare-oauth-callback-rescue:${state}`;
-  if (sessionStorage.getItem(attemptKey)) {
+  if (sessionStorage.getItem(attemptKey) === "navigated") {
     renderFailure(
       "This OAuth callback has already been processed once. Return to connector settings and start a fresh authorization.",
     );
@@ -143,8 +156,20 @@
         return;
       }
 
+      if (isWorkSurface()) {
+        window.clearInterval(timer);
+        sessionStorage.setItem(rescueStatusKey, "leaving-work-surface");
+        location.replace(appShellPath);
+        return;
+      }
+
       if (Date.now() >= deadline) {
         window.clearInterval(timer);
+        if (location.pathname !== appShellPath || location.search) {
+          sessionStorage.setItem(rescueStatusKey, "retrying-app-shell");
+          location.replace(appShellPath);
+          return;
+        }
         sessionStorage.setItem(rescueStatusKey, "redirecting-to-login");
         location.replace(loginPath);
       }
@@ -179,12 +204,35 @@
     );
   }
 
+  function isWorkSurface() {
+    return new URLSearchParams(location.search).get("surface") === "work";
+  }
+
   function nextShellUrl() {
     if (isLoginSurface()) return loginPath;
-    if (location.search.includes("surface=work")) {
-      return `${location.pathname}${location.search}`;
-    }
-    return `/${chatAppSearch}`;
+    return appShellPath;
+  }
+
+  function watchLoginThenResume() {
+    const pending = sessionStorage.getItem(pendingKey);
+    if (!pending || !location.pathname.startsWith("/pastel")) return;
+
+    const deadline = Date.now() + 5 * 60 * 1000;
+    const timer = window.setInterval(() => {
+      if (Date.now() >= deadline) {
+        window.clearInterval(timer);
+        return;
+      }
+      if (!location.pathname.startsWith("/pastel")) {
+        window.clearInterval(timer);
+        return;
+      }
+      if (location.hash && !location.hash.startsWith("#/login")) {
+        window.clearInterval(timer);
+        sessionStorage.setItem(rescueStatusKey, "resuming-after-login");
+        location.replace(appShellPath);
+      }
+    }, 200);
   }
 
   function renderFailure(message) {

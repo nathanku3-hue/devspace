@@ -24,6 +24,12 @@ After this one-time setup, a valid Chatshare OAuth authorization page obtains a
 one-time proof from `127.0.0.1:7677` and submits automatically. There is no
 password prompt or approval click while DevSpace is running normally.
 
+Version `1.5.0` lands the missing callback on `/` (the settings/connector
+Remix shell). It leaves `/?surface=work` with a full navigation because that
+query boots the chat UI and does not run the connector callback. After
+Chatshare login, a pending callback resumes on `/` instead of staying on
+`/pastel/`.
+
 ## Security Boundary
 
 The extension contains no reusable device secret. DevSpace creates an in-memory
