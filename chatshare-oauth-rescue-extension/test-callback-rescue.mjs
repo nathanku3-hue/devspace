@@ -11,13 +11,38 @@ const profile = await mkdtemp(join(tmpdir(), "chatshare-rescue-test-"));
 const bootstrap = await readFile(new URL("./callback-bootstrap.js", import.meta.url), "utf8");
 let receivedBody = null;
 
+const assets = {
+  "/mock-route.js": `import{n as e}from"./mock-support.js";export default function(){return null}`,
+  "/mock-support.js": `import{Xkt as w}from"./mock-api-client.js";export function n(){return w.safePost(\`/aip/connectors/links/oauth/callback\`,{requestBody:{}})}`,
+  "/mock-api-client.js": `export const Xkt={async safePost(path,options){const response=await fetch(path,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(options.requestBody)});if(!response.ok)throw new Error("callback "+response.status);return response.json()}};`,
+};
+
 const server = createServer(async (request, response) => {
-  if (request.method === "POST" && request.url === "/mock-callback") {
+  if (request.method === "POST" && request.url === "/aip/connectors/links/oauth/callback") {
     let body = "";
     for await (const chunk of request) body += chunk;
     receivedBody = JSON.parse(body);
+    const redirectUrl = String(receivedBody.full_redirect_url ?? "");
+    let payload = { post_auth_url: "/success" };
+    if (redirectUrl.includes("dummy-work-state")) {
+      payload = {
+        post_auth_url: "/plugins",
+        link: { connector_id: "asdk_app_testplugin" },
+      };
+    } else if (redirectUrl.includes("dummy-saved-state")) {
+      payload = {
+        post_auth_url: "/plugins",
+        link: { connector_id: "asdk_app_other" },
+      };
+    }
     response.writeHead(200, { "Content-Type": "application/json" });
-    response.end(JSON.stringify({ post_auth_url: "/success" }));
+    response.end(JSON.stringify(payload));
+    return;
+  }
+
+  if (assets[request.url]) {
+    response.writeHead(200, { "Content-Type": "text/javascript; charset=utf-8" });
+    response.end(assets[request.url]);
     return;
   }
 
@@ -38,6 +63,7 @@ const server = createServer(async (request, response) => {
       [routeId]: {
         id: routeId,
         path: "connector/oauth/:callback_id",
+        module: "/mock-route.js",
         hasLoader: true,
         hasClientLoader: false
       }
@@ -46,20 +72,11 @@ const server = createServer(async (request, response) => {
 
   window.__reactRouterDataRouter = {
     state: { initialized: true },
-    async navigate(destination, options) {
-      const route = window.__reactRouterManifest.routes[routeId];
-      if (route.hasLoader) {
-        throw new Error('No result found for routeId "' + routeId + '"');
+    async navigate(destination) {
+      if (destination.startsWith("/connector/oauth/") || destination === "/connector_platform_oauth_redirect") {
+        return;
       }
-
       history.replaceState(null, "", destination);
-      const apiResponse = await fetch('/mock-callback', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ full_redirect_url: location.href })
-      });
-      const result = await apiResponse.json();
-      location.replace(result.post_auth_url);
     }
   };
 </script>`);
@@ -101,11 +118,12 @@ try {
 
   await waitFor(async () => {
     const result = await cdp.call("Runtime.evaluate", {
-      expression: "location.hash.startsWith('#cs_oauth_callback=') === false",
+      expression:
+        "location.pathname === '/' && location.hash.startsWith('#cs_oauth_callback=') === false",
       returnByValue: true,
     });
     return result.result.value === true;
-  }, 8000, "rescue hash cleared");
+  }, 8000, "rescue opened /plugins");
 
   await waitFor(() => receivedBody !== null, 8000, "callback POST");
   await waitFor(async () => {
@@ -134,9 +152,10 @@ try {
   });
 
   await waitFor(async () => {
+    if (receivedBody !== null) return true;
     const result = await cdp.call("Runtime.evaluate", {
       expression:
-        "location.search.includes('surface=work') === false && location.hash.startsWith('#cs_oauth_callback=') === false",
+        "location.search.includes('surface=work') === false && (location.pathname === '/' || location.pathname === '/success')",
       returnByValue: true,
     });
     return result.result.value === true;
@@ -145,23 +164,48 @@ try {
   await waitFor(() => receivedBody !== null, 8000, "work-surface callback POST");
   await waitFor(async () => {
     const result = await cdp.call("Runtime.evaluate", {
-      expression: "location.pathname === '/success'",
+      expression:
+        "location.pathname === '/plugins/plugin_asdk_app_testplugin' && location.hash === '#settings/Plugins/plugin_asdk_app_testplugin'",
       returnByValue: true,
     });
     return result.result.value === true;
-  }, 8000, "work-surface success redirect");
+  }, 8000, "work-surface plugin settings redirect");
 
   const workExpected = `http://127.0.0.1:${appPort}${workCallback}`;
   if (receivedBody?.full_redirect_url !== workExpected) {
     throw new Error(`Unexpected work-surface callback body: ${JSON.stringify(receivedBody)}`);
   }
 
+  receivedBody = null;
+  await cdp.call("Page.navigate", { url: `http://127.0.0.1:${appPort}/success` });
+  await cdp.call("Runtime.evaluate", {
+    expression: `sessionStorage.clear(); sessionStorage.setItem("chatshare-oauth-callback-rescue-return", "/plugins/plugin_saved#settings/Plugins/plugin_saved")`,
+    returnByValue: true,
+  });
+  const savedCallback = `/connector/oauth/test-id?code=dummy-code&state=dummy-saved-state`;
+  await cdp.call("Page.navigate", {
+    url: `http://127.0.0.1:${appPort}/#cs_oauth_callback=${savedCallback}`,
+  });
+  await waitFor(() => receivedBody !== null, 8000, "saved-return callback POST");
+  await waitFor(async () => {
+    const result = await cdp.call("Runtime.evaluate", {
+      expression:
+        "location.pathname === '/plugins/plugin_saved' && location.hash === '#settings/Plugins/plugin_saved'",
+      returnByValue: true,
+    });
+    return result.result.value === true;
+  }, 8000, "saved plugin settings redirect");
+
   console.log(JSON.stringify({
     passed: true,
     productionErrorPrevented: true,
-    manifestLoaderDisabledBeforeNavigation: true,
+    submittedThroughChatshareClient: true,
     postedFullRedirectUrlMatches: true,
     leftWorkSurfaceBeforeCallback: true,
+    openedConnectorShellBeforeCallback: true,
+    stayedOnPluginsInsteadOfMissingRoute: true,
+    returnedToPluginSettings: true,
+    honoredSavedPluginReturn: true,
     finalPage: state.result.value,
   }, null, 2));
   cdp.close();

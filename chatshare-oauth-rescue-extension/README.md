@@ -24,11 +24,11 @@ After this one-time setup, a valid Chatshare OAuth authorization page obtains a
 one-time proof from `127.0.0.1:7677` and submits automatically. There is no
 password prompt or approval click while DevSpace is running normally.
 
-Version `1.5.0` lands the missing callback on `/` (the settings/connector
-Remix shell). It leaves `/?surface=work` with a full navigation because that
-query boots the chat UI and does not run the connector callback. After
-Chatshare login, a pending callback resumes on `/` instead of staying on
-`/pastel/`.
+Version `1.10.0` stays on the ChatGPT document at `/` and, after the
+callback POST, client-navigates to
+`/plugins/plugin_<id>#settings/Plugins/plugin_<id>`. A full load of that
+path is HTTP 404; the extension must not `location.replace` it. `/#settings`
+is only the generic settings overlay and is not the DevSpace Local page.
 
 ## Security Boundary
 

@@ -5,8 +5,13 @@
   const callbackRouteId = "routes/connector.oauth.$callback_id";
   const rescueStatusKey = "chatshare-oauth-callback-rescue-status";
   const pendingKey = "chatshare-oauth-callback-rescue-pending";
+  const returnKey = "chatshare-oauth-callback-rescue-return";
   const loginPath = "/pastel/#/login";
-  const appShellPath = "/";
+  const documentShellPath = "/";
+  const connectorShellPath = "/plugins";
+  const callbackApiPath = "/aip/connectors/links/oauth/callback";
+
+  rememberPluginReturnUrl();
 
   const callbackUrl = readCallbackUrl();
   if (!callbackUrl) {
@@ -28,17 +33,21 @@
   // Chatshare's ChatGPT shell uses location.hash for #settings. Leaving the
   // rescue fragment in the address bar blocks that router and also prevents
   // the unauthenticated / -> /pastel/ login bounce from presenting #/login.
+  const fullRedirectUrl = callbackUrl.href;
   sessionStorage.setItem(pendingKey, `${callbackUrl.pathname}${callbackUrl.search}`);
 
   // ?surface=work boots the chat UI, not the settings/connector Remix tree.
   // replaceState cannot switch documents, so leave that query with a real load.
-  if (isWorkSurface()) {
-    sessionStorage.setItem(rescueStatusKey, "leaving-work-surface");
-    location.replace(appShellPath);
+  if (isWorkSurface() || isMarketplaceSurface()) {
+    sessionStorage.setItem(
+      rescueStatusKey,
+      isWorkSurface() ? "leaving-work-surface" : "leaving-marketplace",
+    );
+    location.replace(documentShellPath);
     return;
   }
 
-  if (location.hash.startsWith(fragmentPrefix)) {
+  if (location.hash.startsWith(fragmentPrefix) || isMarketplaceSurface()) {
     history.replaceState(null, "", nextShellUrl());
   }
 
@@ -63,7 +72,7 @@
   sessionStorage.setItem(rescueStatusKey, "installing-manifest-patch");
 
   const manifestPatch = installManifestPatch();
-  waitForRouterAndNavigate();
+  waitForAppAndSubmit();
 
   function installManifestPatch() {
     let manifestValue = patchManifest(window.__reactRouterManifest);
@@ -88,20 +97,10 @@
     return {
       isReady() {
         const current = patchManifest(window.__reactRouterManifest ?? manifestValue);
-        return Boolean(
-          assignmentObserved &&
-            current?.routes?.[callbackRouteId] &&
-            current.routes[callbackRouteId].hasLoader === false,
-        );
+        return Boolean(assignmentObserved && current?.routes);
       },
-      release() {
-        const current = patchManifest(window.__reactRouterManifest ?? manifestValue);
-        Object.defineProperty(window, "__reactRouterManifest", {
-          configurable: true,
-          enumerable: true,
-          writable: true,
-          value: current,
-        });
+      manifest() {
+        return patchManifest(window.__reactRouterManifest ?? manifestValue);
       },
     };
   }
@@ -112,19 +111,16 @@
     if (!route || typeof route !== "object") return manifest;
 
     // Chatshare does not serve the callback document or its React Router
-    // Single Fetch `.data` endpoint. The callback component itself consumes no
-    // loader data; it only performs the authenticated callback API call in an
-    // effect. Disabling this one incorrect loader flag prevents React Router
-    // from issuing the broken data request and lets the original component run.
+    // Single Fetch `.data` endpoint. Keep the flag false in case a later
+    // client navigation tries to mount the original route.
     route.hasLoader = false;
     route.hasClientLoader = false;
     sessionStorage.setItem(rescueStatusKey, "manifest-patched");
     return manifest;
   }
 
-  function waitForRouterAndNavigate() {
+  function waitForAppAndSubmit() {
     const deadline = Date.now() + 20000;
-    const destination = `${callbackUrl.pathname}${callbackUrl.search}`;
 
     const timer = window.setInterval(() => {
       const router = window.__reactRouterDataRouter;
@@ -132,18 +128,14 @@
 
       if (manifestPatch.isReady() && routerReady) {
         window.clearInterval(timer);
-        manifestPatch.release();
-        sessionStorage.setItem(rescueStatusKey, "router-navigation-started");
-
-        Promise.resolve(router.navigate(destination, { replace: true }))
-          .then(() => {
-            sessionStorage.setItem(attemptKey, "navigated");
-            sessionStorage.setItem(rescueStatusKey, "router-navigation-complete");
-            sessionStorage.removeItem(pendingKey);
-          })
+        sessionStorage.setItem(rescueStatusKey, "submitting-callback");
+        Promise.resolve()
+          .then(() => openConnectorShell(router))
+          .then(() => submitRescuedCallback(manifestPatch.manifest()))
+          .then((result) => finishWithPostAuth(result))
           .catch((error) => {
             renderFailure(
-              `Chatshare rejected the rescued callback navigation: ${safeErrorMessage(error)}`,
+              `Chatshare rejected the rescued callback: ${safeErrorMessage(error)}`,
             );
           });
         return;
@@ -156,24 +148,296 @@
         return;
       }
 
-      if (isWorkSurface()) {
+      if (isWorkSurface() || isMarketplaceSurface()) {
         window.clearInterval(timer);
-        sessionStorage.setItem(rescueStatusKey, "leaving-work-surface");
-        location.replace(appShellPath);
+        sessionStorage.setItem(
+          rescueStatusKey,
+          isWorkSurface() ? "leaving-work-surface" : "leaving-marketplace",
+        );
+        location.replace(documentShellPath);
         return;
       }
 
       if (Date.now() >= deadline) {
         window.clearInterval(timer);
-        if (location.pathname !== appShellPath || location.search) {
+        if (!isDocumentShell() || location.search) {
           sessionStorage.setItem(rescueStatusKey, "retrying-app-shell");
-          location.replace(appShellPath);
+          location.replace(documentShellPath);
           return;
         }
         sessionStorage.setItem(rescueStatusKey, "redirecting-to-login");
         location.replace(loginPath);
       }
     }, 25);
+  }
+
+  function openConnectorShell(router) {
+    if (isConnectorShell()) return undefined;
+    sessionStorage.setItem(rescueStatusKey, "opening-app-shell");
+    return router.navigate(documentShellPath, { replace: true });
+  }
+
+  async function submitRescuedCallback(manifest) {
+    const client = await resolveChatshareApiClient(manifest);
+    if (!client || typeof client.safePost !== "function") {
+      throw new Error("Chatshare's connector API client is not available on this page.");
+    }
+
+    sessionStorage.setItem(rescueStatusKey, "submitting-callback");
+    const deadline = Date.now() + 15000;
+    let lastError;
+
+    while (Date.now() < deadline) {
+      try {
+        const result = await client.safePost(callbackApiPath, {
+          requestBody: { full_redirect_url: fullRedirectUrl },
+        });
+        if (!result || typeof result !== "object") {
+          throw new Error("Chatshare returned an empty callback response.");
+        }
+        return result;
+      } catch (error) {
+        lastError = error;
+        if (!isMissingAuthError(error)) throw error;
+        await sleep(200);
+      }
+    }
+
+    throw lastError ?? new Error("Chatshare is not authenticated yet.");
+  }
+
+  async function resolveChatshareApiClient(manifest) {
+    const candidateUrls = [];
+    const routeModule = manifest?.routes?.[callbackRouteId]?.module;
+    for (const url of expandAssetCandidates(routeModule)) {
+      candidateUrls.push(url);
+    }
+    for (const url of findLoadedRemixModules()) {
+      if (!candidateUrls.some((existing) => existing.href === url.href)) {
+        candidateUrls.push(url);
+      }
+    }
+
+    for (const moduleUrl of candidateUrls) {
+      const resolved = await resolveClientFromModuleGraph(moduleUrl);
+      if (resolved) return resolved;
+    }
+
+    return undefined;
+  }
+
+  function remixAssetBases() {
+    const bases = [location.origin + "/"];
+    const pattern = /^(https:\/\/[^/]*openoai\.net\/cdn\/assets\/[^/]+\/)/;
+    for (const el of document.querySelectorAll("script[src], link[href]")) {
+      const spec = el.getAttribute("src") || el.getAttribute("href") || "";
+      const match = spec.match(pattern);
+      if (match) bases.push(match[1]);
+    }
+    for (const entry of performance.getEntriesByType("resource")) {
+      const match = String(entry.name).match(pattern);
+      if (match) bases.push(match[1]);
+    }
+    return Array.from(new Set(bases));
+  }
+
+  function expandAssetCandidates(spec) {
+    if (!spec || typeof spec !== "string") return [];
+    const urls = [];
+    const seen = new Set();
+    const add = (url) => {
+      if (!url || seen.has(url.href)) return;
+      seen.add(url.href);
+      urls.push(url);
+    };
+    add(resolveAssetUrl(spec));
+    if (!/^[a-z]+:/i.test(spec)) {
+      for (const base of remixAssetBases()) {
+        add(resolveAssetUrl(spec.replace(/^\.\//, ""), base));
+        add(resolveAssetUrl(spec.split("/").pop(), base));
+      }
+    }
+    return urls;
+  }
+
+  async function resolveClientFromModuleGraph(moduleUrl) {
+    let source;
+    try {
+      source = await fetchText(moduleUrl);
+    } catch {
+      return undefined;
+    }
+
+    if (source.includes(`${callbackApiPath}`) && /\.safePost\(/.test(source)) {
+      const binding = findImportedBinding(source, moduleUrl, findSafePostAlias(source));
+      if (binding) {
+        const apiModule = await import(binding.moduleUrl.href);
+        return apiModule[binding.exportName];
+      }
+    }
+
+    for (const imported of extractImportUrls(source, moduleUrl)) {
+      let importedSource;
+      try {
+        importedSource = await fetchText(imported);
+      } catch {
+        continue;
+      }
+      if (!importedSource.includes(callbackApiPath) || !/\.safePost\(/.test(importedSource)) {
+        continue;
+      }
+      const alias = findSafePostAlias(importedSource);
+      const binding = findImportedBinding(importedSource, imported, alias);
+      if (!binding) continue;
+      const apiModule = await import(binding.moduleUrl.href);
+      return apiModule[binding.exportName];
+    }
+
+    return undefined;
+  }
+
+  function findSafePostAlias(source) {
+    const match = source.match(
+      /([A-Za-z_$][\w$]*)\.safePost\(`\/aip\/connectors\/links\/oauth\/callback`/,
+    );
+    return match?.[1];
+  }
+
+  function extractImportUrls(source, sourceUrl) {
+    const urls = [];
+    const pattern = /from["']([^"']+\.js)["']/g;
+    let match;
+    while ((match = pattern.exec(source)) !== null) {
+      const resolved = resolveAssetUrl(match[1], sourceUrl);
+      if (resolved) urls.push(resolved);
+    }
+    return urls;
+  }
+
+  function findImportedBinding(source, sourceUrl, localAlias) {
+    if (!localAlias) return undefined;
+    const importPattern = /import\{([^}]*)\}from["']([^"']+)["']/g;
+    let match;
+    while ((match = importPattern.exec(source)) !== null) {
+      for (const binding of match[1].split(",")) {
+        const parts = binding.trim().match(/^([A-Za-z_$][\w$]*)\s+as\s+([A-Za-z_$][\w$]*)$/);
+        if (parts && parts[2] === localAlias) {
+          const moduleUrl = resolveAssetUrl(match[2], sourceUrl);
+          if (!moduleUrl) return undefined;
+          return { exportName: parts[1], moduleUrl };
+        }
+      }
+    }
+    return undefined;
+  }
+
+  function findLoadedRemixModules() {
+    const urls = [];
+    for (const el of document.querySelectorAll("script[src], link[rel='modulepreload'][href]")) {
+      const spec = el.getAttribute("src") || el.getAttribute("href");
+      if (!spec || !/connector\.oauth|oauth.*callback/i.test(spec)) continue;
+      const url = resolveAssetUrl(spec);
+      if (url) urls.push(url);
+    }
+    return urls;
+  }
+
+  async function fetchText(url) {
+    const response = await fetch(url.href, { credentials: "omit", cache: "force-cache" });
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    return response.text();
+  }
+
+  function resolveAssetUrl(spec, base = location.href) {
+    if (!spec || typeof spec !== "string") return undefined;
+    try {
+      return new URL(spec, base);
+    } catch {
+      return undefined;
+    }
+  }
+
+  function rememberPluginReturnUrl() {
+    const normalized = pluginClientDestination(`${location.pathname}${location.hash}`);
+    if (normalized) sessionStorage.setItem(returnKey, normalized);
+  }
+
+  function pluginIdFromConnector(connectorId) {
+    if (typeof connectorId !== "string" || !/^[A-Za-z0-9_:-]+$/.test(connectorId)) return undefined;
+    return connectorId.startsWith("plugin_") ? connectorId : `plugin_${connectorId}`;
+  }
+
+  function pluginClientDestination(value) {
+    if (typeof value !== "string" || value.length === 0) return undefined;
+    let parsed;
+    try {
+      parsed = new URL(value, location.origin);
+    } catch {
+      return undefined;
+    }
+    if (parsed.origin !== location.origin) return undefined;
+    const pathMatch = parsed.pathname.match(/^\/plugins\/(plugin_[A-Za-z0-9_]+)/);
+    if (pathMatch) return `/plugins/${pathMatch[1]}#settings/Plugins/${pathMatch[1]}`;
+    const hashMatch = parsed.hash.match(/^#settings\/Plugins\/(plugin_[A-Za-z0-9_]+)/);
+    if (hashMatch) return `/plugins/${hashMatch[1]}#settings/Plugins/${hashMatch[1]}`;
+    return undefined;
+  }
+
+  function resolvePostAuthDestination(result) {
+    const saved = pluginClientDestination(sessionStorage.getItem(returnKey) ?? "");
+    if (saved) return saved;
+
+    const pluginId = pluginIdFromConnector(result?.link?.connector_id);
+    if (pluginId) return `/plugins/${pluginId}#settings/Plugins/${pluginId}`;
+
+    const postAuthUrl = result?.post_auth_url;
+    if (typeof postAuthUrl !== "string" || postAuthUrl.length === 0) {
+      throw new Error("Chatshare did not return a post-auth destination.");
+    }
+    let next;
+    try {
+      next = new URL(postAuthUrl, location.origin);
+    } catch {
+      throw new Error("Chatshare returned an invalid post-auth destination.");
+    }
+    if (next.origin !== location.origin) {
+      throw new Error("Chatshare returned a post-auth destination outside Chatshare.");
+    }
+    return pluginClientDestination(`${next.pathname}${next.search}${next.hash}`)
+      ?? `${next.pathname}${next.search}${next.hash}`;
+  }
+
+  function finishWithPostAuth(result) {
+    const destination = resolvePostAuthDestination(result);
+    sessionStorage.setItem(attemptKey, "navigated");
+    sessionStorage.setItem(rescueStatusKey, "router-navigation-complete");
+    sessionStorage.removeItem(pendingKey);
+    sessionStorage.removeItem(returnKey);
+
+    const pluginDest = pluginClientDestination(destination);
+    const router = window.__reactRouterDataRouter;
+    if (pluginDest && router && typeof router.navigate === "function") {
+      return Promise.resolve(router.navigate(pluginDest, { replace: true })).then(() => {
+        if (!location.pathname.startsWith("/plugins/plugin_")) {
+          history.replaceState(null, "", pluginDest);
+        }
+      });
+    }
+    if (pluginDest) {
+      history.replaceState(null, "", pluginDest);
+      return undefined;
+    }
+    location.replace(destination);
+    return undefined;
+  }
+
+  function isMissingAuthError(error) {
+    const message = safeErrorMessage(error).toLowerCase();
+    return message.includes("no access token") || message.includes("unauthorized") || message.includes("401");
+  }
+
+  function sleep(ms) {
+    return new Promise((resolve) => window.setTimeout(resolve, ms));
   }
 
   function readCallbackUrl() {
@@ -208,9 +472,26 @@
     return new URLSearchParams(location.search).get("surface") === "work";
   }
 
+  function isChatHomeSurface() {
+    if (location.search) return false;
+    return location.pathname === documentShellPath || location.pathname.startsWith("/c/");
+  }
+
+  function isMarketplaceSurface() {
+    return location.pathname === connectorShellPath && !location.pathname.startsWith(`${connectorShellPath}/plugin_`);
+  }
+
+  function isConnectorShell() {
+    return location.pathname === documentShellPath;
+  }
+
+  function isDocumentShell() {
+    return location.pathname === documentShellPath;
+  }
+
   function nextShellUrl() {
     if (isLoginSurface()) return loginPath;
-    return appShellPath;
+    return documentShellPath;
   }
 
   function watchLoginThenResume() {
@@ -230,7 +511,7 @@
       if (location.hash && !location.hash.startsWith("#/login")) {
         window.clearInterval(timer);
         sessionStorage.setItem(rescueStatusKey, "resuming-after-login");
-        location.replace(appShellPath);
+        location.replace(documentShellPath);
       }
     }, 200);
   }

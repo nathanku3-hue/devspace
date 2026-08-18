@@ -816,3 +816,125 @@ sessionStorage.getItem("chatshare-oauth-callback-rescue-status")
 ```
 
 Expected values: `leaving-work-surface` then `router-navigation-complete`, or `redirecting-to-login` then `resuming-after-login` then `router-navigation-complete`.
+
+---
+
+# Chatshare Rescue 1.10.0 Document vs Client-Route Lessons
+
+Date: 2026-08-18
+Client: `https://chatshare.xyz`
+Server: `https://devspace-proxy.kitlongku.workers.dev`
+Live extension: `E:\Code\devspace\chatshare-oauth-rescue-extension` version `1.10.0`
+Classification: Chatshare.xyz compatibility stream. This is not `WEB-CONNECTOR-1`.
+
+No authorization code, state value, access token, refresh token, owner token, or browser credential is recorded in this document.
+
+## Confirmed outcome
+
+Authorize still issued 302s. The rescue intercepted the missing callback before the 404. After several reconnects, `openai-mcp/1.0.0 (ChatGPT)` created authenticated MCP sessions. That is stronger evidence than the address bar.
+
+The remaining break was post-auth UI, not DevSpace custody. The user stayed on `https://chatshare.xyz/` or `https://chatshare.xyz/plugins` instead of the DevSpace Local plugin page. A full load of `/plugins/plugin_<id>` returned HTTP 404 `Not Found`. `/#settings/Plugins/plugin_<id>` briefly appeared, then Chatshare cleared the hash back to `/`.
+
+## Failure chain
+
+### 1. Bare `/` is the ChatGPT chat home, not the connector callback tree
+
+Version `1.5.0` landed the rescued callback on `/`. A logged-in reconnect then stayed on `https://chatshare.xyz/` with title `ChatGPT`. `router.navigate('/connector/oauth/...')` did not mount the callback component. Chatshare never posted `/aip/connectors/links/oauth/callback`.
+
+Lesson: visit count and document title identify the surface. `/` with title `ChatGPT` is the chat home. It is not proof that the connector Remix tree is mounted.
+
+### 2. `/plugins` is the plugin catalog, not the settings shell
+
+Version `1.6.0` moved the same document to `/plugins` before hydration. Chatshare's router then resolved `navigate('/connector/oauth/...')` without changing the path. The rescue stopped with:
+
+```text
+Chatshare stayed on /plugins instead of the connector callback.
+Status: router-navigation-started
+```
+
+Authenticated `/plugins` later loaded as `ChatGPT Plugins | Browse and add plugins to ChatGPT`. That is the marketplace catalog. It is a different document from the ChatGPT app on `/`.
+
+Lesson: `/plugins` is not a reliable connector shell. Unauthenticated `/plugins` is HTTP 404. Authenticated `/plugins` can be the catalog.
+
+### 3. Chatshare no longer client-navigates to the missing callback route
+
+The callback document and its `.data` route are still missing. Chatshare's production callback component only POSTs:
+
+```text
+POST /aip/connectors/links/oauth/callback
+{ "full_redirect_url": <complete callback URL> }
+```
+
+then follows `post_auth_url`. If `router.navigate` will not mount that component, the rescue must call Chatshare's own authenticated API client from the page. The extension must not call DevSpace `/token` or copy credentials.
+
+Version `1.7.0` resolves that client from the Remix module graph (`safePost` on the same singleton Chatshare already loaded) and submits the rescued callback URL.
+
+Lesson: when the original component is unreachable, reuse the host app's API client. Do not reconstruct bearer headers in extension code.
+
+### 4. `post_auth_url` can be `/plugins`
+
+After a successful submit, Chatshare's `post_auth_url` can be the catalog. `location.replace(post_auth_url)` then looks like "OAuth did nothing." MCP can already be live.
+
+Lesson: do not treat `/plugins` after authorize as a failed token exchange. Check `openai-mcp` `/mcp` 200s before recycling the tunnel.
+
+### 5. `/plugins/plugin_<id>` is client-only and 404s as a document
+
+The DevSpace Local page is:
+
+```text
+/plugins/plugin_<id>#settings/Plugins/plugin_<id>
+```
+
+That path only exists after a client navigation inside the ChatGPT app. A new tab, a refresh, or `location.replace` of that URL returns HTTP 404 `Not Found`. Chrome history can still show the URL with title `ChatGPT - DevSpace Local` from an earlier in-app navigation.
+
+Lesson: never `location.replace` a Chatshare path that 404s when fetched without the SPA. Use `router.navigate` on the already-loaded `/` document.
+
+### 6. `/#settings/Plugins/plugin_<id>` is the generic overlay
+
+Version `1.9.0` used `/#settings/Plugins/plugin_<id>` because `/` is a real document. History then showed that hash, immediately followed by `https://chatshare.xyz/` with title `ChatGPT`. Chatshare's hash router accepted the fragment, did not open the DevSpace Local page, and cleared back to `/`.
+
+Lesson: `/#settings` is the generic settings overlay. The plugin page is the client path `/plugins/plugin_<id>`. Those are not interchangeable.
+
+## Version 1.10.0 repair
+
+1. DNR still lands on `/#cs_oauth_callback=...`.
+2. Stay on the ChatGPT document at `/`. Leave `/?surface=work` and the `/plugins` catalog with a real load of `/`.
+3. Do not `router.navigate` to `/connector/oauth/...`.
+4. Resolve Chatshare's API client and POST the rescued callback URL to `/aip/connectors/links/oauth/callback`.
+5. Remember the plugin page the user started from, or build it from `link.connector_id`.
+6. Client-navigate to `/plugins/plugin_<id>#settings/Plugins/plugin_<id>`. Never `location.replace` that path.
+7. Fall back to `history.replaceState` only if the router did not change `location.pathname`.
+
+Verified:
+
+- `test-callback-rescue.mjs` passed, including submit-through-client, work-surface leave, connector-id plugin destination, and saved return URL.
+- `test-device-authorization.mjs` passed.
+- `test-real-routing.mjs` against live Chatshare still ended at `/pastel/#/login` when logged out.
+- `test-production-assets.mjs` still resolved the production `safePost` export.
+- Live authorize 302s and later `openai-mcp` sessions were observed. This close does not claim a new `open_workspace` screenshot.
+
+## Durable procedure additions
+
+1. Classify Chatshare URLs by document vs client route before choosing `location.replace` or `router.navigate`.
+2. Unauthenticated `/` 302s to `/pastel/`. Unauthenticated `/plugins` and `/plugins/plugin_<id>` are 404. Authenticated `/` is the ChatGPT app.
+3. If the tab stays on `/` after authorize, check whether the rescue hash was cleared and whether `/aip/connectors/links/oauth/callback` ran. Do not assume the plugin page will appear from `/#settings`.
+4. If the user pastes `/plugins/plugin_<id>` into the address bar and sees `Not Found`, that is the missing document route. Open `https://chatshare.xyz/`, then Settings → Plugins → DevSpace Local, or `/?surface=work&hints=plugin:<id>`.
+5. Account-level MCP is not a settings-page redirect. Start a new chat from the connected plugin. Do not create another connector.
+6. After a rescue-extension update, Chrome Reload is required before the next Chatshare connect.
+
+## Files
+
+- `chatshare-oauth-rescue-extension/callback-bootstrap.js`
+- `chatshare-oauth-rescue-extension/manifest.json`
+- `chatshare-oauth-rescue-extension/README.md`
+- `chatshare-oauth-rescue-extension/test-callback-rescue.mjs`
+
+## Final status
+
+Chatshare callback rescue as of 2026-08-18 is `1.10.0` at `E:\Code\devspace\chatshare-oauth-rescue-extension`. Diagnose later Chatshare routing changes from:
+
+```javascript
+sessionStorage.getItem("chatshare-oauth-callback-rescue-status")
+```
+
+Expected values: `submitting-callback` then `router-navigation-complete`. A live `openai-mcp` `/mcp` 200 is the protocol close. The plugin settings page only counts if `location.pathname` is `/plugins/plugin_<id>` after a client navigation, not after a document load.
