@@ -938,3 +938,84 @@ sessionStorage.getItem("chatshare-oauth-callback-rescue-status")
 ```
 
 Expected values: `submitting-callback` then `router-navigation-complete`. A live `openai-mcp` `/mcp` 200 is the protocol close. The plugin settings page only counts if `location.pathname` is `/plugins/plugin_<id>` after a client navigation, not after a document load.
+
+---
+
+# Chatshare Rescue 1.11.0 Chrome 142 Loopback Hang Lessons
+
+Date: 2026-08-20
+Client: `https://chatshare.xyz`
+Server: `https://devspace-proxy.kitlongku.workers.dev`
+Live extension: `E:\Code\devspace\chatshare-oauth-rescue-extension` version `1.11.0`
+Classification: Chatshare.xyz compatibility stream. This is not `WEB-CONNECTOR-1`.
+
+No authorization code, state value, access token, refresh token, owner token, or browser credential is recorded in this document.
+
+## Confirmed outcome
+
+The public path was healthy. `/healthz`, the current quick tunnel, and the Worker proxy all returned DevSpace JSON. The device-proof listener was bound on `127.0.0.1:7677`. Chatshare registered a new OAuth client and opened `/authorize` twice. Both visits returned the enrolled-PC HTML form and never POST-submitted it, so DevSpace never issued a 302 and this client stored zero tokens.
+
+The break was Chrome 142 Local Network Access hanging the extension **service worker** fetch to loopback, not a 502/530 custody failure and not Chatshare callback routing.
+
+Version `1.11.0` fetches the one-time proof from the authorize tab, where Chrome can show the local-network prompt, times out instead of spinning on `Checking this enrolled PC…`, and names that permission in the failure text. Operator close is: Chrome **Reload** so the unpacked copy shows `1.11.0`, allow **Local network access** / **Apps on device**, then start a fresh Chatshare Connect on the same connector. This close does not claim a new `open_workspace` screenshot.
+
+## Failure chain
+
+### 1. "No redirect after `/authorize`" means the form never submitted
+
+A Chatshare Connect that stays on `https://devspace-proxy.kitlongku.workers.dev/authorize?...` is still on the DevSpace owner page. That GET is supposed to be a 200 HTML form. The redirect to Chatshare happens only after POST.
+
+Serve logs for this incident showed two Chrome GETs of `/` (OAuth authorize is mounted there) and no matching POST. Chrome history had `Connect DevSpace` and no `#cs_oauth_callback=` or `/connector/oauth/...?code=`. The new client had zero access and zero refresh rows.
+
+Lesson: classify authorize hangs before blaming Chatshare's missing callback route. No POST means no 302, no rescue hash, and no `/token`.
+
+### 2. Device-auth HTML is a dead end without a completed proof
+
+With `DEVSPACE_DEVICE_AUTH=true`, a Chatshare `redirect_uri` gets the enrolled-PC form: status text plus Retry, no owner-password field, no Authorize button. The rescue content script must obtain a loopback proof and `requestSubmit()`. If that never returns, the tab stays on `Checking this enrolled PC…`. `DEVSPACE_DEVICE_AUTH_REQUIRED=false` does not show a password fallback on that form.
+
+Lesson: a healthy signer on `127.0.0.1:7677` is not proof that the browser completed device authorization.
+
+### 3. Chrome 142 blocks loopback from the service worker without a prompt
+
+The unpacked extension was present, with host permission for `http://127.0.0.1:7677/*`. Chrome still had service worker registration `1.9.0` from 2026-08-18; disk was already `1.10.0` because the later reload never happened.
+
+Device proof was fetched only from `device-proof-background.js`. Chrome 142 Local Network Access gates public-to-loopback fetches. Service workers cannot raise that permission prompt; they require a prior grant. The fetch therefore hung, `chrome.runtime.sendMessage` never completed, and the form never left "Checking this enrolled PC…". Site settings had no `local_network_access` grant for the authorize origin or the extension origin.
+
+Lesson: do not fetch `127.0.0.1` only from an MV3 service worker. The authorize document can show Chrome's prompt. A missing Reload after an unpacked update is a separate, concurrent failure.
+
+## Version 1.11.0 repair
+
+1. The authorize content script fetches `http://127.0.0.1:7677/devspace-device-proof` itself, with `targetAddressSpace: "loopback"` then `"local"`.
+2. That fetch is bounded by an 8s timeout so the page cannot spin forever.
+3. The service worker remains a timed fallback and uses the same address-space annotation.
+4. Failure text tells the operator to Allow **Local network access** / **Apps on device** on the extension's Site settings, then Retry.
+5. README records the Chrome 142 permission step.
+
+Verified:
+
+- `test-device-authorization.mjs` passed, including content-script loopback fetch on the happy path.
+- `test-callback-rescue.mjs` passed.
+
+## Durable procedure additions
+
+1. If Chatshare Connect stays on `/authorize` with `Checking this enrolled PC…`, DevSpace has not redirected. Do not recycle the tunnel and do not register another connector.
+2. Confirm `/healthz` and `127.0.0.1:7677`. Then check Chrome: unpacked ID `aaoelopmdnhifffjefciagfmhjanbaoc`, Reload after any extension edit, version on the card, and Local network access / Apps on device = Allow.
+3. After Reload, start a fresh Chatshare Connect, or Retry / refresh the existing authorize tab if Chatshare is still waiting. Do not reuse a spent callback URL.
+4. Close this class of hang on a POST `/` 302 plus a later token row, not on the authorize HTML 200.
+
+## Files
+
+- `chatshare-oauth-rescue-extension/device-authorization.js`
+- `chatshare-oauth-rescue-extension/device-proof-background.js`
+- `chatshare-oauth-rescue-extension/manifest.json`
+- `chatshare-oauth-rescue-extension/README.md`
+- `chatshare-oauth-rescue-extension/test-device-authorization.mjs`
+
+## Final status
+
+Chatshare device-proof auto-submit as of 2026-08-20 is `1.11.0` at `E:\Code\devspace\chatshare-oauth-rescue-extension`. Chrome Reload is required before the next connect. Diagnose later authorize hangs from the on-page status text and from whether serve logs show a POST after the GET. Callback routing is still diagnosed from:
+
+```javascript
+sessionStorage.getItem("chatshare-oauth-callback-rescue-status")
+```
+

@@ -27,7 +27,7 @@ async function createDeviceProof(message, sender) {
     throw new Error("Device proof request is malformed.");
   }
 
-  const response = await fetch(LOOPBACK_PROOF_URL, {
+  const request = {
     method: "POST",
     cache: "no-store",
     credentials: "omit",
@@ -36,7 +36,8 @@ async function createDeviceProof(message, sender) {
       "X-DevSpace-Extension-Id": chrome.runtime.id,
     },
     body: JSON.stringify({ challenge, binding }),
-  });
+  };
+  const response = await fetchWithLocalAddressSpace(LOOPBACK_PROOF_URL, request);
 
   if (!response.ok) {
     throw new Error(`The enrolled-PC signer rejected the request (${response.status}).`);
@@ -50,6 +51,20 @@ async function createDeviceProof(message, sender) {
   }
 
   return { proof, deviceId };
+}
+
+async function fetchWithLocalAddressSpace(url, request) {
+  for (const space of ["loopback", "local"]) {
+    try {
+      return await fetch(url, { ...request, targetAddressSpace: space });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      if (!/targetAddressSpace|address space|Failed to construct 'Request'/i.test(message)) {
+        throw error;
+      }
+    }
+  }
+  return await fetch(url, request);
 }
 
 function safeErrorMessage(error) {

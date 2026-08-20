@@ -81,6 +81,7 @@ async function testBackgroundRelay() {
     fetchCalls[0].options.headers["X-DevSpace-Extension-Id"],
     expectedExtensionId,
   );
+  assert.equal(fetchCalls[0].options.targetAddressSpace, "loopback");
   assert.deepEqual(JSON.parse(fetchCalls[0].options.body), { challenge, binding });
 
   const rejected = await sendBackgroundMessage(messageListener, {
@@ -142,13 +143,19 @@ async function testContentScriptSubmission() {
     },
   };
   const messages = [];
+  const fetchCalls = [];
   const context = {
     HTMLFormElement: MockForm,
     HTMLInputElement: MockInput,
     HTMLButtonElement: MockButton,
+    URL,
     Error,
     String,
+    JSON,
     console,
+    setTimeout,
+    clearTimeout,
+    location: { href: `${expectedDevspaceOrigin}/authorize?client_id=test` },
     document: {
       querySelector(selector) {
         return selector === 'form[data-devspace-device-auth="required"]'
@@ -163,22 +170,35 @@ async function testContentScriptSubmission() {
     },
     chrome: {
       runtime: {
+        id: expectedExtensionId,
         async sendMessage(message) {
           messages.push(message);
-          return { ok: true, proof, deviceId: "device-test" };
+          throw new Error("service worker should not be required on the happy path");
         },
       },
+    },
+    async fetch(url, options) {
+      fetchCalls.push({ url, options });
+      return {
+        ok: true,
+        status: 200,
+        async json() {
+          return { proof, deviceId: "device-test" };
+        },
+      };
     },
   };
   vm.runInNewContext(source, context, { filename: "device-authorization.js" });
   await waitFor(() => form.submissions === 1, "device authorization submission");
 
-  assert.equal(messages.length, 1);
-  assert.deepEqual({ ...messages[0] }, {
-    type: "devspace-device-proof",
-    challenge: "C".repeat(43),
-    binding: "B".repeat(43),
-  });
+  assert.equal(messages.length, 0);
+  assert.equal(fetchCalls.length, 1);
+  assert.equal(fetchCalls[0].url, expectedLoopbackUrl);
+  assert.equal(fetchCalls[0].options.targetAddressSpace, "loopback");
+  assert.equal(
+    fetchCalls[0].options.headers["X-DevSpace-Extension-Id"],
+    expectedExtensionId,
+  );
   assert.equal(inputs.device_proof.value, proof);
   assert.equal(form.dataset.devspaceDeviceAuthState, "submitting");
   assert.match(status.textContent, /verified/i);
