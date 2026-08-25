@@ -1019,3 +1019,73 @@ Chatshare device-proof auto-submit as of 2026-08-20 is `1.11.0` at `E:\Code\devs
 sessionStorage.getItem("chatshare-oauth-callback-rescue-status")
 ```
 
+---
+
+# Chatshare 1.11.0 Operator Close: Stale Service Worker and Plugin Actions Lessons
+
+Date: 2026-08-25
+Client: `https://chatshare.xyz`
+Server: `https://devspace-proxy.kitlongku.workers.dev`
+Live extension: `E:\Code\devspace\chatshare-oauth-rescue-extension` version `1.11.0`
+Classification: Chatshare.xyz compatibility stream. This is not `WEB-CONNECTOR-1`.
+
+No authorization code, state value, access token, refresh token, owner token, device proof, or browser credential is recorded in this document.
+
+## Confirmed outcome
+
+The 2026-08-20 1.11.0 procedure closed on a live Chatshare Connect. Chrome Reload unstuck `/authorize`. DevSpace issued a POST `/` 302, persisted a device-bound token pair, and accepted `openai-mcp/1.0.0 (ChatGPT)` sessions. The connected `DevSpace Local` plugin page still showed no user-callable open-folder action. A new chat from that plugin then opened `E:\code\quant` as a checkout workspace. User-confirmed close. This close does not attach a new screenshot.
+
+## Failure chain
+
+### 1. "No redirect after `/authorize`" was again a missing POST
+
+Chatshare opened:
+
+```text
+https://devspace-proxy.kitlongku.workers.dev/authorize?...
+```
+
+GET returned the enrolled-PC HTML form (`Connect DevSpace`, `data-devspace-device-auth="required"`). The Worker forwards that public path to origin `/`, so serve logs show GET `/` 200, not GET `/authorize`. The `chatgpt.com` → `chatshare.xyz` redirect alias accepted the callback host. `/healthz` and `127.0.0.1:7677` were healthy.
+
+The new client stored zero tokens until a Chrome POST existed. Two Chatshare GETs of the form produced no POST and no 302. This is the same class as 2026-08-20: classify the hang before blaming Chatshare's missing callback route.
+
+Lesson: an authorize HTML 200 is not a redirect. Close this gate on POST `/` 302 plus a token row.
+
+### 2. Disk `1.11.0` with service worker `1.9.0` is still the 2026-08-20 hang
+
+The unpacked extension path and ID were already correct. Disk manifest was `1.11.0`. Chrome 142 Local Network Access for `devspace-proxy.kitlongku.workers.dev` was already Allow. Chrome's service worker registration was still `1.9.0`.
+
+1.9.0 proves the PC only from the MV3 service worker. That fetch can hang even when the page origin already has Local Network Access. The tab stays on `Checking this enrolled PC…` and never `requestSubmit()`. Reloading the unpacked copy so the card and the service worker both show `1.11.0` unblocked the POST.
+
+Lesson: do not trust the folder on disk or an Allow grant alone. Confirm Chrome Reload and `service_worker_registration_info.version`. Do not recycle the tunnel or register another connector.
+
+### 3. A connected plugin with no open-folder action is not a missing MCP tool
+
+After the 302 and token exchange, ChatGPT created authenticated `/mcp` sessions. DevSpace never received `open_workspace` while the operator stayed on the plugin page.
+
+`open_workspace` is registered with ChatGPT Apps widget metadata `visibility: ["model"]`. The Apps SDK documents that as visible to the model and not callable by the UI. Default visibility is `["model", "app"]`. The plugin card therefore exposes no Open folder / Open project action. The model-facing tool still exists.
+
+This is distinct from the 2026-08-16 class, where an old Chatshare conversation reported the plugin as not installed. Account-level MCP health still does not attach tools to an old thread.
+
+Lesson: do not add a connector, and do not look for a folder picker on the plugin page. Start a new chat from the connected plugin and give an allowed absolute path. Close on a `workspace_sessions` row (this incident: `E:\code\quant` checkout), not on the plugin actions list.
+
+## Durable procedure additions
+
+1. Authorize hang: `/healthz`, `127.0.0.1:7677`, extension ID `aaoelopmdnhifffjefciagfmhjanbaoc`, card version `1.11.0`, service worker version `1.11.0`, Local network access / Apps on device = Allow, then Retry or a fresh Connect on the same connector.
+2. Plugin page empty of open-folder actions: expected while `open_workspace` is model-only. Open a new chat from that plugin and ask it to open a path under the allowed roots.
+3. Do not treat launcher stdout as the only `open_workspace` proof. This serve log recorded MCP initialize without `tool_call` lines; the workspace store still gained an active checkout session.
+
+## Files
+
+- `chatshare-oauth-rescue-extension/manifest.json`
+- `src/server.ts` (`OPEN_WORKSPACE_TOOL_ANNOTATIONS` and `_meta.ui.visibility`)
+- `lessons.md`
+
+## Final status
+
+Chatshare device-proof auto-submit remains `1.11.0` at `E:\Code\devspace\chatshare-oauth-rescue-extension`. The 2026-08-25 operator close is: Reload until the service worker is `1.11.0`, complete authorize POST, then open a folder from a new connected-plugin chat. Diagnose later authorize hangs from on-page status plus GET vs POST. Diagnose later empty plugin actions from `visibility: ["model"]` plus whether a new chat actually called `open_workspace`. Callback routing is still diagnosed from:
+
+```javascript
+sessionStorage.getItem("chatshare-oauth-callback-rescue-status")
+```
+
