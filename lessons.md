@@ -1089,3 +1089,62 @@ Chatshare device-proof auto-submit remains `1.11.0` at `E:\Code\devspace\chatsha
 sessionStorage.getItem("chatshare-oauth-callback-rescue-status")
 ```
 
+---
+
+# Chatshare 2026-08-26 Unloaded Extension Close
+
+Date: 2026-08-26
+Client: `https://chatshare.xyz`
+Server: `https://devspace-proxy.kitlongku.workers.dev`
+Live extension: `E:\Code\devspace\chatshare-oauth-rescue-extension` version `1.11.0`
+Classification: Chatshare.xyz compatibility stream. This is not `WEB-CONNECTOR-1`.
+
+No authorization code, state value, access token, refresh token, owner token, device proof, or browser credential is recorded in this document.
+
+## Confirmed outcome
+
+User-confirmed close. A Chatshare Connect showed:
+
+```text
+OAuth callback rescue stopped
+Chatshare rejected the rescued callback: We couldn't connect your account. Please try again.
+Status: submitting-callback
+```
+
+The unpacked rescue extension was not loaded. Chrome Reload of `Chatshare OAuth Callback Rescue` (`aaoelopmdnhifffjefciagfmhjanbaoc`, `1.11.0`) unblocked a fresh Connect on the same connector. This is the same class as the 2026-08-20 / 2026-08-25 stale service-worker hangs, not a new Chatshare callback-API class. This close does not attach a new `open_workspace` screenshot.
+
+## Failure chain
+
+### 1. Confirm the extension is loaded before classifying Chatshare's error text
+
+Authorize still issued a POST `/` 302. Token exchange returned 200. Chatshare's API then returned `We couldn't connect your account. Please try again.`, and the rescue page stayed on `submitting-callback`.
+
+That page only exists if some copy of the content script ran. It does not prove the unpacked `1.11.0` service worker and DNR ruleset were the ones Chrome was actually using. The operator close was: the extension was not loaded; Reload; Connect succeeded.
+
+Lesson: before blaming Chatshare's callback API, discovery 404s, or the tunnel, open `chrome://extensions`, confirm unpacked ID `aaoelopmdnhifffjefciagfmhjanbaoc`, card version `1.11.0`, enabled, and Reload so the service worker is running. Do not register another connector.
+
+### 2. Chatshare now probes OIDC discovery; keep the alias, do not treat it as this close
+
+During the failed attempts, Chatshare's Python client requested `/.well-known/openid-configuration` and DevSpace returned 404. That path had not appeared in this serve log before. DevSpace already served RFC 8414 `/.well-known/oauth-authorization-server`.
+
+`createOAuthMetadata` is now also served at `/.well-known/openid-configuration`. Local origin, the Worker proxy, and the current trycloudflare host return 200 JSON. Setup discovery checks include that path.
+
+Lesson: keep the alias. Do not invent `userinfo` or `jwks` unless a later Chatshare request proves they are required. Do not close this incident on that 404; the operator close was the extension Reload.
+
+## Durable procedure additions
+
+1. Rescue page `Chatshare rejected the rescued callback` with status `submitting-callback`: first confirm the unpacked extension is loaded and Reloaded. Then check authorize POST 302, token 200, and `/.well-known/openid-configuration`.
+2. Do not create another connector. Start a fresh Connect on the same plugin after Reload. Spent authorization codes cannot be reused.
+
+## Files
+
+- `src/server.ts`
+- `src/oauth-discovery.test.ts`
+- `docs/configuration.md`
+- `scripts/setup-devspace.ps1`
+- `lessons.md`
+
+## Final status
+
+Closed 2026-08-26. Chatshare callback rescue remains extension `1.11.0`. Operator close: Reload the unpacked extension, then a fresh Connect on the same connector succeeded. DevSpace also aliases OIDC discovery to OAuth authorization-server metadata. Diagnose later copies of this page from whether the extension is loaded, then from OpenID discovery GET status plus whether token ran.
+

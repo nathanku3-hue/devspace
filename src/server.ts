@@ -4,7 +4,7 @@ import { access, realpath } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { createMcpExpressApp } from "@modelcontextprotocol/sdk/server/express.js";
-import { mcpAuthRouter, getOAuthProtectedResourceMetadataUrl } from "@modelcontextprotocol/sdk/server/auth/router.js";
+import { mcpAuthRouter, createOAuthMetadata, getOAuthProtectedResourceMetadataUrl } from "@modelcontextprotocol/sdk/server/auth/router.js";
 import { requireBearerAuth } from "@modelcontextprotocol/sdk/server/auth/middleware/bearerAuth.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { isInitializeRequest } from "@modelcontextprotocol/sdk/types.js";
@@ -1410,7 +1410,7 @@ export function createMcpServer(
     {
       title: "Publish Git changes",
       description:
-        "Stage exactly the listed files, reject unrelated staged files, run Git whitespace checks, create a normal commit, and optionally push the checked-out branch without force. Use only when the user explicitly requests a commit or push. Pass workingDirectory relative to the opened workspace root; do not construct absolute Windows or /mnt paths and do not run cd commands.",
+        "Commit exactly the listed files from a private index, leaving any unrelated already-staged files untouched. Do not unstage or reset another slice's index. Run Git whitespace checks, create a normal commit, and optionally push the checked-out branch without force. Use only when the user explicitly requests a commit or push. Pass workingDirectory relative to the opened workspace root; do not construct absolute Windows or /mnt paths and do not run cd commands.",
       inputSchema: {
         workspaceId: z
           .string()
@@ -1739,16 +1739,31 @@ export function createServer(config = loadConfig()): RunningServer {
     next();
   });
 
+  const issuerUrl = new URL(config.publicBaseUrl);
+  const oauthMetadata = createOAuthMetadata({
+    provider: oauthProvider,
+    issuerUrl,
+    baseUrl: issuerUrl,
+    scopesSupported: config.oauth.scopes,
+  });
   app.use(
     mcpAuthRouter({
       provider: oauthProvider,
-      issuerUrl: new URL(config.publicBaseUrl),
-      baseUrl: new URL(config.publicBaseUrl),
+      issuerUrl,
+      baseUrl: issuerUrl,
       resourceServerUrl,
       scopesSupported: config.oauth.scopes,
       resourceName: "DevSpace",
     }),
   );
+  // Chatshare's connector backend probes OIDC discovery after /token.
+  // MCP already serves RFC 8414 metadata; alias it so a 404 is not treated as
+  // "we couldn't connect your account."
+  app.get("/.well-known/openid-configuration", (_req, res) => {
+    res.setHeader("Cache-Control", "no-store");
+    res.setHeader("Access-Control-Allow-Origin", "*");
+    res.json(oauthMetadata);
+  });
 
   app.options("/mcp-app-assets/{*asset}", (_req, res) => {
     setAssetHeaders(res);

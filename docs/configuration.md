@@ -78,6 +78,7 @@ MCP clients discover metadata from:
 ```text
 /.well-known/oauth-protected-resource/mcp
 /.well-known/oauth-authorization-server
+/.well-known/openid-configuration
 ```
 
 ## Tool Modes

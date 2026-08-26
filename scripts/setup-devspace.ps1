@@ -1310,6 +1310,7 @@ Write-Host "----------------------------"
 $endpoints = @(
     "/.well-known/oauth-protected-resource/mcp"
     "/.well-known/oauth-authorization-server"
+    "/.well-known/openid-configuration"
 )
 $discoveryFailed = $false
 foreach ($ep in $endpoints) {
