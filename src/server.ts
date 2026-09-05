@@ -3,7 +3,7 @@ import { readFileSync } from "node:fs";
 import { access, realpath } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { createMcpExpressApp } from "@modelcontextprotocol/sdk/server/express.js";
+
 import { mcpAuthRouter, createOAuthMetadata, getOAuthProtectedResourceMetadataUrl } from "@modelcontextprotocol/sdk/server/auth/router.js";
 import { requireBearerAuth } from "@modelcontextprotocol/sdk/server/auth/middleware/bearerAuth.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
@@ -17,7 +17,7 @@ import {
 import express from "express";
 import type { Request, Response } from "express";
 import * as z from "zod/v4";
-import { loadConfig, type ServerConfig, type WidgetMode } from "./config.js";
+import { isAllowedHostHeader, loadConfig, type ServerConfig, type WidgetMode } from "./config.js";
 import {
   logEvent,
   requestIp,
@@ -98,7 +98,7 @@ const SHELL_TOOL_ANNOTATIONS = {
 };
 
 interface RunningServer {
-  app: ReturnType<typeof createMcpExpressApp>;
+  app: express.Express;
   config: ServerConfig;
   close(): Promise<void>;
 }
@@ -1690,14 +1690,37 @@ export function createMcpServer(
   return server;
 }
 
+function devspaceHostHeaderValidation(allowedHosts: string[]) {
+  return (req: Request, res: Response, next: () => void) => {
+    const hostHeader = req.headers.host;
+    if (!hostHeader) {
+      res.status(403).json({
+        jsonrpc: "2.0",
+        error: { code: -32000, message: "Missing Host header" },
+        id: null,
+      });
+      return;
+    }
+    if (!isAllowedHostHeader(hostHeader, allowedHosts)) {
+      const hostname = hostHeader.split(":")[0] ?? hostHeader;
+      res.status(403).json({
+        jsonrpc: "2.0",
+        error: { code: -32000, message: `Invalid Host: ${hostname}` },
+        id: null,
+      });
+      return;
+    }
+    next();
+  };
+}
+
 export function createServer(config = loadConfig()): RunningServer {
-  const allowedHosts = config.allowedHosts.includes("*")
-    ? undefined
-    : Array.from(new Set([config.host, ...config.allowedHosts]));
-  const app = createMcpExpressApp({
-    host: config.host,
-    ...(allowedHosts ? { allowedHosts } : {}),
-  });
+  const app = express();
+  app.use(express.json());
+  if (!config.allowedHosts.includes("*")) {
+    const allowedHosts = Array.from(new Set([config.host, ...config.allowedHosts]));
+    app.use(devspaceHostHeaderValidation(allowedHosts));
+  }
   const transports = new Map<string, Transport>();
   const mcpUrl = new URL("/mcp", config.publicBaseUrl);
   const resourceServerUrl = resourceUrlFromServerUrl(mcpUrl);

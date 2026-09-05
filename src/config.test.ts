@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { loadConfig } from "./config.js";
+import { isAllowedHostHeader, loadConfig } from "./config.js";
 
 const emptyConfigDir = mkdtempSync(join(tmpdir(), "devspace-empty-config-test-"));
 const baseEnv = {
@@ -209,6 +209,16 @@ assert.deepEqual(
   loadConfig({ ...baseEnv, DEVSPACE_ALLOWED_HOSTS: "*" }).allowedHosts,
   ["*"],
 );
+
+assert.equal(isAllowedHostHeader("devspace-proxy.kitlongku.workers.dev", ["devspace-proxy.kitlongku.workers.dev"]), true);
+assert.equal(
+  isAllowedHostHeader("however-later-lambda-tea.trycloudflare.com", ["*.trycloudflare.com"]),
+  true,
+);
+assert.equal(isAllowedHostHeader("evil.example.com", ["*.trycloudflare.com"]), false);
+assert.equal(isAllowedHostHeader("trycloudflare.com", ["*.trycloudflare.com"]), false);
+assert.equal(isAllowedHostHeader("127.0.0.1:7676", ["127.0.0.1", "localhost"]), true);
+assert.equal(isAllowedHostHeader(undefined, ["127.0.0.1"]), false);
 
 const configDir = mkdtempSync(join(tmpdir(), "devspace-config-test-"));
 writeFileSync(

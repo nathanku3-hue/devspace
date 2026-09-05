@@ -1,22 +1,42 @@
 [CmdletBinding()]
 param(
-    [string]$RepositoryRoot = (Split-Path -Parent $PSScriptRoot)
+    [string]$RepositoryRoot = (Split-Path -Parent $PSScriptRoot),
+    [string]$PreviousDistDirectory = ""
 )
 
 $ErrorActionPreference = "Stop"
+$lifecycleScript = Join-Path $PSScriptRoot "setup-devspace-lifecycle.ps1"
+if (Test-Path -LiteralPath $lifecycleScript -PathType Leaf) {
+    . $lifecycleScript
+}
 $repository = (Resolve-Path $RepositoryRoot).Path
 $packageJson = Join-Path $repository "package.json"
 $cliPath = Join-Path $repository "dist\cli.js"
 $serverPath = Join-Path $repository "dist\server.js"
+$distDirectory = Join-Path $repository "dist"
 
 if (!(Test-Path $packageJson)) {
     Write-Error "DevSpace repository not found at '$repository'."
     exit 1
 }
 
+$snapshotTaken = $false
+if (-not [string]::IsNullOrWhiteSpace($PreviousDistDirectory)) {
+    if (Get-Command Copy-DevSpaceDistSnapshot -ErrorAction SilentlyContinue) {
+        $snapshotTaken = [bool](Copy-DevSpaceDistSnapshot -DistDirectory $distDirectory -SnapshotDirectory $PreviousDistDirectory)
+        if ($snapshotTaken) {
+            Write-Host "Saved previous dist snapshot at '$PreviousDistDirectory'."
+        }
+    }
+}
+
 Write-Host "Building local DevSpace package..."
 & npm.cmd --prefix $repository run build
 if ($LASTEXITCODE -ne 0) {
+    if ($snapshotTaken -and (Get-Command Restore-DevSpaceDistSnapshot -ErrorAction SilentlyContinue)) {
+        [void](Restore-DevSpaceDistSnapshot -DistDirectory $distDirectory -SnapshotDirectory $PreviousDistDirectory)
+        Write-Warning "Restored previous dist snapshot after build failure."
+    }
     Write-Error "DevSpace build failed. The server was not started."
     exit 1
 }

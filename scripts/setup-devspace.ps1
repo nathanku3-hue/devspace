@@ -10,7 +10,11 @@
 param(
     [switch]$Monitor,
     [switch]$Stop,
-    [switch]$LibraryOnly
+    [switch]$LibraryOnly,
+    [switch]$Reregister,
+    [switch]$AllowDirty,
+    [switch]$OverridePreferredSource,
+    [switch]$PinPreferredSource
 )
 
 # Keep the console visible even when launched once from an older hidden startup shortcut.
@@ -45,6 +49,9 @@ $script:devspaceProcess = $null
 $script:setupLogFile = Join-Path $env:TEMP "devspace_setup.log"
 $script:runtimePidFile = Join-Path $env:USERPROFILE ".devspace\runtime.json"
 $script:probeClientFile = Join-Path $env:USERPROFILE ".devspace\setup-probe-client.json"
+$script:setupLockFile = Join-Path $env:USERPROFILE ".devspace\setup.lock"
+$script:setupLockHeld = $false
+$script:previousDistDirectory = $null
 
 $PublicProxyBase = "https://devspace-proxy.kitlongku.workers.dev"
 $LocalHost = "127.0.0.1"
@@ -60,15 +67,18 @@ $AllowedRootsEnv = $AllowedRoots -join ","
 $ExpectedTools = @(
     "bash",
     "close_workspace",
+    "continue_meta_harness",
     "edit",
     "open_workspace",
     "publish_git_changes",
     "read",
     "read_files",
     "safe_rename_file",
+    "web_launch",
     "write"
 )
 . (Join-Path $PSScriptRoot "setup-devspace-support.ps1")
+. (Join-Path $PSScriptRoot "setup-devspace-lifecycle.ps1")
 
 function Write-SetupLog {
     param([string]$Message, [string]$Level = "INFO")
@@ -88,15 +98,22 @@ function Set-DevSpaceStartupShortcut {
     try {
         $startupFolder = Join-Path $env:APPDATA "Microsoft\Windows\Start Menu\Programs\Startup"
         $shortcutPath = Join-Path $startupFolder "DevSpace.lnk"
+        $sourceRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
+        $operatorRoot = Split-Path -Parent $sourceRoot
+        $rootLauncher = Join-Path $operatorRoot "setup_devspace.ps1"
+        if (-not (Test-Path -LiteralPath $rootLauncher -PathType Leaf)) {
+            Write-Warning "Root operator launcher not found at $rootLauncher; leaving startup shortcut unchanged."
+            return
+        }
 
         $WshShell = New-Object -ComObject WScript.Shell
         $Shortcut = $WshShell.CreateShortcut($shortcutPath)
         $Shortcut.TargetPath = "powershell.exe"
-        $Shortcut.Arguments = "-NoProfile -ExecutionPolicy Bypass -File `"$PSCommandPath`""
-        $Shortcut.WorkingDirectory = $PSScriptRoot
+        $Shortcut.Arguments = "-NoProfile -ExecutionPolicy Bypass -File `"$rootLauncher`""
+        $Shortcut.WorkingDirectory = $operatorRoot
         $Shortcut.WindowStyle = 1
         $Shortcut.Save()
-        Write-Host "Visible startup shortcut configured at: $shortcutPath"
+        Write-Host "Visible startup shortcut configured at: $shortcutPath -> $rootLauncher"
     } catch {
         Write-Warning "Failed to configure startup shortcut: $_"
     }
@@ -170,8 +187,13 @@ function Test-LocalDevSpaceHealthy {
     if (-not (Test-PortOpen $LocalHost $LocalPort 200)) {
         return $false
     }
-    $health = Get-HttpBody -url "http://${LocalHost}:${LocalPort}/healthz" -timeoutSec 2
-    return ($health -match 'devspace')
+    $health = Get-HttpBody -url "http://${LocalHost}:${LocalPort}/healthz" -timeoutSec 2 -NoProxy
+    return (Test-DevSpaceHealthzJson $health)
+}
+
+function Test-WorkerDevSpaceHealthy {
+    $health = Get-HttpBody -url "$PublicProxyBase/healthz" -timeoutSec 8 -PreferIpv4
+    return (Test-DevSpaceHealthzJson $health)
 }
 
 function Get-LogTail([string]$path, [int]$lines = 30) {
@@ -559,8 +581,8 @@ function Save-RuntimeState {
         [string]$TunnelUrl,
         [string]$TunnelHost,
         [Parameter(Mandatory = $true)]$GitIdentity,
-        [Parameter(Mandatory = $true)][string[]]$LocalTools,
-        [Parameter(Mandatory = $true)][string[]]$PublicTools
+        [string[]]$LocalTools = @(),
+        [string[]]$PublicTools = @()
     )
     $dir = Split-Path -Parent $script:runtimePidFile
     if (!(Test-Path $dir)) {
@@ -860,7 +882,7 @@ function Test-ProxyUsesTunnel([string]$expectedTunnelHost, [int]$attempts = 8) {
 
     for ($i = 1; $i -le $attempts; $i++) {
         $body = Get-HttpBody -url $probeUrl -timeoutSec 15 -PreferIpv4
-        if (($body -match '"ok"\s*:\s*true' -or $body -match '"name"\s*:\s*"devspace"') -and $body -match 'devspace') {
+        if (Test-DevSpaceHealthzJson $body) {
             Write-Host "Proxy healthz OK (attempt $i): $body"
             return $true
         }
@@ -899,7 +921,7 @@ function Start-DevSpaceServer([string]$devspaceCli, [string]$tunnelHost) {
         port          = $LocalPort
         allowedRoots  = @($AllowedRoots)
         publicBaseUrl = $PublicProxyBase
-        allowedHosts  = @($proxyHost, $tunnelHost, "localhost", "127.0.0.1")
+        allowedHosts  = @($proxyHost, "*.trycloudflare.com", $tunnelHost, "localhost", "127.0.0.1")
     }
     $configJson = $config | ConvertTo-Json -Depth 5
     [System.IO.File]::WriteAllText((Join-Path $configDir "config.json"), $configJson + "`n")
@@ -907,7 +929,7 @@ function Start-DevSpaceServer([string]$devspaceCli, [string]$tunnelHost) {
 
     $env:DEVSPACE_PUBLIC_BASE_URL = $PublicProxyBase
     # No space after commas; parser trims, but keep the value clean.
-    $env:DEVSPACE_ALLOWED_HOSTS = "$proxyHost,$tunnelHost,localhost,127.0.0.1"
+    $env:DEVSPACE_ALLOWED_HOSTS = "$proxyHost,*.trycloudflare.com,$tunnelHost,localhost,127.0.0.1"
     $env:DEVSPACE_ALLOWED_ROOTS = $AllowedRootsEnv
     $env:DEVSPACE_TRUST_PROXY = "true"
     $env:DEVSPACE_OAUTH_ALLOWED_REDIRECT_HOSTS = "chatgpt.com,claude.ai,perplexity.ai,*.perplexity.ai,www.perplexity.com,enterprise.perplexity.com,n.perplexity.com,staging.perplexity.com,chatshare.xyz,*.chatshare.xyz,localhost,127.0.0.1"
@@ -1004,18 +1026,17 @@ function Start-DevSpaceServer([string]$devspaceCli, [string]$tunnelHost) {
             continue
         }
 
-        $health = Get-HttpBody -url "http://${LocalHost}:${LocalPort}/healthz" -timeoutSec 2
-        if ($health -match 'devspace') {
+        $health = Get-HttpBody -url "http://${LocalHost}:${LocalPort}/healthz" -timeoutSec 2 -NoProxy
+        if (Test-DevSpaceHealthzJson $health) {
             # Confirm tunnel host is allowed (this is what cloudflared will send).
-            $withTunnelHost = Get-HttpBody -url "http://${LocalHost}:${LocalPort}/healthz" -timeoutSec 2 -headers @{ Host = $tunnelHost }
+            $withTunnelHost = Get-HttpBody -url "http://${LocalHost}:${LocalPort}/healthz" -timeoutSec 2 -NoProxy -headers @{ Host = $tunnelHost }
             if ($withTunnelHost -match 'Invalid Host') {
                 throw "Local DevSpace is listening but rejects Host '$tunnelHost'. Check DEVSPACE_ALLOWED_HOSTS / config.json."
             }
-            if ($withTunnelHost -match 'devspace' -or $withTunnelHost -eq "" -or $withTunnelHost -match '"ok"') {
+            if (Test-DevSpaceHealthzJson $withTunnelHost) {
                 $ready = $true
                 break
             }
-            # healthz may still return ok JSON under allowed host
             if ($withTunnelHost -notmatch 'Invalid Host') {
                 $ready = $true
                 break
@@ -1045,376 +1066,324 @@ function Stop-TrackedProcesses {
     }
 }
 
-# --- main ---
-if ($LibraryOnly) {
-    return
-}
-
-$exitCode = 0
-
-if ($Stop) {
-    Stop-DevSpaceRuntime
-    exit 0
-}
-
-try {
-Write-SetupLog "==== DevSpace setup starting (log: $script:setupLogFile) ===="
-Set-DevSpaceStartupShortcut
-Stop-DevSpaceRelatedProcesses
-
-# Scan for local or system proxy before starting cloudflared
-$detectedProxy = $null
-try {
-    $systemProxy = [System.Net.WebRequest]::GetSystemWebProxy()
-    $testUri = [System.Uri]$PublicProxyBase
-    $proxyUri = $systemProxy.GetProxy($testUri)
-    if ($proxyUri -and $proxyUri.Host -ne $testUri.Host) {
-        $detectedProxy = $proxyUri.AbsoluteUri
-        Write-Host "Detected system proxy: $detectedProxy"
+function Read-DevSpaceRuntimeState {
+    if (-not (Test-Path -LiteralPath $script:runtimePidFile -PathType Leaf)) {
+        return $null
     }
-} catch {
-    Write-Warning "Failed to query system proxy: $_"
+    try {
+        return Get-Content -LiteralPath $script:runtimePidFile -Raw | ConvertFrom-Json
+    } catch {
+        return $null
+    }
 }
 
-if ($null -eq $detectedProxy) {
-    $commonPorts = @(7890, 7897, 10809, 1080, 10808)
-    foreach ($port in $commonPorts) {
-        if (Test-PortOpen "127.0.0.1" $port) {
-            $detectedProxy = "http://127.0.0.1:$port"
-            Write-Host "Detected open local proxy port: $port"
-            break
+function Test-DevSpaceQuickTunnelAlive {
+    if ($null -ne $script:cloudflaredProcess -and (Test-ManagedProcessAlive $script:cloudflaredProcess)) {
+        return $true
+    }
+    $state = Read-DevSpaceRuntimeState
+    if ($null -ne $state -and $state.cloudflaredPid) {
+        $pidValue = [int]$state.cloudflaredPid
+        $record = Get-CimInstance Win32_Process -Filter "ProcessId=$pidValue" -ErrorAction SilentlyContinue
+        if (
+            $null -ne $record -and
+            [System.StringComparer]::OrdinalIgnoreCase.Equals([string]$record.Name, "cloudflared.exe") -and
+            [string]$record.CommandLine -match "127\.0\.0\.1:$LocalPort"
+        ) {
+            $script:cloudflaredProcess = Get-Process -Id $pidValue -ErrorAction SilentlyContinue
+            return ($null -ne $script:cloudflaredProcess)
         }
     }
-}
-
-if ($null -ne $detectedProxy) {
-    # cloudflared reads these; Worker registration intentionally uses --noproxy.
-    $env:http_proxy = $detectedProxy
-    $env:https_proxy = $detectedProxy
-    $env:HTTP_PROXY = $detectedProxy
-    $env:HTTPS_PROXY = $detectedProxy
-    # Do not force ALL curl through Clash — set-tunnel / health checks use --noproxy.
-    Write-SetupLog "Configured session proxy for cloudflared: $detectedProxy"
-}
-
-$configDir = Join-Path $env:USERPROFILE ".devspace"
-if (!(Test-Path $configDir)) {
-    New-Item -ItemType Directory -Path $configDir -Force | Out-Null
-}
-
-# Ensure PATH includes machine/user entries for cloudflared.
-$currentPaths = $env:Path -split ";"
-$machinePath = [System.Environment]::GetEnvironmentVariable("Path", "Machine")
-$userPath = [System.Environment]::GetEnvironmentVariable("Path", "User")
-$registryPaths = ($machinePath + ";" + $userPath) -split ";"
-$mergedPaths = @()
-foreach ($p in ($currentPaths + $registryPaths)) {
-    $trimmed = if ($null -ne $p) { $p.Trim() } else { "" }
-    if ($trimmed -and $mergedPaths -notcontains $trimmed) {
-        $mergedPaths += $trimmed
+    $cf = Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object {
+        $_.Name -eq "cloudflared.exe" -and $_.CommandLine -match "127\.0\.0\.1:$LocalPort"
+    } | Select-Object -First 1
+    if ($null -ne $cf) {
+        $script:cloudflaredProcess = Get-Process -Id $cf.ProcessId -ErrorAction SilentlyContinue
+        return ($null -ne $script:cloudflaredProcess)
     }
-}
-$env:Path = $mergedPaths -join ";"
-
-$authToken = $env:DEVSPACE_PROXY_AUTH_TOKEN
-if ($null -eq $authToken -and (Test-Path (Join-Path $configDir "proxy_token.txt"))) {
-    $authToken = (Get-Content (Join-Path $configDir "proxy_token.txt") -Raw).Trim()
-}
-if ([string]::IsNullOrWhiteSpace($authToken)) {
-    throw "Proxy authentication token not found. Set DEVSPACE_PROXY_AUTH_TOKEN or place it in '$configDir\proxy_token.txt'."
+    return $false
 }
 
-$devspaceSourceDir = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
-$devspaceCli = Join-Path $devspaceSourceDir "dist\cli.js"
-$prepareLaunchScript = Join-Path $devspaceSourceDir "scripts\prepare-devspace-launch.ps1"
-
-Write-Host "Preparing local DevSpace build..."
-& powershell.exe -NoProfile -ExecutionPolicy Bypass -File $prepareLaunchScript -RepositoryRoot $devspaceSourceDir
-if ($LASTEXITCODE -ne 0) {
-    throw "DevSpace launch preparation failed. The server was not started."
+function Get-CurrentQuickTunnelUrl {
+    $state = Read-DevSpaceRuntimeState
+    if ($null -ne $state -and -not [string]::IsNullOrWhiteSpace([string]$state.tunnelUrl)) {
+        return [string]$state.tunnelUrl
+    }
+    $logFile = if ($script:cloudflaredLogFile) { $script:cloudflaredLogFile } else { Join-Path $env:TEMP "cloudflared_tunnel.log" }
+    if (Test-Path -LiteralPath $logFile) {
+        $logContent = Get-Content -LiteralPath $logFile -Raw -ErrorAction SilentlyContinue
+        $fromLog = Get-DevSpaceQuickTunnelUrlFromLogText $logContent
+        if ($fromLog) {
+            return $fromLog
+        }
+    }
+    return $null
 }
 
-if (!(Test-Path $devspaceCli)) {
-    throw "DevSpace CLI not found at '$devspaceCli'."
+function Stop-DevSpaceCloudflaredOnly {
+    Write-SetupLog "Stopping cloudflared only; leaving the DevSpace origin running."
+    $targets = New-Object 'System.Collections.Generic.HashSet[int]'
+    if ($null -ne $script:cloudflaredProcess) {
+        [void]$targets.Add([int]$script:cloudflaredProcess.Id)
+    }
+    $state = Read-DevSpaceRuntimeState
+    if ($null -ne $state -and $state.cloudflaredPid) {
+        [void]$targets.Add([int]$state.cloudflaredPid)
+    }
+    Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object {
+        $_.Name -eq "cloudflared.exe" -and $_.CommandLine -match "127\.0\.0\.1:$LocalPort"
+    } | ForEach-Object {
+        [void]$targets.Add([int]$_.ProcessId)
+    }
+    foreach ($procId in $targets) {
+        Stop-Process -Id $procId -Force -ErrorAction SilentlyContinue
+        Write-SetupLog "  Stopped cloudflared PID $procId"
+    }
+    $script:cloudflaredProcess = $null
+    Start-Sleep -Seconds 1
 }
 
-# Ensure auth.json exists
-$authFile = Join-Path $configDir "auth.json"
-if (!(Test-Path $authFile)) {
-    Write-Host "Generating auth.json..."
-    $bytes = New-Object Byte[] 32
-    [System.Security.Cryptography.RandomNumberGenerator]::Create().GetBytes($bytes)
-    $token = [System.Convert]::ToBase64String($bytes).Replace('+', '-').Replace('/', '_').Replace('=', '')
-    $auth = @{ ownerToken = $token }
-    [System.IO.File]::WriteAllText($authFile, (($auth | ConvertTo-Json) + "`n"))
-} else {
-    Write-Host "Using existing auth.json configuration."
-}
+function Start-CloudflaredQuickTunnel {
+    $logFile = Join-Path $env:TEMP "cloudflared_tunnel.log"
+    $stdoutFile = Join-Path $env:TEMP "cloudflared_stdout.log"
+    $script:cloudflaredLogFile = $logFile
+    if (Test-Path $logFile) { Remove-Item $logFile -Force -ErrorAction SilentlyContinue }
+    if (Test-Path $stdoutFile) { Remove-Item $stdoutFile -Force -ErrorAction SilentlyContinue }
 
-Start-Process -FilePath "node" -ArgumentList @($devspaceCli, "config", "set", "publicBaseUrl", $PublicProxyBase) -NoNewWindow -Wait | Out-Null
-
-# Start tunnel only after ports are free; DevSpace starts after we know the hostname
-# so the live process allowlist always matches the active quick tunnel.
-$logFile = Join-Path $env:TEMP "cloudflared_tunnel.log"
-$stdoutFile = Join-Path $env:TEMP "cloudflared_stdout.log"
-$script:cloudflaredLogFile = $logFile
-if (Test-Path $logFile) { Remove-Item $logFile -Force -ErrorAction SilentlyContinue }
-if (Test-Path $stdoutFile) { Remove-Item $stdoutFile -Force -ErrorAction SilentlyContinue }
-
-Write-Host "Starting Cloudflare Quick Tunnel..."
-$cloudflaredArgs = @(
-    "tunnel",
-    "--url", "http://${LocalHost}:${LocalPort}",
-    "--protocol", "http2",
-    "--edge-ip-version", "4",
-    "--no-autoupdate",
-    "--loglevel", "info"
-)
-# WMI + cmd redirect: break away from console job AND capture trycloudflare URL from logs.
-$cfExe = (Get-Command cloudflared -ErrorAction Stop).Source
-$cfLauncher = Join-Path $env:TEMP "cloudflared_launch.cmd"
-@(
-    "@echo off"
-    "`"$cfExe`" tunnel --url http://${LocalHost}:${LocalPort} --protocol http2 --edge-ip-version 4 --no-autoupdate --loglevel info >`"$logFile`" 2>&1"
-) | Set-Content -Path $cfLauncher -Encoding ASCII
-$cfCreate = Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{
-    CommandLine      = "cmd.exe /c `"$cfLauncher`""
-    CurrentDirectory = $PSScriptRoot
-}
-if ($cfCreate.ReturnValue -eq 0 -and $cfCreate.ProcessId) {
-    Write-SetupLog "cloudflared launcher PID=$($cfCreate.ProcessId)"
-    # Resolve cloudflared.exe child PID
-    for ($i = 0; $i -lt 20; $i++) {
-        Start-Sleep -Milliseconds 300
-        $cf = Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object {
-            $_.Name -eq "cloudflared.exe" -and $_.CommandLine -match "127\.0\.0\.1:$LocalPort"
-        } | Select-Object -First 1
-        if ($cf) {
-            $script:cloudflaredProcess = Get-Process -Id $cf.ProcessId -ErrorAction SilentlyContinue
-            if ($script:cloudflaredProcess) {
-                Write-SetupLog "cloudflared PID=$($cf.ProcessId)"
-                break
+    Write-Host "Starting Cloudflare Quick Tunnel..."
+    $cloudflaredArgs = @(
+        "tunnel",
+        "--url", "http://${LocalHost}:${LocalPort}",
+        "--protocol", "http2",
+        "--edge-ip-version", "4",
+        "--no-autoupdate",
+        "--loglevel", "info"
+    )
+    $cfExe = (Get-Command cloudflared -ErrorAction Stop).Source
+    $cfLauncher = Join-Path $env:TEMP "cloudflared_launch.cmd"
+    @(
+        "@echo off"
+        "`"$cfExe`" tunnel --url http://${LocalHost}:${LocalPort} --protocol http2 --edge-ip-version 4 --no-autoupdate --loglevel info >`"$logFile`" 2>&1"
+    ) | Set-Content -Path $cfLauncher -Encoding ASCII
+    $cfCreate = Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{
+        CommandLine      = "cmd.exe /c `"$cfLauncher`""
+        CurrentDirectory = $PSScriptRoot
+    }
+    if ($cfCreate.ReturnValue -eq 0 -and $cfCreate.ProcessId) {
+        Write-SetupLog "cloudflared launcher PID=$($cfCreate.ProcessId)"
+        for ($i = 0; $i -lt 20; $i++) {
+            Start-Sleep -Milliseconds 300
+            $cf = Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object {
+                $_.Name -eq "cloudflared.exe" -and $_.CommandLine -match "127\.0\.0\.1:$LocalPort"
+            } | Select-Object -First 1
+            if ($cf) {
+                $script:cloudflaredProcess = Get-Process -Id $cf.ProcessId -ErrorAction SilentlyContinue
+                if ($script:cloudflaredProcess) {
+                    Write-SetupLog "cloudflared PID=$($cf.ProcessId)"
+                    break
+                }
             }
         }
     }
-}
-if ($null -eq $script:cloudflaredProcess) {
-    Write-SetupLog "WMI cloudflared start failed; using Start-Process." "WARN"
-    $script:cloudflaredProcess = Start-Process -FilePath "cloudflared" -ArgumentList $cloudflaredArgs -NoNewWindow -RedirectStandardError $logFile -RedirectStandardOutput $stdoutFile -PassThru
-}
-if ($null -eq $script:cloudflaredProcess) {
-    throw "cloudflared failed to start: no process handle was returned."
-}
-
-$tunnelUrl = $null
-Write-Host "Waiting for tunnel URL..." -NoNewline
-for ($i = 0; $i -lt 30; $i++) {
-    Start-Sleep -Seconds 1
-    Write-Host "." -NoNewline
-    $script:cloudflaredProcess.Refresh()
-    if ($script:cloudflaredProcess.HasExited) {
-        throw "cloudflared exited before publishing a URL. ExitCode=$(Get-SafeExitCode $script:cloudflaredProcess). See $logFile"
+    if ($null -eq $script:cloudflaredProcess) {
+        Write-SetupLog "WMI cloudflared start failed; using Start-Process." "WARN"
+        $script:cloudflaredProcess = Start-Process -FilePath "cloudflared" -ArgumentList $cloudflaredArgs -NoNewWindow -RedirectStandardError $logFile -RedirectStandardOutput $stdoutFile -PassThru
     }
-    if (Test-Path $logFile) {
-        $logContent = Get-Content $logFile -Raw -ErrorAction SilentlyContinue
-        if ($logContent) {
-            # Prefer the LAST trycloudflare URL in the log (avoid stale lines from a previous run if log appends).
-            $matches = [regex]::Matches($logContent, "https://[a-zA-Z0-9\-]+\.trycloudflare\.com")
-            if ($matches.Count -gt 0) {
-                $tunnelUrl = $matches[$matches.Count - 1].Value
+    if ($null -eq $script:cloudflaredProcess) {
+        throw "cloudflared failed to start: no process handle was returned."
+    }
+
+    $tunnelUrl = $null
+    Write-Host "Waiting for tunnel URL..." -NoNewline
+    for ($i = 0; $i -lt 30; $i++) {
+        Start-Sleep -Seconds 1
+        Write-Host "." -NoNewline
+        $script:cloudflaredProcess.Refresh()
+        if ($script:cloudflaredProcess.HasExited) {
+            throw "cloudflared exited before publishing a URL. ExitCode=$(Get-SafeExitCode $script:cloudflaredProcess). See $logFile"
+        }
+        if (Test-Path $logFile) {
+            $logContent = Get-Content $logFile -Raw -ErrorAction SilentlyContinue
+            $tunnelUrl = Get-DevSpaceQuickTunnelUrlFromLogText $logContent
+            if ($tunnelUrl) {
                 Write-Host "`nFound Tunnel URL: $tunnelUrl"
                 break
             }
         }
     }
-}
-
-if ($null -eq $tunnelUrl) {
-    throw "Failed to obtain Cloudflare Tunnel URL. Check Clash/TUN routing or cloudflared logs at $logFile."
-}
-
-$tunnelHost = ([System.Uri]$tunnelUrl).Host
-
-# Register BEFORE starting DevSpace so the first healthy proxy probe can succeed once DevSpace is up.
-Register-TunnelWithProxy -tunnelUrl $tunnelUrl -authToken $authToken -detectedProxy $detectedProxy
-
-# Start DevSpace with allowlist that includes the fresh tunnel host.
-$script:devspaceProcess = Start-DevSpaceServer -devspaceCli $devspaceCli -tunnelHost $tunnelHost
-
-# Re-register after local server is ready (defeats races with other tunnel recyclers).
-Register-TunnelWithProxy -tunnelUrl $tunnelUrl -authToken $authToken -detectedProxy $detectedProxy
-
-# Primary readiness signals on Clash/TUN machines:
-# 1) cloudflared log shows edge registration (does NOT require host DNS for trycloudflare)
-# 2) Worker proxy /healthz returns DevSpace JSON (public path clients actually use)
-# Direct curls to *.trycloudflare.com often DNS-timeout on the host and are optional only.
-Write-Host "Waiting for Cloudflare edge registration (from cloudflared log)..." -NoNewline
-$edgeReady = $false
-for ($i = 0; $i -lt 30; $i++) {
-    Start-Sleep -Seconds 1
-    Write-Host "." -NoNewline
-
-    $script:cloudflaredProcess.Refresh()
-    if ($script:cloudflaredProcess.HasExited) {
-        throw "Cloudflare Tunnel stopped during startup. ExitCode=$(Get-SafeExitCode $script:cloudflaredProcess). See $logFile"
+    if ($null -eq $tunnelUrl) {
+        throw "Failed to obtain Cloudflare Tunnel URL. Check Clash/TUN routing or cloudflared logs at $logFile."
     }
-    $script:devspaceProcess.Refresh()
-    if ($script:devspaceProcess.HasExited) {
-        throw "DevSpace stopped during startup. PID=$($script:devspaceProcess.Id); ExitCode=$(Get-SafeExitCode $script:devspaceProcess)."
+    return $tunnelUrl
+}
+
+function Bind-DevSpaceOriginProcess {
+    $found = Find-DevSpaceServeProcess
+    if ($found) {
+        $script:devspaceProcess = Get-Process -Id $found.ProcessId -ErrorAction SilentlyContinue
     }
+    return ($null -ne $script:devspaceProcess)
+}
 
-    if (Test-CloudflaredEdgeRegistered -logPath $logFile) {
-        $edgeReady = $true
-        Write-Host "`nCloudflare edge: Registered tunnel connection."
-        break
+function Complete-DevSpaceRuntimeRecord {
+    param(
+        [Parameter(Mandatory = $true)][string]$DevSpaceSourceDir,
+        [Parameter(Mandatory = $true)][string]$DevSpaceCli,
+        [Parameter(Mandatory = $true)][string]$TunnelUrl,
+        [Parameter(Mandatory = $true)][string]$TunnelHost,
+        [string[]]$LocalTools = @(),
+        [string[]]$PublicTools = @()
+    )
+
+    Bind-DevSpaceOriginProcess | Out-Null
+    if ($null -eq $script:devspaceProcess) {
+        throw "Cannot write runtime state: DevSpace origin process was not found."
     }
-}
-if (-not $edgeReady) {
-    Write-Warning "`nDid not observe 'Registered tunnel connection' in $logFile yet; continuing with proxy checks."
-}
-
-# Optional direct origin probe (may fail under local DNS even when the tunnel works).
-Write-Host "Optional direct tunnel probe (may DNS-fail under Clash/TUN)..."
-$direct = Get-HttpBody -url "$tunnelUrl/healthz" -timeoutSec 8 -PreferIpv4
-if ($direct -match 'devspace') {
-    Write-Host "Direct tunnel origin healthy: $direct"
-} elseif ($direct -match 'Invalid Host') {
-    throw "Tunnel reaches a DevSpace process that rejects Host '$tunnelHost'. Another process may still own port $LocalPort."
-} else {
-    Write-Warning "Direct trycloudflare probe inconclusive ('$direct'). This is OK if the Worker proxy path works."
-}
-
-# Verify the Worker is not still pointing at a dead/stale trycloudflare host.
-Write-Host "Verifying public Worker proxy path (this is the required check)..."
-if (-not (Test-ProxyUsesTunnel -expectedTunnelHost $tunnelHost -attempts 12)) {
-    Write-Warning "Proxy still unhealthy after first registration; re-registering once more..."
-    Register-TunnelWithProxy -tunnelUrl $tunnelUrl -authToken $authToken -detectedProxy $detectedProxy
-    Start-Sleep -Seconds 2
-    if (-not (Test-ProxyUsesTunnel -expectedTunnelHost $tunnelHost -attempts 12)) {
-        throw @"
-Public MCP proxy health check failed for $PublicProxyBase.
-Expected upstream tunnel host: $tunnelHost
-Local DevSpace was healthy; cloudflared PID=$(if ($script:cloudflaredProcess) { $script:cloudflaredProcess.Id } else { 'n/a' }) still tracked.
-This is a proxy/tunnel coordination failure, NOT process termination.
-Likely causes:
-  - competing process re-registered a different trycloudflare URL
-  - another serve stole port $LocalPort (e.g. chatgpt-push-fs0)
-  - Worker /set-tunnel did not stick
-See cloudflared log: $logFile
-"@
+    if ($null -eq $script:cloudflaredProcess) {
+        [void](Test-DevSpaceQuickTunnelAlive)
     }
+    $gitIdentity = Get-DevSpaceGitIdentity -RepositoryRoot $DevSpaceSourceDir -CliPath $DevSpaceCli -SetupScriptPath $PSCommandPath
+    Write-SetupLog "Runtime source: commit=$($gitIdentity.commit) branch=$($gitIdentity.branch) dirty=$($gitIdentity.dirty) dirtyFingerprint=$($gitIdentity.dirtyFingerprintSha256)"
+    Save-RuntimeState `
+        -DevSpacePid $script:devspaceProcess.Id `
+        -CloudflaredPid $(if ($script:cloudflaredProcess) { $script:cloudflaredProcess.Id } else { 0 }) `
+        -TunnelUrl $TunnelUrl `
+        -TunnelHost $TunnelHost `
+        -GitIdentity $gitIdentity `
+        -LocalTools @($LocalTools) `
+        -PublicTools @($PublicTools)
 }
 
-Write-Host "`nTesting Discovery Endpoints:"
-Write-Host "----------------------------"
-$endpoints = @(
-    "/.well-known/oauth-protected-resource/mcp"
-    "/.well-known/oauth-authorization-server"
-    "/.well-known/openid-configuration"
-)
-$discoveryFailed = $false
-foreach ($ep in $endpoints) {
-    $url = "$PublicProxyBase$ep"
-    Write-Host "Testing: $url"
-    $response = Get-HttpBody -url $url -timeoutSec 15 -PreferIpv4
-    if ([string]::IsNullOrWhiteSpace($response)) {
-        Write-Warning "Empty response from $url"
-        $discoveryFailed = $true
-    } elseif ($response.Trim().StartsWith("<")) {
-        Write-Warning "Failed: Endpoint returned HTML instead of JSON."
-        $titleMatch = [regex]::Match($response, "(?i)<title>(.*?)</title>")
-        if ($titleMatch.Success) {
-            Write-Warning "HTML Page Title: $($titleMatch.Groups[1].Value)"
-        }
-        $stale = [regex]::Match($response, "([a-z0-9-]+\.trycloudflare\.com)")
-        if ($stale.Success -and $stale.Groups[1].Value -ne $tunnelHost) {
-            Write-Warning "Proxy is still using stale tunnel host '$($stale.Groups[1].Value)' (current is '$tunnelHost')."
-        }
-        $discoveryFailed = $true
-    } elseif ($response -match 'Invalid Host') {
-        Write-Warning $response
-        $discoveryFailed = $true
-    } else {
-        Write-Host $response
-        if ($response -match "127\.0\.0\.1|localhost|4750") {
-            Write-Warning "Found residual localhost values in response."
+function Invoke-DevSpaceInventoryAndDiscovery {
+    param(
+        [Parameter(Mandatory = $true)][string]$TunnelHost,
+        [Parameter(Mandatory = $true)][string]$AuthFile,
+        [Parameter(Mandatory = $true)][string]$TunnelUrl
+    )
+
+    Write-Host "`nTesting Discovery Endpoints:"
+    Write-Host "----------------------------"
+    $endpoints = @(
+        "/.well-known/oauth-protected-resource/mcp"
+        "/.well-known/oauth-authorization-server"
+        "/.well-known/openid-configuration"
+    )
+    $discoveryFailed = $false
+    foreach ($ep in $endpoints) {
+        $url = "$PublicProxyBase$ep"
+        Write-Host "Testing: $url"
+        $response = Get-HttpBody -url $url -timeoutSec 15 -PreferIpv4
+        if ([string]::IsNullOrWhiteSpace($response)) {
+            Write-Warning "Empty response from $url"
+            $discoveryFailed = $true
+        } elseif ($response.Trim().StartsWith("<")) {
+            Write-Warning "Failed: Endpoint returned HTML instead of JSON."
+            $discoveryFailed = $true
+        } elseif ($response -match 'Invalid Host') {
+            Write-Warning $response
             $discoveryFailed = $true
         } else {
-            Write-Host "Check OK."
+            Write-Host $response
+            if ($response -match "127\.0\.0\.1|localhost|4750") {
+                Write-Warning "Found residual localhost values in response."
+                $discoveryFailed = $true
+            } else {
+                Write-Host "Check OK."
+            }
+        }
+        Write-Host "----------------------------`n"
+    }
+    if ($discoveryFailed) {
+        throw "Discovery endpoint checks failed while the origin is still running. Active tunnel: $TunnelUrl"
+    }
+
+    Write-Host "Verifying authenticated MCP tool inventories..."
+    $authConfig = Get-Content -LiteralPath $AuthFile -Raw | ConvertFrom-Json
+    $ownerToken = [string]$authConfig.ownerToken
+    if ([string]::IsNullOrWhiteSpace($ownerToken)) {
+        throw "DevSpace auth.json does not contain ownerToken."
+    }
+    $probeAccessToken = New-DevSpaceProbeAccessToken `
+        -LocalBaseUrl "http://${LocalHost}:${LocalPort}" `
+        -ResourceUrl "$PublicProxyBase/mcp" `
+        -OwnerToken $ownerToken
+    $localTools = Invoke-AuthenticatedToolsList `
+        -BaseUrl "http://${LocalHost}:${LocalPort}" `
+        -AccessToken $probeAccessToken
+    $localTools = Assert-ExpectedToolInventory -EndpointLabel "Local" -ExpectedTools $ExpectedTools -ActualTools $localTools
+    $publicTools = Invoke-AuthenticatedToolsList `
+        -BaseUrl $PublicProxyBase `
+        -AccessToken $probeAccessToken
+    $publicTools = Assert-ExpectedToolInventory -EndpointLabel "Public Worker" -ExpectedTools $ExpectedTools -ActualTools $publicTools
+    return [pscustomobject]@{ LocalTools = $localTools; PublicTools = $publicTools }
+}
+
+function Initialize-DevSpaceSessionEnvironment {
+    $detectedProxy = $null
+    try {
+        $systemProxy = [System.Net.WebRequest]::GetSystemWebProxy()
+        $testUri = [System.Uri]$PublicProxyBase
+        $proxyUri = $systemProxy.GetProxy($testUri)
+        if ($proxyUri -and $proxyUri.Host -ne $testUri.Host) {
+            $detectedProxy = $proxyUri.AbsoluteUri
+            Write-Host "Detected system proxy: $detectedProxy"
+        }
+    } catch {
+        Write-Warning "Failed to query system proxy: $_"
+    }
+    if ($null -eq $detectedProxy) {
+        $commonPorts = @(7890, 7897, 10809, 1080, 10808)
+        foreach ($port in $commonPorts) {
+            if (Test-PortOpen "127.0.0.1" $port) {
+                $detectedProxy = "http://127.0.0.1:$port"
+                Write-Host "Detected open local proxy port: $port"
+                break
+            }
         }
     }
-    Write-Host "----------------------------`n"
+    if ($null -ne $detectedProxy) {
+        $env:http_proxy = $detectedProxy
+        $env:https_proxy = $detectedProxy
+        $env:HTTP_PROXY = $detectedProxy
+        $env:HTTPS_PROXY = $detectedProxy
+        Write-SetupLog "Configured session proxy for cloudflared: $detectedProxy"
+    }
+
+    $currentPaths = $env:Path -split ";"
+    $machinePath = [System.Environment]::GetEnvironmentVariable("Path", "Machine")
+    $userPath = [System.Environment]::GetEnvironmentVariable("Path", "User")
+    $registryPaths = ($machinePath + ";" + $userPath) -split ";"
+    $mergedPaths = @()
+    foreach ($p in ($currentPaths + $registryPaths)) {
+        $trimmed = if ($null -ne $p) { $p.Trim() } else { "" }
+        if ($trimmed -and $mergedPaths -notcontains $trimmed) {
+            $mergedPaths += $trimmed
+        }
+    }
+    $env:Path = $mergedPaths -join ";"
+    return $detectedProxy
 }
 
-if ($discoveryFailed) {
-    throw @"
-Discovery endpoint checks failed while processes are still running.
-DevSpace PID=$(if ($script:devspaceProcess) { $script:devspaceProcess.Id } else { 'n/a' })
-cloudflared PID=$(if ($script:cloudflaredProcess) { $script:cloudflaredProcess.Id } else { 'n/a' })
-Active tunnel: $tunnelUrl
-Public proxy: $PublicProxyBase
-This is a proxy/tunnel coordination failure, not a blank process exit.
-"@
-}
+function Finish-DevSpaceBackgroundOrMonitor {
+    param(
+        [Parameter(Mandatory = $true)][string]$TunnelUrl,
+        [Parameter(Mandatory = $true)][string]$DevSpaceCli
+    )
 
-Write-Host "Verifying authenticated MCP tool inventories..."
-$authConfig = Get-Content -LiteralPath $authFile -Raw | ConvertFrom-Json
-$ownerToken = [string]$authConfig.ownerToken
-if ([string]::IsNullOrWhiteSpace($ownerToken)) {
-    throw "DevSpace auth.json does not contain ownerToken."
-}
-$probeAccessToken = New-DevSpaceProbeAccessToken `
-    -LocalBaseUrl "http://${LocalHost}:${LocalPort}" `
-    -ResourceUrl "$PublicProxyBase/mcp" `
-    -OwnerToken $ownerToken
-$localTools = Invoke-AuthenticatedToolsList `
-    -BaseUrl "http://${LocalHost}:${LocalPort}" `
-    -AccessToken $probeAccessToken
-$localTools = Assert-ExpectedToolInventory -EndpointLabel "Local" -ExpectedTools $ExpectedTools -ActualTools $localTools
-$publicTools = Invoke-AuthenticatedToolsList `
-    -BaseUrl $PublicProxyBase `
-    -AccessToken $probeAccessToken
-$publicTools = Assert-ExpectedToolInventory -EndpointLabel "Public Worker" -ExpectedTools $ExpectedTools -ActualTools $publicTools
+    $script:leaveRunning = $true
+    if (-not $Monitor) {
+        Write-Host ""
+        Write-Host "DevSpace is running in the background (this window can close)." -ForegroundColor Green
+        Write-Host "  Public:  $PublicProxyBase"
+        Write-Host "  Tunnel:  $TunnelUrl"
+        Write-Host "  PIDs:    devspace=$(if ($script:devspaceProcess) { $script:devspaceProcess.Id } else { 'n/a' }) cloudflared=$(if ($script:cloudflaredProcess) { $script:cloudflaredProcess.Id } else { 'n/a' })"
+        Write-Host "  State:   $script:runtimePidFile"
+        Write-Host "  Stop:    powershell -ExecutionPolicy Bypass -File `"$PSCommandPath`" -Stop"
+        Write-Host "  Monitor: powershell -ExecutionPolicy Bypass -File `"$PSCommandPath`" -Monitor"
+        Write-SetupLog "Background mode: leaving processes running; exiting launcher."
+        return
+    }
 
-$gitIdentity = Get-DevSpaceGitIdentity -RepositoryRoot $devspaceSourceDir -CliPath $devspaceCli -SetupScriptPath $PSCommandPath
-Write-SetupLog "Runtime source: commit=$($gitIdentity.commit) branch=$($gitIdentity.branch) dirty=$($gitIdentity.dirty) dirtyFingerprint=$($gitIdentity.dirtyFingerprintSha256)"
-Write-SetupLog "Setup finished. Exact connector tools: $($ExpectedTools -join ', ')."
-Write-SetupLog "Public MCP base: $PublicProxyBase"
-Write-SetupLog "Active tunnel host: $tunnelHost"
-Write-SetupLog "DevSpace PID=$($script:devspaceProcess.Id); cloudflared PID=$($script:cloudflaredProcess.Id)"
-Save-RuntimeState `
-    -DevSpacePid $script:devspaceProcess.Id `
-    -CloudflaredPid $script:cloudflaredProcess.Id `
-    -TunnelUrl $tunnelUrl `
-    -TunnelHost $tunnelHost `
-    -GitIdentity $gitIdentity `
-    -LocalTools $localTools `
-    -PublicTools $publicTools
-
-Write-Host ""
-Write-Host "Live MCP endpoint: $($localTools.Count) tools (localhost and public Worker verified)" -ForegroundColor Green
-Write-Host "  Localhost: $($localTools.Count) tools"
-Write-Host "  Public Worker: $($publicTools.Count) tools"
-Write-Warning "ChatGPT action snapshot may require Refresh or republication after tool changes."
-Write-Warning "Existing conversations may retain their previous tool schema; start a new conversation after refreshing the app."
-
-# Default: leave services running in the background and exit cleanly.
-# The previous "steady-state monitor" stayed in the same console job; when the
-# job/console was torn down (or a sibling agent killed cli.js), Node died with
-# ExitCode=null and this script's finally block then killed everything else.
-$script:leaveRunning = $true
-
-if (-not $Monitor) {
-    Write-Host ""
-    Write-Host "DevSpace is running in the background (this window can close)." -ForegroundColor Green
-    Write-Host "  Public:  $PublicProxyBase"
-    Write-Host "  Tunnel:  $tunnelUrl"
-    Write-Host "  PIDs:    devspace=$($script:devspaceProcess.Id) cloudflared=$($script:cloudflaredProcess.Id)"
-    Write-Host "  State:   $script:runtimePidFile"
-    Write-Host "  Stop:    powershell -ExecutionPolicy Bypass -File `"$PSCommandPath`" -Stop"
-    Write-Host "  Monitor: powershell -ExecutionPolicy Bypass -File `"$PSCommandPath`" -Monitor"
-    Write-SetupLog "Background mode: leaving processes running; exiting launcher."
-} else {
     Write-Host "Entering steady-state monitor (-Monitor). Ctrl+C stops services."
     try {
         $null = [Console]::Add_CancelKeyPress({
@@ -1439,7 +1408,6 @@ if (-not $Monitor) {
         $cfAlive = Test-ManagedProcessAlive $script:cloudflaredProcess
         $localOk = Test-LocalDevSpaceHealthy
 
-        # Re-bind process handles if WMI-launched PIDs were recycled
         if (-not $dsAlive -or -not $localOk) {
             $found = Find-DevSpaceServeProcess
             if ($found) {
@@ -1459,14 +1427,238 @@ if (-not $Monitor) {
         }
     }
 }
+
+# --- main ---
+if ($LibraryOnly) {
+    return
+}
+
+$exitCode = 0
+$devspaceSourceDir = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
+$devspaceCli = Join-Path $devspaceSourceDir "dist\cli.js"
+$prepareLaunchScript = Join-Path $devspaceSourceDir "scripts\prepare-devspace-launch.ps1"
+$script:previousDistDirectory = Join-Path $devspaceSourceDir "dist-previous"
+
+function Invoke-DevSpaceWorkerRepair {
+    param(
+        [Parameter(Mandatory = $true)][string]$TunnelUrl,
+        [Parameter(Mandatory = $true)][string]$AuthToken,
+        [string]$DetectedProxy,
+        [Parameter(Mandatory = $true)][string]$TunnelHost
+    )
+
+    Register-TunnelWithProxy -tunnelUrl $TunnelUrl -authToken $AuthToken -detectedProxy $DetectedProxy
+    if (-not (Test-ProxyUsesTunnel -expectedTunnelHost $TunnelHost -attempts 8)) {
+        Write-Warning "Proxy still unhealthy after first registration; re-registering once more..."
+        Register-TunnelWithProxy -tunnelUrl $TunnelUrl -authToken $AuthToken -detectedProxy $DetectedProxy
+        Start-Sleep -Seconds 2
+        if (-not (Test-ProxyUsesTunnel -expectedTunnelHost $TunnelHost -attempts 8)) {
+            throw "Public MCP proxy health check failed for $PublicProxyBase after /set-tunnel. Origin was left running. Expected upstream: $TunnelHost"
+        }
+    }
+}
+
+try {
+Write-SetupLog "==== DevSpace setup starting (log: $script:setupLogFile) ===="
+if (Test-DevSpaceGitWorktreePath $devspaceSourceDir) {
+    throw "Refusing to run production setup from Git worktree '$devspaceSourceDir'. Use E:\Code\devspace\setup_devspace.ps1"
+}
+
+Enter-DevSpaceSetupLock -LockPath $script:setupLockFile | Out-Null
+$script:setupLockHeld = $true
+
+if ($Stop) {
+    $script:intentionalStop = $true
+    Stop-DevSpaceRuntime
+    $script:leaveRunning = $false
+} else {
+
+Set-DevSpaceStartupShortcut
+$configDir = Join-Path $env:USERPROFILE ".devspace"
+if (!(Test-Path $configDir)) {
+    New-Item -ItemType Directory -Path $configDir -Force | Out-Null
+}
+$pinPath = Get-DevSpacePreferredSourcePinPath
+if ($PinPreferredSource) {
+    Save-DevSpacePreferredRuntimeSource -PinPath $pinPath -Repository $devspaceSourceDir
+    Write-SetupLog "Pinned preferred runtime source to $devspaceSourceDir"
+}
+$pin = Assert-DevSpacePreferredRuntimeSource `
+    -ApprovedCheckout $devspaceSourceDir `
+    -PinPath $pinPath `
+    -OverridePreferredSource:$OverridePreferredSource
+
+$detectedProxy = Initialize-DevSpaceSessionEnvironment
+$authToken = $env:DEVSPACE_PROXY_AUTH_TOKEN
+if ($null -eq $authToken -and (Test-Path (Join-Path $configDir "proxy_token.txt"))) {
+    $authToken = (Get-Content (Join-Path $configDir "proxy_token.txt") -Raw).Trim()
+}
+if ([string]::IsNullOrWhiteSpace($authToken)) {
+    throw "Proxy authentication token not found. Set DEVSPACE_PROXY_AUTH_TOKEN or place it in '$configDir\proxy_token.txt'."
+}
+
+$authFile = Join-Path $configDir "auth.json"
+if (!(Test-Path $authFile)) {
+    Write-Host "Generating auth.json..."
+    $bytes = New-Object Byte[] 32
+    [System.Security.Cryptography.RandomNumberGenerator]::Create().GetBytes($bytes)
+    $token = [System.Convert]::ToBase64String($bytes).Replace('+', '-').Replace('/', '_').Replace('=', '')
+    $auth = @{ ownerToken = $token }
+    [System.IO.File]::WriteAllText($authFile, (($auth | ConvertTo-Json) + "`n"))
+} else {
+    Write-Host "Using existing auth.json configuration."
+}
+
+$localOk = Test-LocalDevSpaceHealthy
+$workerOk = Test-WorkerDevSpaceHealthy
+$tunnelAlive = Test-DevSpaceQuickTunnelAlive
+$decision = Get-DevSpaceHealDecision `
+    -LocalHealthy $localOk `
+    -WorkerHealthy $workerOk `
+    -QuickTunnelAlive $tunnelAlive `
+    -ForceReregister:$Reregister
+Write-SetupLog "Heal decision: action=$($decision.Action) preserveNode=$($decision.PreserveNode) preserveDist=$($decision.PreserveActiveDist) preserveTunnelHost=$($decision.PreserveTunnelHostname)"
+
+$preNodePid = $null
+$preDistFingerprint = Get-DevSpaceDistFingerprint -CliPath $devspaceCli
+if ($localOk) {
+    Bind-DevSpaceOriginProcess | Out-Null
+    if ($script:devspaceProcess) {
+        $preNodePid = $script:devspaceProcess.Id
+        Write-SetupLog "Sacred origin bound PID=$preNodePid distFingerprint=$preDistFingerprint"
+    }
+}
+
+$tunnelUrl = $null
+$tunnelHost = $null
+$localTools = @()
+$publicTools = @()
+
+switch ($decision.Action) {
+    "noop" {
+        $tunnelUrl = Get-CurrentQuickTunnelUrl
+        if ([string]::IsNullOrWhiteSpace($tunnelUrl)) {
+            throw "Local origin and Worker are healthy but no current quick-tunnel URL is recorded."
+        }
+        $tunnelHost = ([System.Uri]$tunnelUrl).Host
+        Write-SetupLog "Public path is healthy; skipping recycle, rebuild, and tunnel remint."
+        $state = Read-DevSpaceRuntimeState
+        if ($null -ne $state -and $state.toolInventory) {
+            $localTools = @($state.toolInventory.local)
+            $publicTools = @($state.toolInventory.public)
+        }
+    }
+    "reregister" {
+        $tunnelUrl = Get-CurrentQuickTunnelUrl
+        if ([string]::IsNullOrWhiteSpace($tunnelUrl)) {
+            throw "Quick tunnel is alive but its URL could not be recovered for /set-tunnel."
+        }
+        $tunnelHost = ([System.Uri]$tunnelUrl).Host
+        Invoke-DevSpaceWorkerRepair -TunnelUrl $tunnelUrl -AuthToken $authToken -DetectedProxy $detectedProxy -TunnelHost $tunnelHost
+    }
+    "restart-tunnel" {
+        if (-not $localOk) {
+            throw "Internal error: restart-tunnel requires a healthy origin."
+        }
+        Stop-DevSpaceCloudflaredOnly
+        $tunnelUrl = Start-CloudflaredQuickTunnel
+        $tunnelHost = ([System.Uri]$tunnelUrl).Host
+        Invoke-DevSpaceWorkerRepair -TunnelUrl $tunnelUrl -AuthToken $authToken -DetectedProxy $detectedProxy -TunnelHost $tunnelHost
+    }
+    "staged-recycle" {
+        Assert-DevSpaceSourceCleanForRecycle -Repository $devspaceSourceDir -AllowDirty:$AllowDirty -Pin $pin
+        Write-SetupLog "Local origin is down; stopping leftover processes before staged build."
+        Stop-DevSpaceRelatedProcesses
+        Start-Sleep -Seconds 2
+        Write-Host "Preparing local DevSpace build (staged snapshot, then build)..."
+        & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $prepareLaunchScript -RepositoryRoot $devspaceSourceDir -PreviousDistDirectory $script:previousDistDirectory
+        if ($LASTEXITCODE -ne 0) {
+            throw "DevSpace launch preparation failed. The server was not started."
+        }
+        if (!(Test-Path $devspaceCli)) {
+            throw "DevSpace CLI not found at '$devspaceCli'."
+        }
+        Start-Process -FilePath "node" -ArgumentList @($devspaceCli, "config", "set", "publicBaseUrl", $PublicProxyBase) -NoNewWindow -Wait | Out-Null
+        $tunnelUrl = Start-CloudflaredQuickTunnel
+        $tunnelHost = ([System.Uri]$tunnelUrl).Host
+        Register-TunnelWithProxy -tunnelUrl $tunnelUrl -authToken $authToken -detectedProxy $detectedProxy
+        try {
+            $script:devspaceProcess = Start-DevSpaceServer -devspaceCli $devspaceCli -tunnelHost $tunnelHost
+        } catch {
+            if (Restore-DevSpaceDistSnapshot -DistDirectory (Join-Path $devspaceSourceDir "dist") -SnapshotDirectory $script:previousDistDirectory) {
+                Write-SetupLog "Restored previous dist snapshot after origin start failure." "WARN"
+            }
+            throw
+        }
+        Register-TunnelWithProxy -tunnelUrl $tunnelUrl -authToken $authToken -detectedProxy $detectedProxy
+        Write-Host "Waiting for Cloudflare edge registration (from cloudflared log)..." -NoNewline
+        $edgeReady = $false
+        $logFile = $script:cloudflaredLogFile
+        for ($i = 0; $i -lt 30; $i++) {
+            Start-Sleep -Seconds 1
+            Write-Host "." -NoNewline
+            if (-not (Test-ManagedProcessAlive $script:cloudflaredProcess)) {
+                throw "Cloudflare Tunnel stopped during startup. ExitCode=$(Get-SafeExitCode $script:cloudflaredProcess). See $logFile"
+            }
+            if (-not (Test-ManagedProcessAlive $script:devspaceProcess)) {
+                throw "DevSpace stopped during startup. PID=$($script:devspaceProcess.Id); ExitCode=$(Get-SafeExitCode $script:devspaceProcess)."
+            }
+            if (Test-CloudflaredEdgeRegistered -logPath $logFile) {
+                $edgeReady = $true
+                Write-Host "`nCloudflare edge: Registered tunnel connection."
+                break
+            }
+        }
+        if (-not $edgeReady) {
+            Write-Warning "`nDid not observe 'Registered tunnel connection' in $logFile yet; continuing with proxy checks."
+        }
+        Invoke-DevSpaceWorkerRepair -TunnelUrl $tunnelUrl -AuthToken $authToken -DetectedProxy $detectedProxy -TunnelHost $tunnelHost
+    }
+    default {
+        throw "Unknown heal decision '$($decision.Action)'."
+    }
+}
+
+if ($decision.PreserveNode -and $preNodePid) {
+    Bind-DevSpaceOriginProcess | Out-Null
+    if ($null -eq $script:devspaceProcess -or [int]$script:devspaceProcess.Id -ne [int]$preNodePid) {
+        throw "Heal path was required to preserve Node PID $preNodePid but the origin PID changed."
+    }
+    $postDistFingerprint = Get-DevSpaceDistFingerprint -CliPath $devspaceCli
+    if ($preDistFingerprint -and $postDistFingerprint -and $preDistFingerprint -ne $postDistFingerprint) {
+        throw "Heal path was required to preserve the active dist fingerprint."
+    }
+}
+
+if ($decision.Action -ne "noop" -or @($localTools).Count -eq 0) {
+    $inventory = Invoke-DevSpaceInventoryAndDiscovery -TunnelHost $tunnelHost -AuthFile $authFile -TunnelUrl $tunnelUrl
+    $localTools = @($inventory.LocalTools)
+    $publicTools = @($inventory.PublicTools)
+    Write-SetupLog "Setup finished. Exact connector tools: $($ExpectedTools -join ', ')."
+    Write-Host ""
+    Write-Host "Live MCP endpoint: $($localTools.Count) tools (localhost and public Worker verified)" -ForegroundColor Green
+}
+
+Complete-DevSpaceRuntimeRecord `
+    -DevSpaceSourceDir $devspaceSourceDir `
+    -DevSpaceCli $devspaceCli `
+    -TunnelUrl $tunnelUrl `
+    -TunnelHost $tunnelHost `
+    -LocalTools $localTools `
+    -PublicTools $publicTools
+Write-SetupLog "Public MCP base: $PublicProxyBase"
+Write-SetupLog "Active tunnel host: $tunnelHost"
+Finish-DevSpaceBackgroundOrMonitor -TunnelUrl $tunnelUrl -DevSpaceCli $devspaceCli
+}
 } catch {
     if ($script:intentionalStop) {
         Write-SetupLog "Stopped by user."
         $exitCode = 0
         $script:leaveRunning = $false
     } else {
-        $exitCode = 1
-        $script:leaveRunning = $false
+        $disposition = Get-DevSpaceFailureDisposition -LocalHealthy (Test-LocalDevSpaceHealthy)
+        $exitCode = $disposition.ExitCode
+        $script:leaveRunning = $disposition.LeaveRunning
         Write-Host ""
         Write-Host "========== DEVSPACE SETUP/RUNTIME ERROR ==========" -ForegroundColor Red
         Write-Host $_.Exception.Message -ForegroundColor Red
@@ -1475,6 +1667,9 @@ if (-not $Monitor) {
         }
         Write-Host "==================================================" -ForegroundColor Red
         Write-SetupLog $_.Exception.Message "ERROR"
+        if ($disposition.PreserveOrigin) {
+            Write-SetupLog "Preserving healthy origin after setup failure (sacred origin)." "WARN"
+        }
     }
 } finally {
     if ($script:leaveRunning) {
@@ -1483,6 +1678,10 @@ if (-not $Monitor) {
         Write-Host "`nStopping DevSpace and Cloudflare Tunnel..."
         Stop-TrackedProcesses
         try { Stop-DevSpaceRuntime } catch {}
+    }
+    if ($script:setupLockHeld) {
+        Exit-DevSpaceSetupLock -LockPath $script:setupLockFile
+        $script:setupLockHeld = $false
     }
 }
 

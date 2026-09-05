@@ -1,3 +1,17 @@
+# DevSpace Durable Lessons
+
+## 2026-09-06 — ChatGPT 502 was setup thrash; a healthy origin is sacred
+
+Repeated 502s (Worker probe 530) were public-path outages caused by full setup recycling a live origin. Canonical `scripts/setup-devspace.ps1` used to **stop → `npm run build` (`rmSync dist`) → maybe start**. A failed build after killing Node left the Worker on a dead quick tunnel. Concurrent setups and discovery/inventory teardowns did the same.
+
+**Invariant:** if local `/healthz` is verified JSON `{ok:true,name:"devspace"}`, never stop Node and never mutate live `dist`. Repair a live tunnel with `/set-tunnel` only. A dead quick tunnel may remint a hostname. Extra-check failures preserve the origin. Recycle only when origin is down.
+
+**Operator entrance:** `E:\Code\devspace\setup_devspace.ps1`. Never launch production setup from a Git worktree. Healthy local+Worker `/healthz` makes setup a no-op.
+
+**Fix (closed):** heal ladder, exclusive lock, fail-open, staged `dist-previous` snapshot, JSON healthz, `*.trycloudflare.com` Host allowlist, PowerShell lifecycle tests. Named tunnel remains the structural end state.
+
+---
+
 # Perplexity MCP OAuth Debugging Lessons
 
 Date: 2026-07-16

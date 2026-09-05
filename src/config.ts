@@ -82,6 +82,35 @@ function normalizeAllowedHosts(rawHosts: string[], derivedHosts: string[]): stri
   return Array.from(new Set(hosts.map((host) => host.trim()).filter(Boolean)));
 }
 
+export function hostnameFromHostHeader(hostHeader: string | undefined): string | null {
+  if (!hostHeader) return null;
+  try {
+    return new URL(`http://${hostHeader}`).hostname;
+  } catch {
+    return null;
+  }
+}
+
+export function isAllowedHostHeader(hostHeader: string | undefined, allowedHosts: string[]): boolean {
+  if (allowedHosts.includes("*")) return true;
+  const hostname = hostnameFromHostHeader(hostHeader);
+  if (!hostname) return false;
+  const normalized = hostname.toLowerCase();
+  for (const entry of allowedHosts) {
+    const pattern = entry.trim().toLowerCase();
+    if (!pattern) continue;
+    if (pattern === "*") return true;
+    if (pattern === normalized) return true;
+    if (pattern.startsWith("*.")) {
+      const suffix = pattern.slice(1);
+      if (normalized.length > suffix.length && normalized.endsWith(suffix)) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
 function parseBoolean(value: string | undefined): boolean {
   return ["1", "true", "yes", "on"].includes(value?.toLowerCase() ?? "");
 }
