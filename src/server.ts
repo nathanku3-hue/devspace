@@ -48,10 +48,23 @@ import {
 } from "./read-files.js";
 import { createWorkspaceStore } from "./workspace-store.js";
 import { formatAgentsPath, WorkspaceRegistry } from "./workspaces.js";
+import { globalShellExecutionLimiter } from "./shell-execution-limiter.js";
+import { killTrackedShellProcesses } from "./shell-runtime.js";
 import { WebLaunchBrowserController } from "./web-launch-browser.js";
 import { registerWebLaunchTool } from "./web-launch-tools.js";
+import {
+  defaultMetaHarnessHost,
+  type MetaContinuationReadiness,
+  type MetaEntry,
+  type MetaHarnessHost,
+} from "./meta-harness.js";
 
 type Transport = StreamableHTTPServerTransport;
+
+const MCP_SESSION_IDLE_MS = 30 * 60_000;
+const MAX_MCP_SESSIONS = 64;
+const WORKSPACE_MEMORY_IDLE_MS = 15 * 60_000;
+const REAPER_INTERVAL_MS = 60_000;
 const WORKSPACE_APP_URI = "ui://devspace/workspace-app.html";
 const WORKSPACE_APP_MANIFEST_ENTRY = "workspace-app.html";
 const READ_ONLY_TOOL_ANNOTATIONS = {
@@ -61,6 +74,12 @@ const READ_ONLY_TOOL_ANNOTATIONS = {
   openWorldHint: false,
 };
 const OPEN_WORKSPACE_TOOL_ANNOTATIONS = {
+  readOnlyHint: false,
+  destructiveHint: false,
+  idempotentHint: false,
+  openWorldHint: false,
+};
+const CREATE_WORKTREE_WORKSPACE_TOOL_ANNOTATIONS = {
   readOnlyHint: false,
   destructiveHint: false,
   idempotentHint: false,
@@ -91,6 +110,12 @@ const EDIT_TOOL_ANNOTATIONS = {
   openWorldHint: false,
 };
 const SHELL_TOOL_ANNOTATIONS = {
+  readOnlyHint: false,
+  destructiveHint: true,
+  idempotentHint: false,
+  openWorldHint: true,
+};
+const META_CONTINUE_TOOL_ANNOTATIONS = {
   readOnlyHint: false,
   destructiveHint: true,
   idempotentHint: false,
@@ -174,6 +199,7 @@ function toolWidgetDescriptorMeta(
 
 interface ToolNames {
   openWorkspace: "open_workspace";
+  createWorktreeWorkspace: "create_worktree_workspace";
   closeWorkspace: "close_workspace";
   read: "read_file" | "read";
   readBatch: "read_files";
@@ -201,6 +227,7 @@ function toolNamesFor(config: ServerConfig): ToolNames {
   return config.toolNaming === "short"
     ? {
         openWorkspace: "open_workspace",
+        createWorktreeWorkspace: "create_worktree_workspace",
         closeWorkspace: "close_workspace",
         read: "read",
         readBatch: "read_files",
@@ -213,6 +240,7 @@ function toolNamesFor(config: ServerConfig): ToolNames {
       }
     : {
         openWorkspace: "open_workspace",
+        createWorktreeWorkspace: "create_worktree_workspace",
         closeWorkspace: "close_workspace",
         read: "read_file",
         readBatch: "read_files",
@@ -241,7 +269,7 @@ function serverInstructions(config: ServerConfig, toolNames: ToolNames): string 
       ? " After creating, editing, or overwriting files, call show_changes once after the related file changes are complete so the user can see the aggregate diff."
       : "";
 
-  return `Use DevSpace as a local coding workspace. Call ${toolNames.openWorkspace} once per project folder or worktree to obtain a workspaceId. Reuse that same workspaceId for all later file, search, edit, write, show-changes, shell, and Git publication tools in that folder; do not call ${toolNames.openWorkspace} again unless switching folders/worktrees, changing checkout/worktree mode, the workspaceId is rejected as unknown, or the user explicitly asks to reopen. Close managed worktree sessions with ${toolNames.closeWorkspace}; it refuses dirty worktrees and removes clean worktrees through Git. When the user explicitly requests one fresh ChatGPT Web conversation with a supplied prompt, invoke web_launch; do not infer this trigger from text typed in another composer. WEB-LAUNCH-0 returns only launch acknowledgement and does not capture assistant output or continue the spawned conversation. ${agentsMd}${skills}${inspection}Batch known context reads with ${toolNames.readBatch} to reduce host approval prompts. Prefer ${toolNames.edit} for targeted modifications, ${toolNames.write} only for new files or complete rewrites, and ${toolNames.shell} for tests, builds, Git inspection, package scripts, and commands that are better executed by the shell. When the user explicitly requests a commit or push, use publish_git_changes with the existing workspaceId, a workingDirectory relative to the workspace root, and exact file paths. Do not construct /mnt paths, Windows absolute paths, or shell cd commands for workspace navigation; use the workingDirectory field. Do not use ${toolNames.shell} to edit working-tree contents or mutate the Git index, history, remotes, or branches. Avoid shell redirection, heredocs, tee, sed -i, perl -i, node/python/ruby scripts, generated scripts, or other commands whose purpose is to write project files. Use ${toolNames.edit} or ${toolNames.write} for content changes.${showChanges}`;
+  return `Use DevSpace as a local coding workspace. Call ${toolNames.openWorkspace} once to open an existing project directory or checkout and obtain a workspaceId; it does not create missing folders. Use ${toolNames.createWorktreeWorkspace} only when an isolated managed Git worktree is actually needed. Reuse the returned workspaceId for all later file, search, edit, write, show-changes, shell, and Git publication tools in that folder; do not reopen the same folder unless the workspaceId is rejected as unknown, the user explicitly asks to reopen, or you intentionally switch to a different folder/worktree. For Meta-Harness repositories, use metaStartup as the authoritative startup-loading state. READY means metaStartup.lines is the canonical repo-declared startup projection; do not reconstruct project state from chat history or undeclared legacy context files. BLOCKED means do not invoke continuation or fall back to undeclared context; treat the listed blockers as recoverable repository-context gaps rather than an owner gate. UNDECLARED means Meta-Harness was detected but inspect returned legacy meta-entry/v1 without repo-declared startup context: do not claim startup context is loaded and do not reconstruct it from chat history. INSPECTION_FAILED is a recoverable host diagnostic, not a product stop. When metaContinuation.status=BLOCKED, do not invoke continue_meta_harness and do not synthesize Meta-Harness decision-plane state from DevSpace. A concrete task in the user's current turn is the velocity-first path: use the returned startup context and execute that task directly instead of invoking continuation merely because metaEntry.action=CONTINUE. Opening a workspace is also a complete user action, not implicit resume intent. Invoke continue_meta_harness only when the user explicitly asks to resume/continue retained Meta-Harness work. Automatically invoke it at most once per user turn. If continue_meta_harness returns STOPPED or BLOCKED, or the call errors, do not retry it automatically in the same turn; continue the user's concrete task with scoped tools when possible, otherwise surface the controller result. When metaEntry.action=IDLE, do not invoke continuation. Close managed worktree sessions with ${toolNames.closeWorkspace}; it refuses dirty worktrees and removes clean worktrees through Git. When the user explicitly requests one fresh ChatGPT Web conversation with a supplied prompt, invoke web_launch; do not infer this trigger from text typed in another composer. WEB-LAUNCH-0 returns only launch acknowledgement and does not capture assistant output or continue the spawned conversation. ${agentsMd}${skills}${inspection}Batch known context reads with ${toolNames.readBatch} to reduce host approval prompts. Prefer ${toolNames.edit} for targeted modifications, ${toolNames.write} only for new files or complete rewrites, and ${toolNames.shell} for tests, builds, Git inspection, package scripts, and commands that are better executed by the shell. When the user explicitly requests a commit or push, use publish_git_changes with the existing workspaceId, a workingDirectory relative to the workspace root, and exact file paths. Do not construct /mnt paths, Windows absolute paths, or shell cd commands for workspace navigation; use the workingDirectory field. Do not use ${toolNames.shell} to edit working-tree contents or mutate the Git index, history, remotes, or branches. Avoid shell redirection, heredocs, tee, sed -i, perl -i, node/python/ruby scripts, generated scripts, or other commands whose purpose is to write project files. Use ${toolNames.edit} or ${toolNames.write} for content changes.${showChanges}`;
 }
 function resultOutputSchema(extra: z.ZodRawShape = {}): z.ZodRawShape {
   return {
@@ -268,6 +296,46 @@ const workspaceAgentsFileOutputSchema = z.object({
 const workspaceAvailableAgentsFileOutputSchema = z.object({
   path: z.string(),
 });
+
+const projectStartupSourceOutputSchema = z.object({
+  id: z.string(),
+  path: z.string(),
+  status: z.enum(["present", "fresh", "stale", "missing", "invalid"]),
+  observedAt: z.string().optional(),
+});
+
+const projectStartupContextOutputSchema = z.object({
+  schemaVersion: z.literal("project-startup-context/v1"),
+  status: z.enum(["READY", "BLOCKED"]),
+  lines: z.array(z.string()).max(10),
+  sources: z.array(projectStartupSourceOutputSchema).max(20),
+  blockers: z.array(z.string()).max(10),
+});
+
+const metaStartupOutputSchema = z.object({
+  status: z.enum(["READY", "BLOCKED", "UNDECLARED", "INSPECTION_FAILED"]),
+  lines: z.array(z.string()).max(10),
+  blockers: z.array(z.string()).max(10),
+});
+
+const metaContinuationOutputSchema = z.object({
+  status: z.enum(["READY", "BLOCKED"]),
+  blockers: z.array(z.string()).max(10),
+});
+
+const metaEntryOutputSchema = z.union([
+  z.object({
+    schemaVersion: z.literal("meta-entry/v1"),
+    action: z.enum(["CONTINUE", "IDLE"]),
+    result: z.string().nullable(),
+  }),
+  z.object({
+    schemaVersion: z.literal("meta-entry/v2"),
+    action: z.enum(["CONTINUE", "IDLE"]),
+    result: z.string().nullable(),
+    startupContext: projectStartupContextOutputSchema,
+  }),
+]);
 
 const reviewFileOutputSchema = z.object({
   path: z.string(),
@@ -498,6 +566,7 @@ export function createMcpServer(
   workspaces: WorkspaceRegistry,
   reviewCheckpoints: ReturnType<typeof createReviewCheckpointManager>,
   webLaunchBrowser: Pick<WebLaunchBrowserController, "launchWebConversation">,
+  metaHarness: MetaHarnessHost = defaultMetaHarnessHost,
 ): McpServer {
   const toolNames = toolNamesFor(config);
   const server = new McpServer(
@@ -546,29 +615,252 @@ export function createMcpServer(
 
   registerWebLaunchTool({ server, browser: webLaunchBrowser });
 
+  const workspaceOpenOutputSchema = {
+    workspaceId: z.string(),
+    root: z.string(),
+    mode: z.enum(["checkout", "worktree"]),
+    sourceRoot: z.string().optional(),
+    worktree: z
+      .object({
+        path: z.string(),
+        baseRef: z.string(),
+        baseSha: z.string(),
+        branch: z.string().optional(),
+        dirtySource: z.boolean(),
+        detached: z.boolean(),
+        managed: z.boolean(),
+      })
+      .optional(),
+    agentsFiles: z.array(workspaceAgentsFileOutputSchema),
+    availableAgentsFiles: z.array(workspaceAvailableAgentsFileOutputSchema),
+    skills: z.array(workspaceSkillOutputSchema),
+    skillDiagnostics: z.array(z.unknown()),
+    metaEntry: metaEntryOutputSchema.optional(),
+    metaStartup: metaStartupOutputSchema.optional(),
+    metaContinuation: metaContinuationOutputSchema.optional(),
+    instruction: z.string(),
+  };
+
+  async function openedWorkspaceResponse(
+    toolName: "open_workspace" | "create_worktree_workspace",
+    request: {
+      path: string;
+      mode: "checkout" | "worktree";
+      baseRef?: string;
+      branch?: string;
+      createBranch?: boolean;
+    },
+  ) {
+    const startedAt = performance.now();
+    const { workspace, agentsFiles, availableAgentsFiles } = await workspaces.openWorkspace(request);
+    if (config.widgets === "changes") {
+      void reviewCheckpoints.initializeWorkspace({
+        workspaceId: workspace.id,
+        root: workspace.root,
+      });
+    }
+    const visibleSkills = workspace.skills
+      .filter((skill) => !skill.disableModelInvocation)
+      .map((skill) => ({
+        name: skill.name,
+        description: skill.description,
+        path: formatPathForPrompt(skill.filePath),
+      }));
+    const loadedAgentsFiles = agentsFiles.map((file) => ({
+      path: formatAgentsPath(file.path, workspace.root),
+      content: file.content,
+    }));
+    const availableAgentsFileOutputs = availableAgentsFiles.map((file) => ({
+      path: formatAgentsPath(file.path, workspace.root),
+    }));
+    let metaEntry: MetaEntry | undefined;
+    let metaInspectionFailed = false;
+    if (metaHarness.looksLikeRepository(workspace.root)) {
+      try {
+        metaEntry = await metaHarness.inspectEntry(workspace.root);
+      } catch {
+        metaInspectionFailed = true;
+        metaEntry = {
+          schemaVersion: "meta-entry/v1",
+          action: "IDLE",
+          result: null,
+        };
+      }
+    }
+    const baseInstruction = config.skillsEnabled
+      ? "Use this workspaceId in all subsequent tool calls for this project. Do not open the same folder again unless this workspaceId stops working, the user asks to reopen, or you intentionally switch folders/worktrees. Follow loaded agentsFiles instructions. Use read_files to load multiple known context or instruction files in one approval; use the single-file read tool only when one file is needed. When a task matches an available skill in skills, read its path before proceeding."
+      : "Use this workspaceId in all subsequent tool calls for this project. Do not open the same folder again unless this workspaceId stops working, the user asks to reopen, or you intentionally switch folders/worktrees. Follow loaded agentsFiles instructions. Use read_files to load multiple known context or instruction files in one approval; use the single-file read tool only when one file is needed.";
+    const startupContext = metaEntry?.schemaVersion === "meta-entry/v2"
+      ? metaEntry.startupContext
+      : undefined;
+    const metaStartup = metaInspectionFailed
+      ? {
+          status: "INSPECTION_FAILED" as const,
+          lines: [] as string[],
+          blockers: ["Meta-Harness inspect failed; startup context was not loaded."],
+        }
+      : startupContext
+        ? {
+            status: startupContext.status,
+            lines: [...startupContext.lines],
+            blockers: [...startupContext.blockers],
+          }
+        : metaEntry
+          ? {
+              status: "UNDECLARED" as const,
+              lines: [] as string[],
+              blockers: ["Meta-Harness inspect returned meta-entry/v1 without repo-declared startup context."],
+            }
+          : undefined;
+    let metaContinuation: MetaContinuationReadiness | undefined;
+    if (!metaInspectionFailed
+        && metaEntry?.action === "CONTINUE"
+        && metaStartup?.status !== "BLOCKED") {
+      try {
+        metaContinuation = metaHarness.continuationReadiness?.(workspace.root)
+          ?? Object.freeze({ status: "READY" as const, blockers: Object.freeze([] as string[]) });
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        metaContinuation = Object.freeze({
+          status: "BLOCKED" as const,
+          blockers: Object.freeze([`Meta-Harness continuation readiness check failed: ${message}`]),
+        });
+      }
+    }
+    const startupInstruction = metaStartup?.status === "READY"
+      ? "Meta-Harness repo-declared startup context is READY. Treat metaStartup.lines as the canonical startup projection before normal work; do not reconstruct project state from chat history or undeclared legacy context files."
+      : metaStartup?.status === "BLOCKED"
+        ? `Meta-Harness repo-declared startup context is BLOCKED: ${metaStartup.blockers.join("; ") || "declared startup context is incomplete"}. Treat these as recoverable repository-context gaps, not an owner gate. Do not fall back to chat history or undeclared legacy context files.`
+        : metaStartup?.status === "UNDECLARED"
+          ? "Meta-Harness is detected, but repo-declared startup context is UNDECLARED because inspect returned meta-entry/v1. Do not claim startup context is loaded and do not reconstruct it from chat history or undeclared legacy files. Use continuation only for resume-only intent; a concrete task in the current user turn remains the direct fast path."
+          : null;
+    const metaInstruction = metaStartup?.status === "BLOCKED"
+      ? null
+      : metaContinuation?.status === "BLOCKED"
+        ? `Meta-Harness automatic continuation is BLOCKED: ${metaContinuation.blockers.join("; ")}. Do not invoke continue_meta_harness and do not synthesize or repair Meta-Harness decision-plane files from DevSpace. Treat this as a recoverable controller-state gap rather than an owner gate.`
+        : metaEntry?.action === "CONTINUE" && (metaStartup?.status === "READY" || metaStartup?.status === "UNDECLARED")
+          ? "Meta-Harness reports mechanically continuable product work. Velocity-first rule: execute the current user action directly using the startup projection and scoped tools; opening the workspace alone is not resume intent. Invoke continue_meta_harness once only when the user explicitly asks to resume/continue retained Meta-Harness work. Do not automatically retry a STOPPED, BLOCKED, or errored continuation in the same turn."
+          : metaInspectionFailed
+            ? "Meta-Harness continuation inspection failed. Treat this as a recoverable host diagnostic, not as a product blocker or owner gate. Continue the accepted task through available scoped tools or a fresh supported Meta-Harness route; do not infer internal lifecycle authority."
+            : null;
+    const instruction = [baseInstruction, startupInstruction, metaInstruction].filter(Boolean).join(" ");
+    const startupText = metaStartup
+      ? [
+          `Meta-Harness startup state: ${metaStartup.status}`,
+          ...metaStartup.lines,
+          ...(metaStartup.blockers.length > 0
+            ? [`Startup blockers: ${metaStartup.blockers.join("; ")}`]
+            : []),
+        ].join("\n")
+      : undefined;
+    const continuationText = metaContinuation?.status === "BLOCKED"
+      ? [
+          "Meta-Harness continuation state: BLOCKED",
+          `Continuation blockers: ${metaContinuation.blockers.join("; ")}`,
+        ].join("\n")
+      : undefined;
+    const resultContent: ToolContent[] = [
+      {
+        type: "text" as const,
+        text: [
+          `Opened workspace ${workspace.id}`,
+          `Root: ${workspace.root}`,
+          `Mode: ${workspace.mode}`,
+          loadedAgentsFiles.length > 0
+            ? `Loaded project instructions: ${loadedAgentsFiles.map((file) => file.path).join(", ")}`
+            : undefined,
+          availableAgentsFileOutputs.length > 0
+            ? `Available nested instructions: ${availableAgentsFileOutputs.map((file) => file.path).join(", ")}`
+            : undefined,
+          visibleSkills.length > 0
+            ? `Available skills: ${visibleSkills.map((skill) => skill.name).join(", ")}`
+            : undefined,
+          startupText,
+          continuationText,
+          instruction,
+        ].filter(Boolean).join("\n"),
+      },
+    ];
+    logToolCall(config, {
+      tool: toolName,
+      workspaceId: workspace.id,
+      path: workspace.root,
+      success: true,
+      durationMs: Math.round(performance.now() - startedAt),
+    });
+
+    return {
+      content: resultContent,
+      _meta: {
+        tool: toolName,
+        card: {
+          workspaceId: workspace.id,
+          root: workspace.root,
+          path: workspace.root,
+          summary: {
+            agentsFiles: loadedAgentsFiles.length,
+            availableAgentsFiles: availableAgentsFileOutputs.length,
+            skills: visibleSkills.length,
+            skillDiagnostics: workspace.skillDiagnostics.length,
+          },
+        },
+      },
+      structuredContent: {
+        workspaceId: workspace.id,
+        root: workspace.root,
+        mode: workspace.mode,
+        sourceRoot: workspace.sourceRoot,
+        worktree: workspace.worktree,
+        agentsFiles: loadedAgentsFiles,
+        availableAgentsFiles: availableAgentsFileOutputs,
+        skills: visibleSkills,
+        skillDiagnostics: workspace.skillDiagnostics,
+        metaEntry,
+        metaStartup,
+        metaContinuation,
+        instruction,
+      },
+    };
+  }
+
   registerAppTool(
     server,
-    "open_workspace",
+    toolNames.openWorkspace,
     {
       title: "Open workspace",
       description:
-        "Open a local project directory as a coding workspace. Call this once per project folder or worktree before reading, editing, searching, writing, showing changes, or running commands. Reuse the returned workspaceId for later calls in the same folder; do not call open_workspace again unless switching folders/worktrees, changing checkout/worktree mode, the workspaceId is rejected as unknown, or the user explicitly asks to reopen. By default this opens the actual checkout. Worktree mode is detached by default; pass branch to attach an existing local branch, or pass branch with createBranch=true to create it from baseRef. Returns a workspaceId, loaded root project instructions, and nested instruction file paths the model should read before working in those directories.",
+        "Open an existing local project directory or checkout as a coding workspace. This operation does not create the project directory or a Git worktree. For a Meta-Harness repository it may silently complete repository-local init hooks and returns explicit metaStartup and metaContinuation states so missing startup context or non-continuable controller state cannot be mistaken for ready work. Call it once per existing project before normal work, then reuse the returned workspaceId.",
       inputSchema: {
         path: z
           .string()
           .describe(
-            "Absolute path, or a leading-tilde home path such as ~/project, to a local project directory inside an allowed root.",
+            "Absolute path, or a leading-tilde home path such as ~/project, to an existing local project directory inside an allowed root.",
           ),
-        mode: z
-          .enum(["checkout", "worktree"])
-          .optional()
+      },
+      outputSchema: workspaceOpenOutputSchema,
+      ...toolWidgetDescriptorMeta(config, "workspace"),
+      annotations: OPEN_WORKSPACE_TOOL_ANNOTATIONS,
+    },
+    async ({ path }) => openedWorkspaceResponse(toolNames.openWorkspace, { path, mode: "checkout" }),
+  );
+
+  registerAppTool(
+    server,
+    toolNames.createWorktreeWorkspace,
+    {
+      title: "Create worktree workspace",
+      description:
+        "Create an isolated managed Git worktree and open it as a coding workspace. Use this only when a separate worktree is actually needed; ordinary existing-folder access belongs to open_workspace.",
+      inputSchema: {
+        path: z
+          .string()
           .describe(
-            "Defaults to checkout. Use checkout to work in the actual directory. Use worktree to create an isolated managed Git worktree for parallel work.",
+            "Absolute path, or a leading-tilde home path such as ~/project, to the existing source Git repository inside an allowed root.",
           ),
         baseRef: z
           .string()
           .optional()
-          .describe("Git ref to use for a detached worktree or as the starting point for a new branch. Only used with mode=\"worktree\". Defaults to HEAD."),
+          .describe("Git ref to use for a detached worktree or as the starting point for a new branch. Defaults to HEAD."),
         branch: z
           .string()
           .trim()
@@ -580,120 +872,88 @@ export function createMcpServer(
           .optional()
           .describe("Create branch from baseRef before attaching it. Requires branch. Defaults to false."),
       },
-      outputSchema: {
-        workspaceId: z.string(),
-        root: z.string(),
-        mode: z.enum(["checkout", "worktree"]),
-        sourceRoot: z.string().optional(),
-        worktree: z
-          .object({
-            path: z.string(),
-            baseRef: z.string(),
-            baseSha: z.string(),
-            branch: z.string().optional(),
-            dirtySource: z.boolean(),
-            detached: z.boolean(),
-            managed: z.boolean(),
-          })
-          .optional(),
-        agentsFiles: z.array(workspaceAgentsFileOutputSchema),
-        availableAgentsFiles: z.array(workspaceAvailableAgentsFileOutputSchema),
-        skills: z.array(workspaceSkillOutputSchema),
-        skillDiagnostics: z.array(z.unknown()),
-        instruction: z.string(),
-      },
+      outputSchema: workspaceOpenOutputSchema,
       ...toolWidgetDescriptorMeta(config, "workspace"),
-      annotations: OPEN_WORKSPACE_TOOL_ANNOTATIONS,
+      annotations: CREATE_WORKTREE_WORKSPACE_TOOL_ANNOTATIONS,
     },
-    async ({ path, mode, baseRef, branch, createBranch }) => {
-      const startedAt = performance.now();
-      const { workspace, agentsFiles, availableAgentsFiles } = await workspaces.openWorkspace({
-        path,
-        mode,
-        baseRef,
-        branch,
-        createBranch,
-      });
-      if (config.widgets === "changes") {
-        void reviewCheckpoints.initializeWorkspace({
-          workspaceId: workspace.id,
-          root: workspace.root,
-        });
-      }
-      const visibleSkills = workspace.skills
-        .filter((skill) => !skill.disableModelInvocation)
-        .map((skill) => ({
-          name: skill.name,
-          description: skill.description,
-          path: formatPathForPrompt(skill.filePath),
-        }));
-      const loadedAgentsFiles = agentsFiles.map((file) => ({
-        path: formatAgentsPath(file.path, workspace.root),
-        content: file.content,
-      }));
-      const availableAgentsFileOutputs = availableAgentsFiles.map((file) => ({
-        path: formatAgentsPath(file.path, workspace.root),
-      }));
-      const instruction = config.skillsEnabled
-        ? "Use this workspaceId in all subsequent tool calls for this project. Do not call open_workspace again for this same folder unless this workspaceId stops working, the user asks to reopen, or you switch to a different folder/worktree. Follow loaded agentsFiles instructions. Use read_files to load multiple known context or instruction files in one approval; use the single-file read tool only when one file is needed. When a task matches an available skill in skills, read its path before proceeding."
-        : "Use this workspaceId in all subsequent tool calls for this project. Do not call open_workspace again for this same folder unless this workspaceId stops working, the user asks to reopen, or you switch to a different folder/worktree. Follow loaded agentsFiles instructions. Use read_files to load multiple known context or instruction files in one approval; use the single-file read tool only when one file is needed.";
-      const resultContent: ToolContent[] = [
-        {
-          type: "text" as const,
-          text: [
-            `Opened workspace ${workspace.id}`,
-            `Root: ${workspace.root}`,
-            `Mode: ${workspace.mode}`,
-            loadedAgentsFiles.length > 0
-              ? `Loaded project instructions: ${loadedAgentsFiles.map((file) => file.path).join(", ")}`
-              : undefined,
-            availableAgentsFileOutputs.length > 0
-              ? `Available nested instructions: ${availableAgentsFileOutputs.map((file) => file.path).join(", ")}`
-              : undefined,
-            visibleSkills.length > 0
-              ? `Available skills: ${visibleSkills.map((skill) => skill.name).join(", ")}`
-              : undefined,
-            instruction,
-          ].filter(Boolean).join("\n"),
-        },
-      ];
-      logToolCall(config, {
-        tool: "open_workspace",
-        workspaceId: workspace.id,
-        path: workspace.root,
-        success: true,
-        durationMs: Math.round(performance.now() - startedAt),
-      });
+    async ({ path, baseRef, branch, createBranch }) => openedWorkspaceResponse(
+      toolNames.createWorktreeWorkspace,
+      { path, mode: "worktree", baseRef, branch, createBranch },
+    ),
+  );
 
-      return {
-        content: resultContent,
-        _meta: {
-          tool: "open_workspace",
-          card: {
-            workspaceId: workspace.id,
-            root: workspace.root,
+  registerAppTool(
+    server,
+    "continue_meta_harness",
+    {
+      title: "Continue Meta-Harness",
+      description:
+        "Continue Meta-Harness once against the exact repository root already bound to this workspace. Accepts only workspaceId: no product result, task/session/Claim selector, path, Git ref, model, environment override, or arbitrary command is permitted. A STOPPED or BLOCKED result is terminal for the current automatic attempt; do not retry it automatically in the same user turn.",
+      inputSchema: {
+        workspaceId: z
+          .string()
+          .describe("Workspace identifier returned by open_workspace."),
+      },
+      outputSchema: resultOutputSchema({
+        status: z.enum(["COMPLETED", "STOPPED", "BLOCKED"]),
+        exitCode: z.number().int().nullable(),
+      }),
+      _meta: {},
+      annotations: META_CONTINUE_TOOL_ANNOTATIONS,
+    },
+    async ({ workspaceId }) => {
+      const startedAt = performance.now();
+      const workspace = workspaces.getWorkspace(workspaceId);
+      if (!metaHarness.looksLikeRepository(workspace.root)) {
+        throw new Error("continue_meta_harness requires an exact Meta-Harness repository root opened by DevSpace.");
+      }
+      try {
+        const readiness = metaHarness.continuationReadiness?.(workspace.root);
+        if (readiness?.status === "BLOCKED") {
+          const result = `Meta-Harness continuation blocked: ${readiness.blockers.join("; ")}`;
+          logToolCall(config, {
+            tool: "continue_meta_harness",
+            workspaceId,
             path: workspace.root,
-            summary: {
-              agentsFiles: loadedAgentsFiles.length,
-              availableAgentsFiles: availableAgentsFileOutputs.length,
-              skills: visibleSkills.length,
-              skillDiagnostics: workspace.skillDiagnostics.length,
-            },
+            success: true,
+            durationMs: Math.round(performance.now() - startedAt),
+          });
+          return {
+            content: [textBlock(result)],
+            structuredContent: { result, status: "BLOCKED" as const, exitCode: null },
+          };
+        }
+        const continuation = await metaHarness.continue(workspace.root);
+        const status = continuation.exitCode === 0 ? "COMPLETED" as const : "STOPPED" as const;
+        logToolCall(config, {
+          tool: "continue_meta_harness",
+          workspaceId,
+          path: workspace.root,
+          success: continuation.exitCode === 0,
+          durationMs: Math.round(performance.now() - startedAt),
+        });
+        return {
+          content: [textBlock(continuation.result)],
+          structuredContent: {
+            result: continuation.result,
+            status,
+            exitCode: continuation.exitCode,
           },
-        },
-        structuredContent: {
-          workspaceId: workspace.id,
-          root: workspace.root,
-          mode: workspace.mode,
-          sourceRoot: workspace.sourceRoot,
-          worktree: workspace.worktree,
-          agentsFiles: loadedAgentsFiles,
-          availableAgentsFiles: availableAgentsFileOutputs,
-          skills: visibleSkills,
-          skillDiagnostics: workspace.skillDiagnostics,
-          instruction,
-        },
-      };
+        };
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        logFailedToolResponse(
+          config,
+          {
+            tool: "continue_meta_harness",
+            workspaceId,
+            path: workspace.root,
+          },
+          [textBlock(message)],
+          startedAt,
+        );
+        throw error;
+      }
     },
   );
 
@@ -730,6 +990,7 @@ export function createMcpServer(
     async ({ workspaceId, pruneStaleMetadata }) => {
       const startedAt = performance.now();
       const closed = await workspaces.closeWorkspace({ workspaceId, pruneStaleMetadata });
+      reviewCheckpoints.forgetWorkspace(workspaceId);
       logToolCall(config, {
         tool: toolNames.closeWorkspace,
         workspaceId,
@@ -1536,7 +1797,7 @@ export function createMcpServer(
         command: z
           .string()
           .describe(
-            `Shell command to run for tests, builds, package scripts, and Git inspection. It must not edit working-tree contents or mutate the Git index, history, remotes, or branches. Use publish_git_changes for explicitly authorized staging, commit, and push operations, and use ${toolNames.edit} or ${toolNames.write} for content changes.`,
+            `Shell command to run for tests, builds, package scripts, and Git inspection. It must not edit working-tree contents or mutate the Git index, history, remotes, or branches. Production runtime control is not granted to this tool: do not invoke setup_devspace.ps1, setup-devspace.ps1, -Stop, or terminate the DevSpace origin/cloudflared/service. Use publish_git_changes for explicitly authorized staging, commit, and push operations, and use ${toolNames.edit} or ${toolNames.write} for content changes.`,
           ),
         workingDirectory: z
           .string()
@@ -1555,17 +1816,36 @@ export function createMcpServer(
       ...toolWidgetDescriptorMeta(config, "shell"),
       annotations: SHELL_TOOL_ANNOTATIONS,
     },
-    async ({ workspaceId, workingDirectory, ...input }) => {
+    async ({ workspaceId, workingDirectory, ...input }, extra) => {
       const startedAt = performance.now();
       const workspace = workspaces.getWorkspace(workspaceId);
       const cwd = workspaces.resolveWorkingDirectory(
         workspace,
         workingDirectory,
       );
-      const response = await runShellTool(input, {
-        cwd,
-        root: workspace.root,
-      });
+      let lease;
+      try {
+        lease = await globalShellExecutionLimiter.acquire(workspace.root, extra.signal);
+      } catch (error) {
+        const content = [textBlock(error instanceof Error ? error.message : String(error))];
+        logFailedToolResponse(config, {
+          tool: toolNames.shell,
+          workspaceId,
+          workingDirectory: workingDirectory ?? ".",
+          command: input.command,
+          commandLength: input.command.length,
+        }, content, startedAt);
+        return { content, isError: true };
+      }
+      let response;
+      try {
+        response = await runShellTool(input, {
+          cwd,
+          root: workspace.root,
+        }, extra.signal);
+      } finally {
+        lease.release();
+      }
 
       if (response.isError) {
         logFailedToolResponse(config, {
@@ -1722,6 +2002,7 @@ export function createServer(config = loadConfig()): RunningServer {
     app.use(devspaceHostHeaderValidation(allowedHosts));
   }
   const transports = new Map<string, Transport>();
+  const transportActivity = new Map<string, { lastSeenMs: number; inFlight: number }>();
   const mcpUrl = new URL("/mcp", config.publicBaseUrl);
   const resourceServerUrl = resourceUrlFromServerUrl(mcpUrl);
   const oauthProvider = new SingleUserOAuthProvider(config.oauth, mcpUrl, config.stateDir);
@@ -1788,6 +2069,15 @@ export function createServer(config = loadConfig()): RunningServer {
     res.json(oauthMetadata);
   });
 
+  // RFC 9728: some clients probe the bare resource metadata URL (without the
+  // /mcp path suffix). Redirect them to the canonical suffixed form so they
+  // can complete OAuth discovery instead of treating a 404 as "unidentified."
+  app.get("/.well-known/oauth-protected-resource", (_req, res) => {
+    res.setHeader("Cache-Control", "no-store");
+    res.setHeader("Access-Control-Allow-Origin", "*");
+    res.redirect(301, "/.well-known/oauth-protected-resource/mcp");
+  });
+
   app.options("/mcp-app-assets/{*asset}", (_req, res) => {
     setAssetHeaders(res);
     res.sendStatus(204);
@@ -1820,7 +2110,7 @@ export function createServer(config = loadConfig()): RunningServer {
     });
     if (res.headersSent) return;
 
-    if (!req.auth?.resource || !checkResourceAllowed({ requestedResource: req.auth.resource, configuredResource: resourceServerUrl })) {
+    if (req.auth?.resource && !checkResourceAllowed({ requestedResource: req.auth.resource, configuredResource: resourceServerUrl })) {
       logEvent(config.logging, "warn", "auth_denied", {
         requestId,
         method: req.method,
@@ -1850,10 +2140,29 @@ export function createServer(config = loadConfig()): RunningServer {
           return;
         }
       } else if (initializeRequest) {
+        if (transports.size >= MAX_MCP_SESSIONS) {
+          const idle = [...transportActivity.entries()]
+            .filter(([, activity]) => activity.inFlight === 0)
+            .sort((a, b) => a[1].lastSeenMs - b[1].lastSeenMs)[0];
+          if (idle) {
+            await transports.get(idle[0])?.close().catch(() => undefined);
+          }
+          if (transports.size >= MAX_MCP_SESSIONS) {
+            sendJsonRpcError(
+              res,
+              503,
+              -32002,
+              `DevSpace is at the MCP session limit (${MAX_MCP_SESSIONS}). Close an idle client session and retry.`,
+            );
+            return;
+          }
+        }
+
         transport = new StreamableHTTPServerTransport({
           sessionIdGenerator: () => randomUUID(),
           onsessioninitialized: (newSessionId) => {
             if (transport) transports.set(newSessionId, transport);
+            transportActivity.set(newSessionId, { lastSeenMs: Date.now(), inFlight: 0 });
             logEvent(config.logging, "info", "mcp_session_created", {
               requestId,
               sessionIdPrefix: sessionIdPrefix(newSessionId),
@@ -1866,6 +2175,7 @@ export function createServer(config = loadConfig()): RunningServer {
           const closedSessionId = transport?.sessionId;
           if (closedSessionId) {
             transports.delete(closedSessionId);
+            transportActivity.delete(closedSessionId);
             logEvent(config.logging, "info", "mcp_session_closed", {
               sessionIdPrefix: sessionIdPrefix(closedSessionId),
             });
@@ -1884,7 +2194,22 @@ export function createServer(config = loadConfig()): RunningServer {
         return;
       }
 
-      await transport.handleRequest(req, res, req.body);
+      const activitySessionId = sessionId ?? transport.sessionId;
+      const activity = activitySessionId ? transportActivity.get(activitySessionId) : undefined;
+      if (activity) {
+        activity.inFlight += 1;
+        activity.lastSeenMs = Date.now();
+      }
+      try {
+        await transport.handleRequest(req, res, req.body);
+      } finally {
+        const completedSessionId = activitySessionId ?? transport.sessionId;
+        const completed = completedSessionId ? transportActivity.get(completedSessionId) : undefined;
+        if (completed) {
+          completed.inFlight = Math.max(0, completed.inFlight - 1);
+          completed.lastSeenMs = Date.now();
+        }
+      }
     } catch (error) {
       logEvent(config.logging, "error", "mcp_request_error", {
         requestId,
@@ -1896,6 +2221,30 @@ export function createServer(config = loadConfig()): RunningServer {
     }
   });
 
+  const reaper = setInterval(() => {
+    const now = Date.now();
+    for (const [sessionId, activity] of transportActivity) {
+      if (activity.inFlight > 0 || now - activity.lastSeenMs < MCP_SESSION_IDLE_MS) continue;
+      const transport = transports.get(sessionId);
+      if (!transport) {
+        transportActivity.delete(sessionId);
+        continue;
+      }
+      void transport.close().catch((error) => {
+        logEvent(config.logging, "warn", "mcp_session_reap_error", {
+          sessionIdPrefix: sessionIdPrefix(sessionId),
+          error: error instanceof Error ? error.message : String(error),
+        });
+      });
+    }
+    const evicted = workspaces.evictInactiveMemory(WORKSPACE_MEMORY_IDLE_MS, now);
+    for (const workspaceId of evicted) reviewCheckpoints.forgetWorkspace(workspaceId);
+    if (evicted.length > 0) {
+      logEvent(config.logging, "debug", "workspace_memory_reaped", { evicted: evicted.length });
+    }
+  }, REAPER_INTERVAL_MS);
+  reaper.unref?.();
+
   let closed = false;
   return {
     app,
@@ -1903,6 +2252,11 @@ export function createServer(config = loadConfig()): RunningServer {
     close: async () => {
       if (closed) return;
       closed = true;
+      clearInterval(reaper);
+      killTrackedShellProcesses();
+      await Promise.allSettled([...transports.values()].map((transport) => transport.close()));
+      transports.clear();
+      transportActivity.clear();
       await webLaunchBrowser.close();
       oauthProvider.close();
       workspaceStore.close?.();
@@ -1937,6 +2291,7 @@ if (await isMainModule()) {
   });
 
   const shutdown = () => {
+    killTrackedShellProcesses();
     httpServer.close(() => {
       void close().finally(() => process.exit(0));
     });

@@ -26,17 +26,22 @@ try {
   const { port } = httpServer.address() as AddressInfo;
   const origin = `http://127.0.0.1:${port}`;
 
-  const [oauthResponse, oidcResponse] = await Promise.all([
+  const [protectedResourceResponse, oauthResponse, oidcResponse] = await Promise.all([
+    fetch(`${origin}/.well-known/oauth-protected-resource/mcp`),
     fetch(`${origin}/.well-known/oauth-authorization-server`),
     fetch(`${origin}/.well-known/openid-configuration`),
   ]);
 
+  assert.equal(protectedResourceResponse.status, 200);
   assert.equal(oauthResponse.status, 200);
   assert.equal(oidcResponse.status, 200);
   assert.equal(oidcResponse.headers.get("access-control-allow-origin"), "*");
 
+  const protectedResourceMetadata = await protectedResourceResponse.json();
   const oauthMetadata = await oauthResponse.json();
   const oidcMetadata = await oidcResponse.json();
+  assert.equal(protectedResourceMetadata.resource, "https://devspace.example.test/mcp");
+  assert.deepEqual(protectedResourceMetadata.authorization_servers, ["https://devspace.example.test/"]);
   assert.deepEqual(oidcMetadata, oauthMetadata);
   assert.equal(oidcMetadata.issuer, "https://devspace.example.test/");
   assert.equal(oidcMetadata.authorization_endpoint, "https://devspace.example.test/authorize");

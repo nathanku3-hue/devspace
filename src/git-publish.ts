@@ -1,5 +1,6 @@
-import { stat } from "node:fs/promises";
-import { relative, sep } from "node:path";
+import { randomBytes } from "node:crypto";
+import { rm, stat } from "node:fs/promises";
+import { isAbsolute, relative, resolve, sep } from "node:path";
 import { git } from "./git.js";
 import { isPathInsideRoot, resolveAllowedPath } from "./roots.js";
 
@@ -36,9 +37,40 @@ function normalizeRepositoryPath(path: string): string {
   return path.split(sep).join("/");
 }
 
-async function stagedPaths(gitRoot: string): Promise<string[]> {
-  const { stdout } = await git(gitRoot, ["diff", "--cached", "--name-only", "-z"]);
+function gitEnv(env?: NodeJS.ProcessEnv): { env?: NodeJS.ProcessEnv } {
+  return env ? { env } : {};
+}
+
+async function stagedPaths(gitRoot: string, env?: NodeJS.ProcessEnv): Promise<string[]> {
+  const { stdout } = await git(gitRoot, ["diff", "--cached", "--name-only", "-z"], gitEnv(env));
   return parseNullSeparated(stdout);
+}
+
+async function stagedEntrySnapshot(gitRoot: string, paths: string[]): Promise<string[]> {
+  if (paths.length === 0) return [];
+  const { stdout } = await git(gitRoot, ["ls-files", "--stage", "-z", "--", ...paths]);
+  return parseNullSeparated(stdout).sort();
+}
+
+async function resolveGitDir(gitRoot: string): Promise<string> {
+  const raw = (await git(gitRoot, ["rev-parse", "--git-dir"])).stdout.trim();
+  return isAbsolute(raw) ? raw : resolve(gitRoot, raw);
+}
+
+async function withPrivateIndex<T>(
+  gitRoot: string,
+  fn: (env: NodeJS.ProcessEnv) => Promise<T>,
+): Promise<T> {
+  const gitDir = await resolveGitDir(gitRoot);
+  const indexPath = resolve(gitDir, `devspace-publish-${randomBytes(8).toString("hex")}.index`);
+  const env = { GIT_INDEX_FILE: indexPath };
+  try {
+    await git(gitRoot, ["read-tree", "HEAD"], { env });
+    return await fn(env);
+  } finally {
+    await rm(indexPath, { force: true });
+    await rm(`${indexPath}.lock`, { force: true });
+  }
 }
 
 function assertLiteralFilePath(path: string): void {
@@ -102,28 +134,6 @@ export async function publishGitChanges(
   );
   const allowedPaths = new Set(repositoryPaths.map(pathKey));
 
-  const alreadyStaged = await stagedPaths(gitRoot);
-  const preexistingUnexpected = alreadyStaged.filter((path) => !allowedPaths.has(pathKey(path)));
-  if (preexistingUnexpected.length > 0) {
-    throw new Error(
-      `Refusing to commit because unrelated paths are already staged: ${preexistingUnexpected.join(", ")}`,
-    );
-  }
-
-  await git(gitRoot, ["--literal-pathspecs", "add", "--", ...repositoryPaths]);
-
-  const staged = await stagedPaths(gitRoot);
-  const unexpected = staged.filter((path) => !allowedPaths.has(pathKey(path)));
-  if (unexpected.length > 0) {
-    throw new Error(`Refusing to commit paths that were not explicitly authorized: ${unexpected.join(", ")}`);
-  }
-  if (staged.length === 0) {
-    throw new Error("No staged changes remain after staging the explicit paths");
-  }
-
-  await git(gitRoot, ["diff", "--cached", "--check"]);
-  const stat = (await git(gitRoot, ["diff", "--cached", "--stat"])).stdout.trim();
-
   const currentBranch = (await git(gitRoot, ["symbolic-ref", "--quiet", "--short", "HEAD"])).stdout.trim();
   if (!currentBranch) {
     throw new Error("Cannot publish from a detached HEAD");
@@ -137,7 +147,47 @@ export async function publishGitChanges(
     );
   }
 
-  await git(gitRoot, ["commit", "-m", message]);
+  const alreadyStaged = await stagedPaths(gitRoot);
+  const preexistingUnexpected = alreadyStaged.filter((path) => !allowedPaths.has(pathKey(path)));
+  const unrelatedSnapshot = await stagedEntrySnapshot(gitRoot, preexistingUnexpected);
+
+  const { staged, stat } = await withPrivateIndex(gitRoot, async (env) => {
+    await git(gitRoot, ["--literal-pathspecs", "add", "--", ...repositoryPaths], { env });
+
+    const staged = await stagedPaths(gitRoot, env);
+    const unexpected = staged.filter((path) => !allowedPaths.has(pathKey(path)));
+    if (unexpected.length > 0) {
+      throw new Error(`Refusing to commit paths that were not explicitly authorized: ${unexpected.join(", ")}`);
+    }
+    if (staged.length === 0) {
+      throw new Error("No staged changes remain after staging the explicit paths");
+    }
+
+    await git(gitRoot, ["diff", "--cached", "--check"], { env });
+    const stat = (await git(gitRoot, ["diff", "--cached", "--stat"], { env })).stdout.trim();
+    await git(gitRoot, ["commit", "-m", message], { env });
+    return { staged, stat };
+  });
+
+  await git(gitRoot, ["--literal-pathspecs", "add", "--", ...repositoryPaths]);
+  const leftoverUnexpected = (await stagedPaths(gitRoot))
+    .filter((path) => !allowedPaths.has(pathKey(path)))
+    .sort((left, right) => pathKey(left).localeCompare(pathKey(right)));
+  const expectedUnexpected = [...preexistingUnexpected].sort((left, right) =>
+    pathKey(left).localeCompare(pathKey(right)),
+  );
+  const leftoverSnapshot = await stagedEntrySnapshot(gitRoot, leftoverUnexpected);
+  if (
+    leftoverUnexpected.length !== expectedUnexpected.length
+    || leftoverUnexpected.some((path, index) => pathKey(path) !== pathKey(expectedUnexpected[index] ?? ""))
+    || leftoverSnapshot.length !== unrelatedSnapshot.length
+    || leftoverSnapshot.some((entry, index) => entry !== unrelatedSnapshot[index])
+  ) {
+    throw new Error(
+      "Commit was created, but the shared index no longer preserves the unrelated staged paths that were present before publication",
+    );
+  }
+
   const commit = (await git(gitRoot, ["rev-parse", "HEAD"])).stdout.trim();
 
   const remote = input.remote?.trim() || "origin";

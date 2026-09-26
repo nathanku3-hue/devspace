@@ -1,5 +1,125 @@
 # DevSpace Durable Lessons
 
+## 2026-09-21 — Plugin "not installed/connected" at startup is access-token expiry, not a server bug
+
+**Symptom:** After PC wake or IDE restart, the Antigravity DevSpace Local plugin reports "not installed/connected" and `open_workspace` is not exposed. Clicking "Connect/Reconnect" restores it immediately.
+
+**Root cause:** The access token TTL is **1 hour** (`DEFAULT_OAUTH_ACCESS_TOKEN_TTL_SECONDS = 60 * 60` in `config.ts`). The IDE plugin sends its stored Bearer token from the last session; that token is already expired. The server correctly returns 401 (`InvalidTokenError`), and the plugin reports unconnected. This is **not a server bug** — the OAuth implementation is correct.
+
+**Why reconnect fixes it:** The reconnect triggers a fresh OAuth device-authorization flow → new access token issued → MCP initialize succeeds → all tools exposed.
+
+**Evidence from DB at time of diagnosis:**
+- All `open-quant-workspace` and IDE probe clients: 0 valid access tokens, valid refresh tokens present.
+- ChatGPT clients have valid access tokens because the Chatshare extension silently refreshes them roughly every hour via device-auth.
+- The IDE plugin does **not** persist or reuse its refresh token client-side between restarts; every restart = cold OAuth flow required.
+
+**Fix options (server-side, no code change):**
+
+1. **Extend access token TTL (quickest):** Add `$env:DEVSPACE_OAUTH_ACCESS_TOKEN_TTL_SECONDS = "86400"` in the `devspace serve` env block of `scripts/setup-devspace.ps1`. A 24-hour TTL survives overnight gaps and PC sleep without user interaction.
+2. **Client-side (plugin):** Store and reuse the refresh token on IDE restart to silently obtain a new access token. This is an Antigravity IDE plugin concern, not the DevSpace server.
+3. **Workaround:** Accept that a reconnect click is needed when the IDE restarts after more than 1 hour.
+
+**Diagnostic proof:** `verifyAccessToken` in `oauth-provider.ts` throws `InvalidTokenError` when `record.expiresAt < Math.floor(Date.now() / 1000)`. The `SqliteOAuthStore` constructor calls `deleteExpiredTokens` at startup which purges them. The SQLite DB confirmed 0 valid access tokens for IDE clients at startup time.
+
+---
+
+## 2026-09-21 — OOM recovery must bound concurrency, output, descendants, and retained session state
+
+A 512 MB V8 heap cap by itself is not a concurrency fix. The Sept. 18–20 origin failures showed that long-running MCP `bash` calls can overlap, noisy child processes can pressure the Node process, and a fatal V8 OOM can kill the origin before normal JavaScript cleanup runs.
+
+**Durable invariants:**
+
+1. **Scope the heap limit to the DevSpace origin only.** Do not set `NODE_OPTIONS=--max-old-space-size=...` in the shared launcher environment because every Node child started by `bash` inherits it. Launch the origin with `node.exe --max-old-space-size=512 ...` instead.
+2. **Bound shell admission.** The hardened runtime allows at most 2 active shell commands globally, 1 per workspace, 16 queued calls, and a 60-second queue wait. Queue saturation must fail explicitly rather than letting memory/process pressure grow without bound.
+3. **Bound shell output before Pi's temp-file path.** Pi truncates displayed output, but its temp-file stream does not provide a useful end-to-end memory bound under sustained producer pressure. DevSpace now terminates a command after 8 MiB of emitted output rather than allowing arbitrary output backlog.
+4. **Use OS ownership for crash cleanup.** JavaScript PID tracking is insufficient for fatal OOM. The production origin is launched suspended, assigned to a Windows Job Object with `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`, then resumed. When the origin exits or crashes, surviving descendant build/test/shell processes are killed by the kernel.
+5. **Harden the restart handoff.** With a Job-Object wrapper, Task Scheduler may still report the wrapper as `Running` briefly after Node dies. Because the origin task uses `MultipleInstances IgnoreNew`, the supervisor must wait for the wrapper to stop, force-stop it if necessary, and only then restart.
+6. **Deduplicate checkout opens and bound retained state.** Repeated/concurrent `open_workspace` calls for the same checkout reuse one active workspace. MCP sessions are capped at 64 with oldest-idle eviction and 30-minute idle cleanup; in-memory workspace/review state is reaped after 15 minutes.
+7. **Installation and activation are separate.** The supervisor installer is intentionally elevation-gated. Running it in a normal PowerShell must fail. Use an Administrator console or `Start-Process powershell.exe -Verb RunAs ...`. The default install preserves a healthy origin; pass `-ApplyNow` for a bounded recycle that verifies local `/healthz` before declaring the new protected runtime active.
+8. **Test the containment mechanism, not just the source text.** The hardening test launches the Windows Job-Object runner with a harmless Node probe that spawns a detached child, exits the origin, and verifies the detached child is gone. PowerShell scripts are parser-checked, TypeScript typecheck/build pass, and the existing supervisor suite remains 52/52 green.
+
+**Operational command for immediate activation:**
+
+```powershell
+Start-Process powershell.exe -Verb RunAs -ArgumentList '-NoProfile','-ExecutionPolicy','Bypass','-File','E:\Code\devspace\devspace-src\scripts\install-devspace-supervisor.ps1','-ApplyNow'
+```
+
+The installer refusing with `Install the DevSpace supervisor from an elevated operator console` means the current shell does not hold an Administrator token; do not remove that guard.
+
+---
+
+## 2026-09-20 — ChatShare OAuth 識別 failure: four independent causes
+
+`https://devspace-proxy.kitlongku.workers.dev/mcp` returning 401 on every ChatShare connection attempt. The 401 itself is correct (unauthenticated probe), but the full OAuth flow failed to complete identity recognition due to four separate issues acting as independent blockers.
+
+**Root Causes:**
+
+1. **`chatshare.xyz` missing from `allowedRedirectHosts` default** (`config.ts`): The default whitelist only contained `chatgpt.com`, `localhost`, `127.0.0.1`. Any ChatShare client registering a `redirect_uri` pointing to `chatshare.xyz` was rejected at dynamic client registration time with `"Client redirect_uri is not allowed for this DevSpace server: chatshare.xyz"` — before OAuth even began. Note that `allowedRedirectPrefixes` (for device-binding) already included `chatshare.xyz` prefixes; this is a completely separate check in `SqliteOAuthClientsStore.registerClient`.
+
+2. **Hard `!req.auth?.resource` guard** (`server.ts`): The bearer auth verification gate was `if (!req.auth?.resource || !checkResourceAllowed(...))`. RFC 8707 resource indicators are optional; clients that don't send a `resource` parameter during token exchange issue tokens without a resource claim. These perfectly valid tokens were immediately rejected with 401 at `/mcp` because `req.auth.resource` was `undefined`. Fixed by inverting: only enforce the resource check when the token *carries* a claim (`req.auth?.resource && !checkResourceAllowed(...)`).
+
+3. **Bare `/.well-known/oauth-protected-resource` returns 404** (`server.ts`): The MCP SDK's `mcpAuthRouter` only registers `/.well-known/oauth-protected-resource/mcp` (path-suffixed form). Some OAuth clients probe the bare path first; getting a 404 caused them to abort discovery and report the server as unidentified. Added a 301 redirect from the bare path to the `/mcp`-suffixed canonical URL, sitting alongside the existing `/.well-known/openid-configuration` alias.
+
+4. **Device auth `required` defaulted to `enabled`** (`config.ts`): `parseDeviceAuthorization` set `required: enabled`, so `DEVSPACE_DEVICE_AUTH=true` silently also set `required=true`. Any token obtained without device-binding (i.e., without the enrolled-PC extension performing the loopback proof) would then be rejected as `"Invalid or expired access token"` in `verifyAccessToken` even though the OAuth flow had completed correctly. `enabled` and `required` are orthogonal concepts: `enabled` means the server *can* accept device-bound proofs; `required` means it *only* accepts them. Changed default to `false` so `DEVSPACE_DEVICE_AUTH_REQUIRED` must be explicitly opted in.
+
+**Fixes applied (`src/config.ts`, `src/server.ts`):**
+- Added `"chatshare.xyz"` to the `allowedRedirectHosts` default array.
+- Changed device auth `required` default from `? enabled` to `? false`.
+- Flipped `/mcp` bearer auth resource guard from `!req.auth?.resource ||` to `req.auth?.resource &&`.
+- Added `app.get("/.well-known/oauth-protected-resource", ...)` 301 redirect to canonical `/mcp`-suffixed path.
+
+**Diagnostic approach:** probe `WWW-Authenticate` header on 401 → follow `resource_metadata` URL → walk `authorization_servers` → verify each well-known endpoint. The `/.well-known/oauth-protected-resource/mcp` and `/.well-known/oauth-authorization-server` were both healthy; failure was in the client registration and token verification layers, not in the discovery metadata itself.
+
+---
+
+## 2026-09-17 — Stale setup.lock contention, WMI process scan latency, and launcher path forwarder
+
+Setup execution (`powershell -ExecutionPolicy Bypass -File E:\Code\devspace\setup\_devspace.ps1`) appeared to hang indefinitely right after logging `Using existing auth.json configuration.`.
+
+**Root Causes:**
+1. **Stale Lock Contention:** An orphaned `setup.lock` file (`C:\Users\Lenovo\.devspace\setup.lock`) remained from an earlier crashed/terminated setup session pointing to an inactive PID (`54012`). Invocations entering `Enter-DevSpaceSetupLock` blocked waiting on lock clearance.
+2. **WMI / CIM Query Latency:** The sequential health checks immediately after reading `auth.json` (`Test-LocalDevSpaceHealthy`, `Test-WorkerDevSpaceHealthy`, `Test-DevSpaceQuickTunnelAlive`, `Bind-DevSpaceOriginProcess`, `Get-CurrentQuickTunnelUrl`) use `Get-CimInstance Win32_Process`. On this Windows system, full table scans or process-name filter queries take 5–10+ seconds per query. While these queries ran, zero output was printed to stdout, presenting as a complete freeze.
+3. **Launcher Path Mismatch:** The user called `E:\Code\devspace\setup\_devspace.ps1` (with `setup\` as a directory), whereas the canonical launcher is `E:\Code\devspace\setup_devspace.ps1`. When `setup\` did not exist as a directory, this resulted in path resolution failures or confusion.
+
+**Fix & Guardrails:**
+- Cleaned the stale `setup.lock` to immediately unblock setup synchronization.
+- Verified background supervisor (`DevSpaceOriginUser` scheduled task) and healthy sacred origin (`PID=157100`) + quick tunnel (`PID=155164`).
+- Added a compatibility forwarding wrapper at `E:\Code\devspace\setup\_devspace.ps1` that forwards parameters directly to `E:\Code\devspace\setup_devspace.ps1`, ensuring both invocation styles work out-of-the-box.
+- Confirmed full run reaches `action=noop` in background mode with exit code 0 and all 12 tools active locally and publicly.
+
+---
+
+## 2026-09-07 — Delegation is proven in the 35-tool candidate; live public acceptance still requires canonical deployment
+
+The public endpoint `https://devspace-proxy.kitlongku.workers.dev/mcp` was live and OAuth-protected, but the production runtime still advertised exactly 11 tools. `runtime.json` bound that live origin to canonical `E:\Code\devspace\devspace-src` at `95c64ae`, PID 16000, with the same 11-tool inventory locally and publicly. `spawn_delegation`, `get_delegation`, `resume_delegation`, `cancel_lane`, and `lane_submit` were therefore not callable on the live connector.
+
+A clean detached `05bbfe7` candidate was rebuilt with the Windows Node toolchain. Typecheck passed, the four DELEGATION-R2 lifecycle proofs passed individually (four-lane concurrent spawn, restart/resume identity, compact fan-in, and cancelled-result fencing), and an in-memory MCP `tools/list` returned the exact 35-tool inventory including all five delegation tools. The committed candidate is therefore valid at the code/runtime-registration boundary; the remaining gate is production custody and connector publication.
+
+The full committed `fde4855..05bbfe7` delta is 84 files (`+20686/-325`). A cumulative three-way dry run against clean canonical `95c64ae` reduced the forward-port conflict set to five shared files: `lessons.md`, `package.json`, `scripts/setup-devspace.Tests.ps1`, `scripts/setup-devspace.ps1`, and `src/server.ts`. No ordinary one- or two-level non-worktree checkout under `E:\Code` contained `05bbfe7` or the delegation source.
+
+**Critical recycle rule:** running `E:\Code\devspace\setup_devspace.ps1` while the origin is healthy intentionally chooses `noop`; it does not rebuild or recycle. After the reviewed 35-tool integration is actually present in canonical, an elevated operator must first stop the protected origin, then run the root setup launcher so the down-origin staged recycle builds canonical and verifies authenticated local/public tool inventories:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File E:\Code\devspace\devspace-src\scripts\operator-stop-devspace.ps1
+powershell -NoProfile -ExecutionPolicy Bypass -File E:\Code\devspace\setup_devspace.ps1 -PinPreferredSource
+```
+
+Do not point production setup at a managed `.worktrees` checkout. After setup verifies the 35 tools on both local and public endpoints, republish/refresh the ChatGPT connector schema and use a fresh conversation before claiming live delegation acceptance.
+
+The intended end-to-end acceptance remains:
+
+`spawn_delegation → cancel_lane` (intentional one-lane kill) `→ get_delegation` compact fan-in `→ planner accepts healthy evidence/worldDelta exactly once`.
+
+There is no separate DevSpace planner-acceptance API. `worldDelta` is advisory, cancellation fences the cancelled lane result, and cancellation itself must not mutate parent World.
+
+---
+
+## 2026-09-06 — MCP -Stop is the remaining kill switch; privilege separation is the fix
+
+Canonical `$Stop` after the setup lock killed healthy PIDs 27876/9332 with no heal decision. MCP bash had no command policy. `-Stop` is removed from model-facing launchers. `bash-runtime-policy.ts` denies `production_runtime_control`. SYSTEM supervisor task restarts a down origin. Worktree setup copies are inert stubs. Named tunnel remains the structural end state.
+
+---
+
 ## 2026-09-06 — ChatGPT 502 was setup thrash; a healthy origin is sacred
 
 Repeated 502s (Worker probe 530) were public-path outages caused by full setup recycling a live origin. Canonical `scripts/setup-devspace.ps1` used to **stop → `npm run build` (`rmSync dist`) → maybe start**. A failed build after killing Node left the Worker on a dead quick tunnel. Concurrent setups and discovery/inventory teardowns did the same.
@@ -1161,4 +1281,192 @@ Lesson: keep the alias. Do not invent `userinfo` or `jwks` unless a later Chatsh
 ## Final status
 
 Closed 2026-08-26. Chatshare callback rescue remains extension `1.11.0`. Operator close: Reload the unpacked extension, then a fresh Connect on the same connector succeeded. DevSpace also aliases OIDC discovery to OAuth authorization-server metadata. Diagnose later copies of this page from whether the extension is loaded, then from OpenID discovery GET status plus whether token ran.
+
+---
+
+# Chatshare Rescue 1.12.0 React removeChild White-Screen Lessons
+
+Date: 2026-09-15
+Client: `https://chatshare.xyz`
+Asset host: `https://chatgpt-remix.openoai.net`
+Live extension: `E:\Code\devspace\chatshare-oauth-rescue-extension` version `1.12.0`
+Classification: Chatshare.xyz compatibility stream. This is not a DevSpace custody failure.
+
+No authorization code, state value, access token, refresh token, owner token, or browser credential is recorded in this document.
+
+## Confirmed outcome
+
+Chatshare showed:
+
+```text
+Application Error
+NotFoundError: Failed to execute 'removeChild' on 'Node':
+The node to be removed is not a child of this node.
+```
+
+The stack is Chatshare's Remix/React reconciler on `chatgpt-remix.openoai.net`. That is `commitDeletion` walking a host tree whose live DOM no longer matches React's fiber. DevSpace `/healthz`, OAuth, and MCP are unrelated.
+
+Version `1.12.0` installs a MAIN-world `document_start` guard on every Chatshare document, including ordinary chat pages with no rescued callback. It marks `<html translate="no">` and swallows only the mismatched-parent `Node.removeChild` / `Node.insertBefore` case so Chatshare does not unmount the whole app. Operator close is: Chrome **Reload** so the unpacked copy shows `1.12.0`, then hard-refresh Chatshare.
+
+## Version 1.12.0 repair
+
+1. On every Chatshare document, set `document.documentElement.translate="no"` and class `notranslate`. Do not inject extra head nodes React might reconcile.
+2. Wrap `Node.prototype.removeChild` and `insertBefore` so a mismatched parent returns instead of throwing. Leave real parent/child operations unchanged.
+3. Guard with `__chatshareRescueDomGuard` so a second injection does not wrap twice.
+
+Verified:
+
+- `test-callback-rescue.mjs` covers the mismatched-parent `removeChild` / `insertBefore` case and the `translate="no"` document flag.
+
+## Files
+
+- `chatshare-oauth-rescue-extension/callback-bootstrap.js`
+- `chatshare-oauth-rescue-extension/manifest.json`
+- `chatshare-oauth-rescue-extension/README.md`
+- `chatshare-oauth-rescue-extension/test-callback-rescue.mjs`
+
+---
+
+# Safe Rename Workspace-Boundary Lessons
+
+Date: 2026-09-22
+Scope: `safe_rename_file` containment, regression coverage, and smoke-test reliability.
+
+## Confirmed outcome
+
+`safe_rename_file` is workspace-scoped. Global `DEVSPACE_ALLOWED_ROOTS` determines which directories may be opened as workspaces; it must not grant one opened workspace authority to rename files into or out of another allowed root.
+
+The helper now accepts exactly one `workspaceRoot`, and every lexical and canonical containment check is performed against that root. The error wording is again `outside workspace root`, matching the actual authority model.
+
+## Durable lessons
+
+1. Do not confuse the global allowlist with per-workspace authority. A directory being globally openable does not mean a tool call from another workspace may mutate it.
+2. Encode the authority model in the type signature. Allowing `string | string[]` made it too easy to accidentally widen rename authority by passing all configured roots.
+3. Security regressions need adversarial negative tests, not only wording assertions. Keep a two-root test where both roots are globally allowed, open workspace A, then prove A cannot import from or export to B and that no filesystem mutation occurs.
+4. Test rejection before mutation. Cross-workspace failures should happen before `link` or `unlink`; the unit test records any attempted mutation and requires none.
+5. Smoke-test startup budgets must reflect current startup cost. The server import currently takes long enough that the old ~6-second readiness window produced a false failure before `/healthz`. The smoke harness now allows a longer readiness period.
+6. Keep unrelated auth machinery out of focused smoke tests. Explicitly disable inherited device authorization when the test is exercising OAuth owner flow plus filesystem behavior.
+7. A passing focused security suite does not imply the entire repository suite is green. At this close, `npm test` still stops on a pre-existing `config.test.ts` expectation that omits `chatshare.xyz` from the current default redirect-host list.
+
+## Verification
+
+- `safe-rename.test.ts`: passed.
+- TypeScript typecheck: passed.
+- Production build: passed.
+- End-to-end `smoke_test.mjs`: passed for `off`, `changes`, and `full` widget modes.
+- Two-root per-workspace rename isolation: passed in the smoke test.
+- Full `npm test`: blocked by the unrelated stale `config.test.ts` redirect-host expectation described above.
+
+## Files
+
+- `src/safe-rename.ts`
+- `src/safe-rename.test.ts`
+- `../smoke_test.mjs`
+- `lessons.md`
+
+---
+
+# DevSpace + Meta-Harness Missing World-Pointer Continuation Lessons
+
+Date: 2026-09-22
+Scope: automatic Meta-Harness continuation through DevSpace.
+
+## Confirmed failure
+
+The DevSpace → Meta-Harness integration was working far enough to detect continuable work and select automatic continuation. The failure was inside the repo-planner continuation path: `.git/meta-harness/decision-plane-v2/current-world.json` was absent.
+
+Meta-Harness `inspect --json` can report `CONTINUE` based on durable repository/run state without proving that decision-plane v2 has a current WorldHead. When repo planning is enabled, the bare continuation route reaches `runRepoWorkWave`, which calls `readCurrentWorldState` non-optionally and therefore fails if the current-world pointer does not exist.
+
+Lesson: `metaEntry.action=CONTINUE` is necessary but not sufficient evidence that a repo-planner continuation is mechanically runnable.
+
+## DevSpace boundary repair
+
+DevSpace now performs a narrow continuation-readiness preflight before recommending or invoking automatic Meta-Harness continuation:
+
+1. If `.meta-harness/repo-charter.json` does not enable repo planning, continuation remains READY.
+2. If repo planning is enabled, resolve the Git common directory, including linked worktrees via `.git` + `commondir`.
+3. If `meta-harness/decision-plane-v2/current-world.json` is missing from that common Git directory, expose `metaContinuation.status=BLOCKED` with an explicit blocker.
+4. `open_workspace` must not instruct the model to call `continue_meta_harness` while continuation is BLOCKED.
+5. `continue_meta_harness` repeats the readiness check so a caller that ignores open-workspace guidance still cannot fall through into the known missing-pointer failure.
+6. DevSpace must not synthesize, repair, or guess Meta-Harness decision-plane authority. Creating the first WorldHead/current-world pointer remains Meta-Harness/controller-owned bootstrap or migration work.
+
+Lesson: recovery guards belong at both the guidance boundary and the execution boundary. Model instructions alone are not a sufficient safety mechanism.
+
+## Authority and topology lessons
+
+- Treat `.git/meta-harness/decision-plane-v2/current-world.json` as a Git-common-directory authority pointer, not necessarily a literal path beneath a worktree's `.git` entry.
+- Guard only the state DevSpace can prove locally and safely. This repair detects a missing pointer; semantic validation of an existing pointer and immutable WorldHead remains Meta-Harness-owned.
+- A missing pointer is a recoverable controller-state gap, not an owner-input gate. Do not ask the user for internal task, Claim, session, generation, or resume identifiers.
+- Do not confuse `.meta-harness/` repository runtime hooks with `.git/meta-harness/decision-plane-v2/` authority state. `ensureProjectHooks` may create the former while the latter remains uninitialized.
+
+## Verification
+
+- Focused Meta-Harness tests: 14/14 passed.
+- TypeScript typecheck: passed.
+- Regression coverage proves both `open_workspace` guidance suppression and direct `continue_meta_harness` preflight blocking.
+
+## Incident residue
+
+A diagnostic bare `meta-harness` invocation ran `ensureProjectHooks` before failing and created an untracked `.meta-harness/` starter directory in this checkout. Those files are not the missing decision-plane pointer and are not part of the DevSpace repair.
+
+## Files
+
+- `src/meta-harness.ts`
+- `src/meta-harness.test.ts`
+- `src/meta-harness-server.test.ts`
+- `src/server.ts`
+- `lessons.md`
+
+---
+
+# DevSpace + Meta-Harness Missing World-Pointer Continuation Lessons
+
+Date: 2026-09-22
+Scope: automatic Meta-Harness continuation through DevSpace.
+
+## Confirmed failure
+
+The DevSpace → Meta-Harness integration was working far enough to detect continuable work and select automatic continuation. The failure was inside the repo-planner continuation path: `.git/meta-harness/decision-plane-v2/current-world.json` was absent.
+
+Meta-Harness `inspect --json` can report `CONTINUE` based on durable repository/run state without proving that decision-plane v2 has a current WorldHead. When repo planning is enabled, the bare continuation route reaches `runRepoWorkWave`, which calls `readCurrentWorldState` non-optionally and therefore fails if the current-world pointer does not exist.
+
+Lesson: `metaEntry.action=CONTINUE` is necessary but not sufficient evidence that a repo-planner continuation is mechanically runnable.
+
+## DevSpace boundary repair
+
+DevSpace now performs a narrow continuation-readiness preflight before recommending or invoking automatic Meta-Harness continuation:
+
+1. If `.meta-harness/repo-charter.json` does not enable repo planning, continuation remains READY.
+2. If repo planning is enabled, resolve the Git common directory, including linked worktrees via `.git` + `commondir`.
+3. If `meta-harness/decision-plane-v2/current-world.json` is missing from that common Git directory, expose `metaContinuation.status=BLOCKED` with an explicit blocker.
+4. `open_workspace` must not instruct the model to call `continue_meta_harness` while continuation is BLOCKED.
+5. `continue_meta_harness` repeats the readiness check so a caller that ignores open-workspace guidance still cannot fall through into the known missing-pointer failure.
+6. DevSpace must not synthesize, repair, or guess Meta-Harness decision-plane authority. Creating the first WorldHead/current-world pointer remains Meta-Harness/controller-owned bootstrap or migration work.
+
+Lesson: recovery guards belong at both the guidance boundary and the execution boundary. Model instructions alone are not a sufficient safety mechanism.
+
+## Authority and topology lessons
+
+- Treat `.git/meta-harness/decision-plane-v2/current-world.json` as a Git-common-directory authority pointer, not necessarily a literal path beneath a worktree's `.git` entry.
+- Guard only the state DevSpace can prove locally and safely. This repair detects a missing pointer; semantic validation of an existing pointer and immutable WorldHead remains Meta-Harness-owned.
+- A missing pointer is a recoverable controller-state gap, not an owner-input gate. Do not ask the user for internal task, Claim, session, generation, or resume identifiers.
+- Do not confuse `.meta-harness/` repository runtime hooks with `.git/meta-harness/decision-plane-v2/` authority state. `ensureProjectHooks` may create the former while the latter remains uninitialized.
+
+## Verification
+
+- Focused Meta-Harness tests: 14/14 passed.
+- TypeScript typecheck: passed.
+- Regression coverage proves both `open_workspace` guidance suppression and direct `continue_meta_harness` preflight blocking.
+
+## Incident residue
+
+A diagnostic bare `meta-harness` invocation ran `ensureProjectHooks` before failing and created an untracked `.meta-harness/` starter directory in this checkout. Those files are not the missing decision-plane pointer and are not part of the DevSpace repair.
+
+## Files
+
+- `src/meta-harness.ts`
+- `src/meta-harness.test.ts`
+- `src/meta-harness-server.test.ts`
+- `src/server.ts`
+- `lessons.md`
 

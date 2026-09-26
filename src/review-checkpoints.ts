@@ -36,6 +36,7 @@ interface WorkspaceReviewState {
 
 export interface ReviewCheckpointManager {
   initializeWorkspace(input: { workspaceId: string; root: string }): Promise<void>;
+  forgetWorkspace(workspaceId: string): void;
   reviewChanges(input: {
     workspaceId: string;
     root: string;
@@ -51,6 +52,8 @@ export function createReviewCheckpointManager(): ReviewCheckpointManager {
 
   return {
     async initializeWorkspace({ workspaceId, root }) {
+      const existing = states.get(workspaceId);
+      if (existing?.root === root) return;
       const refs = reviewRefs(workspaceId);
       const state: WorkspaceReviewState = { root, ...refs };
       states.set(workspaceId, state);
@@ -69,6 +72,10 @@ export function createReviewCheckpointManager(): ReviewCheckpointManager {
       } catch (error) {
         state.diagnostic = error instanceof Error ? error.message : String(error);
       }
+    },
+
+    forgetWorkspace(workspaceId) {
+      states.delete(workspaceId);
     },
 
     async reviewChanges({ workspaceId, root, since = "last_shown", markReviewed = true }) {

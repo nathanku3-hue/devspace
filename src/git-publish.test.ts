@@ -77,18 +77,35 @@ try {
 
   await writeFile(join(repository, "allowed.txt"), "second change\n", "utf8");
   await git(repository, ["add", "--", "unrelated.txt"]);
-  await assert.rejects(
-    publishGitChanges({
-      cwd: repository,
-      workspaceRoot: root,
-      paths: ["allowed.txt"],
-      message: "must not include unrelated staging",
-      push: false,
-    }),
-    /unrelated paths are already staged: unrelated\.txt/,
-  );
-  await git(repository, ["restore", "--staged", "--", "unrelated.txt"]);
+  const unrelatedStageBefore = (await git(repository, ["ls-files", "--stage", "-z", "--", "unrelated.txt"])).stdout;
 
+  const isolated = await publishGitChanges({
+    cwd: repository,
+    workspaceRoot: root,
+    paths: ["allowed.txt"],
+    message: "publish allowed file beside foreign staging",
+    push: false,
+  });
+
+  assert.deepEqual(isolated.paths, ["allowed.txt"]);
+  assert.equal(
+    (await git(repository, ["show", "HEAD:allowed.txt"])).stdout,
+    "second change\n",
+  );
+  assert.equal(
+    (await git(repository, ["show", "HEAD:unrelated.txt"])).stdout,
+    "initial\n",
+  );
+  assert.equal(
+    (await git(repository, ["ls-files", "--stage", "-z", "--", "unrelated.txt"])).stdout,
+    unrelatedStageBefore,
+  );
+  assert.equal(
+    (await git(repository, ["diff", "--cached", "--name-only", "-z"])).stdout,
+    "unrelated.txt\0",
+  );
+
+  const headAfterIsolated = (await git(repository, ["rev-parse", "HEAD"])).stdout.trim();
   await writeFile(join(repository, "allowed.txt"), "trailing whitespace  \n", "utf8");
   await assert.rejects(
     publishGitChanges({
@@ -101,7 +118,15 @@ try {
   );
   assert.equal(
     (await git(repository, ["rev-parse", "HEAD"])).stdout.trim(),
-    published.commit,
+    headAfterIsolated,
+  );
+  assert.equal(
+    (await git(repository, ["ls-files", "--stage", "-z", "--", "unrelated.txt"])).stdout,
+    unrelatedStageBefore,
+  );
+  assert.equal(
+    (await git(repository, ["diff", "--cached", "--name-only", "-z"])).stdout,
+    "unrelated.txt\0",
   );
 } finally {
   await rm(root, { recursive: true, force: true });

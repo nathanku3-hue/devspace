@@ -90,6 +90,11 @@ test("public web_launch exposes only WEB-LAUNCH-0 and preserves the supplied pro
     assert.match(tool.description ?? "", /explicitly requests/i);
     assert.deepEqual(Object.keys(tool.inputSchema.properties ?? {}), ["prompt"]);
 
+    const metaContinuation = listed.tools.find((candidate) => candidate.name === "continue_meta_harness");
+    assert.ok(metaContinuation);
+    assert.deepEqual(Object.keys(metaContinuation.inputSchema.properties ?? {}), ["workspaceId"]);
+    assert.match(metaContinuation.description ?? "", /no product result/i);
+
     const prompt = "Keep  exact spacing.\nDo not continue.";
     const result = await client.callTool({ name: "web_launch", arguments: { prompt } });
     assert.deepEqual(prompts, [prompt]);

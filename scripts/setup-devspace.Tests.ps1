@@ -4,6 +4,16 @@ $lifecycleScript = Join-Path $here "setup-devspace-lifecycle.ps1"
 . $supportScript
 . $lifecycleScript
 
+Describe "DevSpace setup script syntax" {
+    It "parses the production setup script without PowerShell syntax errors" {
+        $setupScript = Join-Path $here "setup-devspace.ps1"
+        $tokens = $null
+        $errors = $null
+        [void][System.Management.Automation.Language.Parser]::ParseFile($setupScript, [ref]$tokens, [ref]$errors)
+        @($errors).Count | Should Be 0
+    }
+}
+
 Describe "DevSpace setup tool inventory assertion" {
     $exactTools = @(
         "bash",
@@ -30,6 +40,55 @@ Describe "DevSpace setup tool inventory assertion" {
     It "rejects duplicate tool names" {
         $actual = @($exactTools + "bash")
         { Assert-ExpectedToolInventory -EndpointLabel "test" -ExpectedTools $exactTools -ActualTools $actual } | Should Throw
+    }
+
+    It "rejects an extra live tool name as lockstep drift" {
+        $actual = @($exactTools + "create_worktree_workspace")
+        { Assert-ExpectedToolInventory -EndpointLabel "test" -ExpectedTools $exactTools -ActualTools $actual } | Should Throw
+    }
+
+    It "accepts cached inventory only when provenance and all three inventories match exactly" {
+        $state = [pscustomobject]@{
+            devspacePid   = 1234
+            tunnelHost    = "live.trycloudflare.com"
+            publicBaseUrl = "https://proxy.example.test"
+            source        = [pscustomobject]@{ cliSha256 = "abc123" }
+            toolInventory = [pscustomobject]@{
+                expected = @($exactTools)
+                local    = @($exactTools)
+                public   = @($exactTools)
+            }
+        }
+        $cached = Get-DevSpaceValidatedCachedToolInventory `
+            -State $state `
+            -ExpectedTools $exactTools `
+            -ExpectedDevSpacePid 1234 `
+            -ExpectedCliSha256 "abc123" `
+            -ExpectedTunnelHost "live.trycloudflare.com" `
+            -ExpectedPublicBaseUrl "https://proxy.example.test/"
+        $cached | Should Not Be $null
+        @($cached.Local).Count | Should Be $exactTools.Count
+        @($cached.Public).Count | Should Be $exactTools.Count
+    }
+
+    It "rejects stale or partial cached inventory" {
+        $state = [pscustomobject]@{
+            devspacePid   = 1234
+            tunnelHost    = "live.trycloudflare.com"
+            publicBaseUrl = "https://proxy.example.test"
+            source        = [pscustomobject]@{ cliSha256 = "abc123" }
+            toolInventory = [pscustomobject]@{
+                expected = @($exactTools)
+                local    = @($exactTools)
+                public   = @($exactTools | Select-Object -Skip 1)
+            }
+        }
+        (Get-DevSpaceValidatedCachedToolInventory -State $state -ExpectedTools $exactTools -ExpectedDevSpacePid 1234 -ExpectedCliSha256 "abc123" -ExpectedTunnelHost "live.trycloudflare.com" -ExpectedPublicBaseUrl "https://proxy.example.test") | Should Be $null
+
+        $state.toolInventory.public = @($exactTools)
+        (Get-DevSpaceValidatedCachedToolInventory -State $state -ExpectedTools $exactTools -ExpectedDevSpacePid 9999 -ExpectedCliSha256 "abc123" -ExpectedTunnelHost "live.trycloudflare.com" -ExpectedPublicBaseUrl "https://proxy.example.test") | Should Be $null
+        (Get-DevSpaceValidatedCachedToolInventory -State $state -ExpectedTools $exactTools -ExpectedDevSpacePid 1234 -ExpectedCliSha256 "different" -ExpectedTunnelHost "live.trycloudflare.com" -ExpectedPublicBaseUrl "https://proxy.example.test") | Should Be $null
+        (Get-DevSpaceValidatedCachedToolInventory -State $state -ExpectedTools $exactTools -ExpectedDevSpacePid 1234 -ExpectedCliSha256 "abc123" -ExpectedTunnelHost "other.trycloudflare.com" -ExpectedPublicBaseUrl "https://proxy.example.test") | Should Be $null
     }
 }
 
@@ -101,6 +160,30 @@ Describe "DevSpace healthz JSON schema" {
         Test-DevSpaceHealthzJson '{"ok":"true","name":"devspace"}' | Should Be $false
         Test-DevSpaceHealthzJson '{"name":"devspace"}' | Should Be $false
         Test-DevSpaceHealthzJson '' | Should Be $false
+    }
+}
+
+Describe "DevSpace discovery document validation" {
+    $base = "https://devspace.example.test"
+
+    It "accepts canonical protected-resource and authorization metadata" {
+        $protected = '{"resource":"https://devspace.example.test/mcp","authorization_servers":["https://devspace.example.test/"]}'
+        $authorization = '{"issuer":"https://devspace.example.test/","authorization_endpoint":"https://devspace.example.test/authorize","token_endpoint":"https://devspace.example.test/token","registration_endpoint":"https://devspace.example.test/register"}'
+
+        Test-DevSpaceDiscoveryDocument -Path "/.well-known/oauth-protected-resource/mcp" -Body $protected -PublicBaseUrl $base | Should Be $true
+        Test-DevSpaceDiscoveryDocument -Path "/.well-known/oauth-authorization-server" -Body $authorization -PublicBaseUrl $base | Should Be $true
+        Test-DevSpaceDiscoveryDocument -Path "/.well-known/openid-configuration" -Body $authorization -PublicBaseUrl $base | Should Be $true
+    }
+
+    It "rejects syntactically valid JSON that points OAuth at the wrong origin" {
+        $wrong = '{"issuer":"https://evil.example/","authorization_endpoint":"https://evil.example/authorize","token_endpoint":"https://evil.example/token","registration_endpoint":"https://evil.example/register"}'
+        Test-DevSpaceDiscoveryDocument -Path "/.well-known/oauth-authorization-server" -Body $wrong -PublicBaseUrl $base | Should Be $false
+        Test-DevSpaceDiscoveryDocument -Path "/.well-known/openid-configuration" -Body $wrong -PublicBaseUrl $base | Should Be $false
+    }
+
+    It "rejects Cloudflare errors and malformed protected-resource metadata" {
+        Test-DevSpaceDiscoveryDocument -Path "/.well-known/oauth-protected-resource/mcp" -Body "error code: 1016" -PublicBaseUrl $base | Should Be $false
+        Test-DevSpaceDiscoveryDocument -Path "/.well-known/oauth-protected-resource/mcp" -Body '{"resource":"https://other.example/mcp","authorization_servers":["https://devspace.example.test/"]}' -PublicBaseUrl $base | Should Be $false
     }
 }
 
@@ -251,6 +334,323 @@ Describe "DevSpace preferred source fail-closed" {
         Save-DevSpacePreferredRuntimeSource -PinPath $pinPath -Repository $approved
         $pin = Assert-DevSpacePreferredRuntimeSource -ApprovedCheckout $approved -PinPath $pinPath
         (ConvertTo-NormalizedDevSpacePath $pin.repository) | Should Be (ConvertTo-NormalizedDevSpacePath $approved)
+    }
+
+    It "does not block staged recycle when the pinned checkout is dirty" {
+        $repo = Join-Path $testDirectory "dirty-recycle"
+        New-Item -ItemType Directory -Path $repo -Force | Out-Null
+        & git -C $repo init --quiet
+        Set-Content -LiteralPath (Join-Path $repo "dirty.txt") -Value "untracked" -Encoding ASCII
+        $pin = [pscustomobject]@{ requireClean = $true }
+        { Assert-DevSpaceSourceCleanForRecycle -Repository $repo -Pin $pin } | Should Not Throw
+    }
+}
+
+Describe "DevSpace proxy tunnel readiness classification" {
+    $expectedHost = "cheaper-rpm-karl-more.trycloudflare.com"
+
+    It "treats valid DevSpace JSON as healthy" {
+        $observation = Get-DevSpaceProxyHealthObservation `
+            -Body '{"ok":true,"name":"devspace"}' `
+            -ExpectedTunnelHost $expectedHost
+        $observation.Kind | Should Be "healthy"
+    }
+
+    It "treats Cloudflare HTML naming the expected host as a wait condition" {
+        $body = "<html><head><title>Origin DNS error | Cloudflare</title></head><body>$expectedHost</body></html>"
+        $observation = Get-DevSpaceProxyHealthObservation -Body $body -ExpectedTunnelHost $expectedHost
+        $observation.Kind | Should Be "expected-upstream-not-ready"
+        $observation.SeenHost | Should Be $expectedHost
+    }
+
+    It "distinguishes a genuinely stale Worker upstream" {
+        $body = "<html><head><title>Origin DNS error | Cloudflare</title></head><body>old-host.trycloudflare.com</body></html>"
+        $observation = Get-DevSpaceProxyHealthObservation -Body $body -ExpectedTunnelHost $expectedHost
+        $observation.Kind | Should Be "stale-upstream"
+        $observation.SeenHost | Should Be "old-host.trycloudflare.com"
+    }
+
+    It "does not mistake an expected-host allowlist rejection for DNS warmup" {
+        $observation = Get-DevSpaceProxyHealthObservation `
+            -Body "Invalid Host: $expectedHost" `
+            -ExpectedTunnelHost $expectedHost
+        $observation.Kind | Should Be "invalid-host"
+        $observation.SeenHost | Should Be $expectedHost
+    }
+
+    It "treats plain Cloudflare 1016 text as a wait condition, not health" {
+        $observation = Get-DevSpaceProxyHealthObservation `
+            -Body "error code: 1016" `
+            -ExpectedTunnelHost $expectedHost
+        $observation.Kind | Should Be "expected-upstream-not-ready"
+        Test-DevSpaceCloudflareUpstreamFailure -Body "error code: 1016" -StatusCode 530 | Should Be $true
+        Test-DevSpaceDiscoveryBodyOk -Body "error code: 1016" | Should Be $false
+        Test-DevSpaceDiscoveryBodyOk -Body '{"resource":"https://example.com/mcp"}' | Should Be $true
+    }
+
+    It "treats unauthenticated POST /mcp 401 as origin reached and 530/1016 as not reached" {
+        Test-DevSpacePublicMcpReachedOrigin -StatusCode 401 -Body '{"error":"invalid_token","error_description":"Missing Authorization header"}' | Should Be $true
+        Test-DevSpacePublicMcpReachedOrigin -StatusCode 530 -Body "error code: 1016" | Should Be $false
+        Test-DevSpacePublicMcpReachedOrigin -StatusCode 200 -Body '{"ok":true,"name":"devspace"}' | Should Be $true
+        Test-DevSpaceHealthzJson '{"ok":true,"name":"devspace"}' | Should Be $true
+        Test-DevSpacePublicMcpReachedOrigin -StatusCode 200 -Body '{"ok":true,"name":"devspace"}' | Should Be $true
+    }
+
+    It "treats transient gateway statuses as public-path failures even with empty bodies" {
+        Test-DevSpaceCloudflareUpstreamFailure -StatusCode 502 -Body "" | Should Be $true
+        Test-DevSpaceCloudflareUpstreamFailure -StatusCode 503 -Body "" | Should Be $true
+        Test-DevSpaceCloudflareUpstreamFailure -StatusCode 524 -Body "" | Should Be $true
+        Test-DevSpacePublicMcpReachedOrigin -StatusCode 502 -Body "" | Should Be $false
+    }
+}
+
+Describe "DevSpace public-path self-heal" {
+    $now = [datetime]::SpecifyKind([datetime]"2026-09-14T20:30:00", "Utc")
+
+    It "reboots origin only when local healthz is down" {
+        $d = Get-DevSpacePublicPathHealDecision -LocalHealthy $false -PublicMcpReachedOrigin $false -QuickTunnelAlive $true -NowUtc $now
+        $d.Action | Should Be "reboot-origin"
+        $d.PreserveNode | Should Be $false
+    }
+
+    It "does not reboot a healthy origin for public 502/530" {
+        $d = Get-DevSpacePublicPathHealDecision -LocalHealthy $true -PublicMcpReachedOrigin $false -QuickTunnelAlive $true -NowUtc $now
+        $d.Action | Should Be "restart-tunnel"
+        $d.PreserveNode | Should Be $true
+    }
+
+    It "no-ops when POST /mcp already reached origin" {
+        $d = Get-DevSpacePublicPathHealDecision -LocalHealthy $true -PublicMcpReachedOrigin $true -QuickTunnelAlive $true -NowUtc $now
+        $d.Action | Should Be "noop"
+        $d.PreserveNode | Should Be $true
+    }
+
+    It "reregisters only during trycloudflare remint cooldown" {
+        $d = Get-DevSpacePublicPathHealDecision `
+            -LocalHealthy $true `
+            -PublicMcpReachedOrigin $false `
+            -QuickTunnelAlive $true `
+            -LastTunnelRestartUtc $now.AddMinutes(-2) `
+            -NowUtc $now
+        $d.Action | Should Be "reregister"
+        $d.PreserveNode | Should Be $true
+    }
+
+    It "does not treat an inconclusive POST /mcp probe as 502" {
+        Get-DevSpacePublicMcpProbeKind -StatusCode 0 -Body "" | Should Be "unknown"
+        Get-DevSpacePublicMcpProbeKind -StatusCode 401 -Body "" | Should Be "reached"
+        Get-DevSpacePublicMcpProbeKind -StatusCode 530 -Body "error code: 1016" | Should Be "upstream-failure"
+        $d = Get-DevSpacePublicPathHealDecision `
+            -LocalHealthy $true `
+            -PublicMcpKind "unknown" `
+            -QuickTunnelAlive $true `
+            -NowUtc $now
+        $d.Action | Should Be "noop"
+        $d.PreserveNode | Should Be $true
+    }
+}
+
+Describe "DevSpace quick tunnel custody" {
+    $testDirectory = $null
+
+    BeforeEach {
+        $testDirectory = Join-Path ([System.IO.Path]::GetTempPath()) ("devspace-tunnel-custody-test-" + [Guid]::NewGuid().ToString("N"))
+        New-Item -ItemType Directory -Path $testDirectory -Force | Out-Null
+    }
+
+    AfterEach {
+        Remove-Item -LiteralPath $testDirectory -Recurse -Force -ErrorAction SilentlyContinue
+    }
+
+    It "parses the live cloudflared logfile from its command line" {
+        $commandLine = '"C:\Program Files (x86)\cloudflared\cloudflared.exe" tunnel --url http://127.0.0.1:7676 --logfile "C:\Users\Lenovo\AppData\Local\Temp\cloudflared_tunnel_live.log"'
+        Get-DevSpaceCloudflaredLogFileFromCommandLine -CommandLine $commandLine | Should Be "C:\Users\Lenovo\AppData\Local\Temp\cloudflared_tunnel_live.log"
+    }
+
+    It "atomically replaces tunnel custody while preserving unrelated runtime fields" {
+        $runtimeFile = Join-Path $testDirectory "runtime.json"
+        @{
+            devspacePid    = 2512
+            cloudflaredPid = 2788
+            tunnelUrl      = "https://dead-old.trycloudflare.com"
+            tunnelHost     = "dead-old.trycloudflare.com"
+            source         = @{ commit = "keep-me" }
+        } | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $runtimeFile -Encoding UTF8
+
+        Update-DevSpaceTunnelCustodyFile `
+            -RuntimeFile $runtimeFile `
+            -TunnelUrl "https://cheaper-rpm-karl-more.trycloudflare.com" `
+            -TunnelHost "cheaper-rpm-karl-more.trycloudflare.com" `
+            -CloudflaredPid 20748 `
+            -CloudflaredLog "C:\Temp\cloudflared-live.log" `
+            -DevSpacePid 2512 `
+            -PublicBaseUrl "https://devspace-proxy.kitlongku.workers.dev" | Out-Null
+
+        $loaded = Get-Content -LiteralPath $runtimeFile -Raw | ConvertFrom-Json
+        $loaded.tunnelUrl | Should Be "https://cheaper-rpm-karl-more.trycloudflare.com"
+        $loaded.tunnelHost | Should Be "cheaper-rpm-karl-more.trycloudflare.com"
+        $loaded.cloudflaredPid | Should Be 20748
+        $loaded.cloudflaredLog | Should Be "C:\Temp\cloudflared-live.log"
+        $loaded.devspacePid | Should Be 2512
+        $loaded.source.commit | Should Be "keep-me"
+        $loaded.tunnelPublishedAt | Should Not Be $null
+    }
+
+    It "refuses to overwrite unreadable runtime custody" {
+        $runtimeFile = Join-Path $testDirectory "runtime.json"
+        Set-Content -LiteralPath $runtimeFile -Value "{not-json" -Encoding ASCII
+        {
+            Update-DevSpaceTunnelCustodyFile `
+                -RuntimeFile $runtimeFile `
+                -TunnelUrl "https://cheaper-rpm-karl-more.trycloudflare.com" `
+                -TunnelHost "cheaper-rpm-karl-more.trycloudflare.com" `
+                -CloudflaredPid 20748
+        } | Should Throw
+        (Get-Content -LiteralPath $runtimeFile -Raw).Trim() | Should Be "{not-json"
+    }
+
+    It "includes supervisor logs even when runtime.json still names a dead cloudflared PID" {
+        $runtimeFile = Join-Path $testDirectory "runtime.json"
+        $supervisorConfig = Join-Path $testDirectory "supervisor.json"
+        $staleLog = Join-Path $testDirectory "stale-temp.log"
+        $supervisorLog = Join-Path $testDirectory "quick-tunnel-stderr.log"
+        Set-Content -LiteralPath $staleLog -Value "https://regular-viking-commodity-motors.trycloudflare.com" -Encoding ASCII
+        Set-Content -LiteralPath $supervisorLog -Value "https://present-exp-parker-rebecca.trycloudflare.com" -Encoding ASCII
+        @{
+            cloudflaredPid = 23112
+            cloudflaredLog = $staleLog
+            tunnelUrl      = "https://regular-viking-commodity-motors.trycloudflare.com"
+        } | ConvertTo-Json | Set-Content -LiteralPath $runtimeFile -Encoding UTF8
+        @{
+            quickTunnelStderrLog = $supervisorLog
+        } | ConvertTo-Json | Set-Content -LiteralPath $supervisorConfig -Encoding UTF8
+
+        $files = @(
+            Get-DevSpaceKnownCloudflaredLogFiles `
+                -RuntimeFile $runtimeFile `
+                -SupervisorConfigPath $supervisorConfig
+        )
+        $files -contains $supervisorLog | Should Be $true
+        $files -contains $staleLog | Should Be $true
+
+        Start-Sleep -Milliseconds 20
+        Set-Content -LiteralPath $supervisorLog -Value "|  https://present-exp-parker-rebecca.trycloudflare.com  |" -Encoding ASCII
+        $recovered = Get-DevSpaceQuickTunnelUrlFromLogFiles -LogFiles $files
+        $recovered.TunnelUrl | Should Be "https://present-exp-parker-rebecca.trycloudflare.com"
+        $recovered.LogFile | Should Be $supervisorLog
+    }
+
+    It "prefers the newest logfile URL when cloudflared has scrubbed its command line" {
+        $older = Join-Path $testDirectory "older.log"
+        $newer = Join-Path $testDirectory "newer.log"
+        Set-Content -LiteralPath $older -Value "https://dead-old.trycloudflare.com" -Encoding ASCII
+        Start-Sleep -Milliseconds 20
+        Set-Content -LiteralPath $newer -Value "https://present-exp-parker-rebecca.trycloudflare.com" -Encoding ASCII
+        $recovered = Get-DevSpaceQuickTunnelUrlFromLogFiles -LogFiles @($older, $newer)
+        $recovered.TunnelUrl | Should Be "https://present-exp-parker-rebecca.trycloudflare.com"
+        $recovered.LogFile | Should Be $newer
+    }
+}
+
+Describe "DevSpace origin process matching" {
+    It "matches a serve command line on the canonical dist CLI" {
+        $record = [pscustomobject]@{
+            Name        = "node.exe"
+            ProcessId   = 126044
+            CommandLine = 'D:\nodejs\node.exe E:\Code\devspace\devspace-src\dist\cli.js serve'
+        }
+        Test-DevSpaceOriginRecord -Record $record | Should Be $true
+    }
+
+    It "matches a scrubbed node command line when it owns the origin listener" {
+        $record = [pscustomobject]@{
+            Name        = "node.exe"
+            ProcessId   = 126044
+            CommandLine = ""
+        }
+        Test-DevSpaceOriginRecord -Record $record -ListenerPid 126044 | Should Be $true
+    }
+
+    It "does not treat an unrelated scrubbed node process as the origin" {
+        $record = [pscustomobject]@{
+            Name        = "node.exe"
+            ProcessId   = 99
+            CommandLine = ""
+        }
+        Test-DevSpaceOriginRecord -Record $record -ListenerPid 126044 | Should Be $false
+    }
+
+    It "rejects a non-node listener owner" {
+        $record = [pscustomobject]@{
+            Name        = "cloudflared.exe"
+            ProcessId   = 126044
+            CommandLine = ""
+        }
+        Test-DevSpaceOriginRecord -Record $record -ListenerPid 126044 | Should Be $false
+    }
+}
+
+Describe "DevSpace cloudflared process matching" {
+    It "matches a command line that targets the origin port" {
+        $record = [pscustomobject]@{
+            Name        = "cloudflared.exe"
+            ProcessId   = 42
+            CommandLine = "cloudflared.exe tunnel --url http://127.0.0.1:7676"
+        }
+        Test-DevSpaceCloudflaredRecord -Record $record -LocalPort 7676 | Should Be $true
+    }
+
+    It "rejects a command line aimed at a different port" {
+        $record = [pscustomobject]@{
+            Name        = "cloudflared.exe"
+            ProcessId   = 42
+            CommandLine = "cloudflared.exe tunnel --url http://127.0.0.1:8080"
+        }
+        Test-DevSpaceCloudflaredRecord -Record $record -LocalPort 7676 | Should Be $false
+    }
+
+    It "rejects a scrubbed command line without remembered PID ownership" {
+        $record = [pscustomobject]@{
+            Name        = "cloudflared.exe"
+            ProcessId   = 36380
+            CommandLine = ""
+        }
+        Test-DevSpaceCloudflaredRecord -Record $record -LocalPort 7676 | Should Be $false
+        Test-DevSpaceCloudflaredRecord -Record $record -LocalPort 7676 -RememberedPid 36380 | Should Be $true
+    }
+
+    It "matches a remembered PID even when the command line no longer contains the port" {
+        $record = [pscustomobject]@{
+            Name        = "cloudflared.exe"
+            ProcessId   = 36380
+            CommandLine = "cloudflared.exe tunnel run other-name"
+        }
+        Test-DevSpaceCloudflaredRecord -Record $record -LocalPort 7676 -RememberedPid 36380 | Should Be $true
+    }
+
+    It "rejects a non-cloudflared process" {
+        $record = [pscustomobject]@{
+            Name        = "node.exe"
+            ProcessId   = 1
+            CommandLine = ""
+        }
+        Test-DevSpaceCloudflaredRecord -Record $record -LocalPort 7676 | Should Be $false
+    }
+}
+
+Describe "DevSpace cloudflared launch command" {
+    It "invokes cloudflared.exe directly with --logfile and no cmd redirection" {
+        $cmd = Get-DevSpaceCloudflaredLaunchCommand `
+            -Executable "C:\Program Files (x86)\cloudflared\cloudflared.exe" `
+            -LocalHost "127.0.0.1" `
+            -LocalPort 7676 `
+            -LogFile "C:\Users\Lenovo\AppData\Local\Temp\cloudflared_tunnel_1.log"
+        $cmd | Should Match ([regex]::Escape('"C:\Program Files (x86)\cloudflared\cloudflared.exe"'))
+        $cmd | Should Match ([regex]::Escape("--url http://127.0.0.1:7676"))
+        $cmd | Should Match "--logfile"
+        $cmd | Should Not Match "cmd\.exe"
+        $cmd | Should Not Match " 2>&1"
+        $cmd.StartsWith("cmd.exe") | Should Be $false
     }
 }
 

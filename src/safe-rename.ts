@@ -36,23 +36,23 @@ const defaultFsOps: FileSystemOps = {
 };
 
 export async function safeRenameFile(
-  workspaceRoot: string | string[],
+  workspaceRoot: string,
   sourcePath: string,
   targetPath: string,
   fsOps: FileSystemOps = defaultFsOps
 ): Promise<void> {
-  const allowedRoots = Array.isArray(workspaceRoot) ? workspaceRoot : [workspaceRoot];
-  const realRoots = await Promise.all(allowedRoots.map((root) => fsOps.realpath(root)));
-  const baseRoot = realRoots[0];
+  // Keep rename authority scoped to the opened workspace. Global allowed roots
+  // control which workspaces may be opened; they are not cross-workspace file authority.
+  const realWorkspaceRoot = await fsOps.realpath(workspaceRoot);
 
-  const absSource = resolve(baseRoot, sourcePath);
-  if (!realRoots.some((root) => isPathInsideRoot(absSource, root))) {
-    throw new Error(`Source path resolves outside allowed roots: ${sourcePath}`);
+  const absSource = resolve(realWorkspaceRoot, sourcePath);
+  if (!isPathInsideRoot(absSource, realWorkspaceRoot)) {
+    throw new Error(`Source path resolves outside workspace root: ${sourcePath}`);
   }
 
-  const absTarget = resolve(baseRoot, targetPath);
-  if (!realRoots.some((root) => isPathInsideRoot(absTarget, root))) {
-    throw new Error(`Target path resolves outside allowed roots: ${targetPath}`);
+  const absTarget = resolve(realWorkspaceRoot, targetPath);
+  if (!isPathInsideRoot(absTarget, realWorkspaceRoot)) {
+    throw new Error(`Target path resolves outside workspace root: ${targetPath}`);
   }
 
   let originalSourceStats;
@@ -71,8 +71,8 @@ export async function safeRenameFile(
   }
 
   const realSource = await fsOps.realpath(absSource);
-  if (!realRoots.some((root) => isPathInsideRoot(realSource, root))) {
-    throw new Error(`Source path resolves outside allowed roots: ${sourcePath}`);
+  if (!isPathInsideRoot(realSource, realWorkspaceRoot)) {
+    throw new Error(`Source path resolves outside workspace root: ${sourcePath}`);
   }
 
   const targetParent = dirname(absTarget);
@@ -87,8 +87,8 @@ export async function safeRenameFile(
     throw error;
   }
 
-  if (!realRoots.some((root) => isPathInsideRoot(realTargetParent, root))) {
-    throw new Error(`Target path resolves outside allowed roots: ${targetPath}`);
+  if (!isPathInsideRoot(realTargetParent, realWorkspaceRoot)) {
+    throw new Error(`Target path resolves outside workspace root: ${targetPath}`);
   }
 
   const targetParentStats = await fsOps.lstat(realTargetParent);

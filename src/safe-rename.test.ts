@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { resolve, basename } from "node:path";
+import { resolve, basename, relative } from "node:path";
 import { safeRenameFile, FileSystemOps } from "./safe-rename.js";
 import { Stats } from "node:fs";
 
@@ -139,12 +139,12 @@ const mockRoot = resolve("/mock/workspace");
 
   await assert.rejects(
     safeRenameFile(mockRoot, "../source.txt", "target.txt", fsOps),
-    /Source path resolves outside allowed roots/
+    /Source path resolves outside workspace root/
   );
 
   await assert.rejects(
     safeRenameFile(mockRoot, "source.txt", "../target.txt", fsOps),
-    /Target path resolves outside allowed roots/
+    /Target path resolves outside workspace root/
   );
 }
 
@@ -284,6 +284,44 @@ const mockRoot = resolve("/mock/workspace");
   assert.deepEqual(linked, [[resolve(mockRoot, "source.txt"), resolve(mockRoot, "target.txt")]]);
   // Both unlinks failed, so unlinked list should be empty
   assert.deepEqual(unlinked, []);
+}
+
+// Test 10: Sibling workspace roots are never part of this workspace's rename authority
+{
+  const siblingRoot = resolve(mockRoot, "..", "other-workspace");
+  const siblingSource = resolve(siblingRoot, "source.txt");
+  const siblingTarget = resolve(siblingRoot, "target.txt");
+  let mutationAttempted = false;
+
+  const fsOps: FileSystemOps = {
+    realpath: async (p) => p,
+    lstat: async (p) => {
+      if (p === resolve(mockRoot, "source.txt") || p === siblingSource) {
+        return createMockStats(true, false, false);
+      }
+      return createMockStats(false, true, false);
+    },
+    link: async () => {
+      mutationAttempted = true;
+      throw new Error("link must not run for cross-workspace paths");
+    },
+    unlink: async () => {
+      mutationAttempted = true;
+      throw new Error("unlink must not run for cross-workspace paths");
+    },
+  };
+
+  await assert.rejects(
+    safeRenameFile(mockRoot, relative(mockRoot, siblingSource), "target.txt", fsOps),
+    /Source path resolves outside workspace root/
+  );
+
+  await assert.rejects(
+    safeRenameFile(mockRoot, "source.txt", relative(mockRoot, siblingTarget), fsOps),
+    /Target path resolves outside workspace root/
+  );
+
+  assert.equal(mutationAttempted, false, "Cross-workspace rejection must happen before any mutation");
 }
 
 console.log("All safe-rename unit tests passed!");

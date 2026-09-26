@@ -87,6 +87,7 @@ assert.equal(loadConfig(baseEnv).oauth.ownerToken, "test-owner-token-that-is-lon
 assert.deepEqual(loadConfig(baseEnv).oauth.scopes, ["devspace"]);
 assert.deepEqual(loadConfig(baseEnv).oauth.allowedRedirectHosts, [
   "chatgpt.com",
+  "chatshare.xyz",
   "localhost",
   "127.0.0.1",
 ]);
@@ -108,7 +109,7 @@ assert.deepEqual(
   loadConfig({ ...baseEnv, DEVSPACE_DEVICE_AUTH: "1" }).oauth.deviceAuthorization,
   {
     enabled: true,
-    required: true,
+    required: false,
     loopbackPort: 7677,
     extensionId: "aaoelopmdnhifffjefciagfmhjanbaoc",
     allowedRedirectPrefixes: [
@@ -125,6 +126,14 @@ assert.equal(
     DEVSPACE_DEVICE_AUTH_REQUIRED: "0",
   }).oauth.deviceAuthorization.required,
   false,
+);
+assert.equal(
+  loadConfig({
+    ...baseEnv,
+    DEVSPACE_DEVICE_AUTH: "1",
+    DEVSPACE_DEVICE_AUTH_REQUIRED: "1",
+  }).oauth.deviceAuthorization.required,
+  true,
 );
 
 assert.deepEqual(

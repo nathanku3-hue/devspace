@@ -22,6 +22,11 @@ try {
   await mkdir(join(root, "nested"));
   await writeFile(join(root, "nested", "AGENTS.md"), "nested instructions\n");
   await writeFile(join(root, "nested", "file.txt"), "hello\n");
+  await mkdir(join(root, ".worktrees", "stale-worktree"), { recursive: true });
+  await writeFile(
+    join(root, ".worktrees", "stale-worktree", "AGENTS.md"),
+    "must not leak into parent workspace context\n",
+  );
 
   const config = loadConfig({
     DEVSPACE_ALLOWED_ROOTS: root,
@@ -43,11 +48,28 @@ try {
     [join(root, "nested", "AGENTS.md")],
   );
 
+  const reopened = await registry.openWorkspace(root);
+  assert.equal(reopened.workspace.id, workspace.id, "checkout reopen should reuse the active workspace");
+  const concurrentCheckout = await Promise.all([
+    registry.openWorkspace(root),
+    registry.openWorkspace(root),
+    registry.openWorkspace(root),
+  ]);
+  assert.deepEqual(
+    concurrentCheckout.map((item) => item.workspace.id),
+    [workspace.id, workspace.id, workspace.id],
+    "concurrent checkout opens should deduplicate",
+  );
+
   const missingWorkspaceRoot = join(root, "missing", "workspace");
-  const missingWorkspace = await registry.openWorkspace(missingWorkspaceRoot);
-  assert.equal(missingWorkspace.workspace.root, missingWorkspaceRoot);
-  assert.equal(missingWorkspace.workspace.mode, "checkout");
-  assert.equal((await stat(missingWorkspaceRoot)).isDirectory(), true);
+  await assert.rejects(
+    () => registry.openWorkspace(missingWorkspaceRoot),
+    /Workspace root does not exist/,
+  );
+  await assert.rejects(
+    () => stat(missingWorkspaceRoot),
+    (error: unknown) => (error as NodeJS.ErrnoException).code === "ENOENT",
+  );
 
   await assert.rejects(
     () => registry.openWorkspace({ path: root, mode: "worktree" }),
@@ -67,6 +89,11 @@ try {
   await git(gitRoot, ["branch", "existing-worktree-branch"]);
   await mkdir(join(gitRoot, "untracked", "active"), { recursive: true });
   await writeFile(join(gitRoot, "untracked", "active", "AGENTS.md"), "untracked active instructions\n");
+  await mkdir(join(gitRoot, ".worktrees", "foreign"), { recursive: true });
+  await writeFile(
+    join(gitRoot, ".worktrees", "foreign", "AGENTS.md"),
+    "foreign worktree instructions must not leak\n",
+  );
   await mkdir(join(gitRoot, "tmp", "replay"), { recursive: true });
   await writeFile(join(gitRoot, "tmp", "replay", "AGENTS.md"), "ignored replay instructions\n");
   await writeFile(join(gitRoot, "dirty.txt"), "not copied\n");

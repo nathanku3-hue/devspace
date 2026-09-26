@@ -38,6 +38,7 @@ npx @waishnav/devspace config set publicBaseUrl https://devspace.example.com
 | `DEVSPACE_OAUTH_OWNER_TOKEN` | Owner password for OAuth approval when enrolled-PC authorization is disabled. Must be at least 16 characters. |
 | `DEVSPACE_DEVICE_AUTH` | Enables silent enrolled-PC OAuth authorization through a loopback signer. |
 | `DEVSPACE_STATE_DIR` | Directory for SQLite state. Defaults to `~/.local/share/devspace`. |
+| `DEVSPACE_SHELL` | Optional absolute path to the workspace Bash executable. On Windows, Git Bash next to `git.exe` is used when this is unset. |
 
 ## OAuth
 
@@ -49,14 +50,14 @@ password or a silent proof from the enrolled PC.
 | `DEVSPACE_OAUTH_ACCESS_TOKEN_TTL_SECONDS` | `3600` |
 | `DEVSPACE_OAUTH_REFRESH_TOKEN_TTL_SECONDS` | `2592000` |
 | `DEVSPACE_OAUTH_SCOPES` | `devspace` |
-| `DEVSPACE_OAUTH_ALLOWED_REDIRECT_HOSTS` | `chatgpt.com,localhost,127.0.0.1` |
+| `DEVSPACE_OAUTH_ALLOWED_REDIRECT_HOSTS` | `chatgpt.com,chatshare.xyz,localhost,127.0.0.1` |
 
 ### Silent Enrolled-PC Authorization
 
 | Variable | Default |
 | --- | --- |
 | `DEVSPACE_DEVICE_AUTH` | `0` |
-| `DEVSPACE_DEVICE_AUTH_REQUIRED` | Same value as `DEVSPACE_DEVICE_AUTH` |
+| `DEVSPACE_DEVICE_AUTH_REQUIRED` | `0` |
 | `DEVSPACE_DEVICE_AUTH_LOOPBACK_PORT` | `7677` |
 | `DEVSPACE_DEVICE_AUTH_EXTENSION_ID` | Bundled extension ID |
 | `DEVSPACE_DEVICE_AUTH_ALLOWED_REDIRECT_PREFIXES` | Chatshare OAuth callback prefixes |

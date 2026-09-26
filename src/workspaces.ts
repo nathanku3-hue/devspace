@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import type { WorkspaceMode, WorkspaceStore } from "./workspace-store.js";
-import { mkdir, opendir, stat } from "node:fs/promises";
+import { opendir, stat } from "node:fs/promises";
 import { dirname, join, relative, resolve, sep } from "node:path";
 import { loadProjectContextFiles } from "@earendil-works/pi-coding-agent";
 import type { ServerConfig } from "./config.js";
@@ -79,6 +79,9 @@ export interface ClosedWorkspace {
 
 export class WorkspaceRegistry {
   private readonly workspaces = new Map<string, Workspace>();
+  private readonly checkoutByRoot = new Map<string, Workspace>();
+  private readonly checkoutOpening = new Map<string, Promise<WorkspaceContext>>();
+  private readonly lastAccessMs = new Map<string, number>();
 
   constructor(
     private readonly config: ServerConfig,
@@ -105,6 +108,7 @@ export class WorkspaceRegistry {
     const workspace = this.workspaces.get(workspaceId);
     if (workspace) {
       this.store?.touchSession(workspaceId);
+      this.lastAccessMs.set(workspaceId, Date.now());
       return workspace;
     }
 
@@ -136,6 +140,10 @@ export class WorkspaceRegistry {
     };
     this.store?.touchSession(workspaceId);
     this.workspaces.set(restoredWorkspace.id, restoredWorkspace);
+    this.lastAccessMs.set(restoredWorkspace.id, Date.now());
+    if (restoredWorkspace.mode === "checkout") {
+      this.checkoutByRoot.set(contextPathKey(restoredWorkspace.root), restoredWorkspace);
+    }
 
     return restoredWorkspace;
   }
@@ -176,6 +184,13 @@ export class WorkspaceRegistry {
     }
 
     this.workspaces.delete(input.workspaceId);
+    this.lastAccessMs.delete(input.workspaceId);
+    if (mode === "checkout") {
+      const key = contextPathKey(root);
+      if (this.checkoutByRoot.get(key)?.id === input.workspaceId) {
+        this.checkoutByRoot.delete(key);
+      }
+    }
     this.store?.closeSession(input.workspaceId, headSha);
 
     return {
@@ -189,6 +204,22 @@ export class WorkspaceRegistry {
       headSha,
       branch,
     };
+  }
+
+  evictInactiveMemory(maxIdleMs: number, now = Date.now()): string[] {
+    const evicted: string[] = [];
+    for (const [workspaceId, workspace] of this.workspaces) {
+      const lastAccess = this.lastAccessMs.get(workspaceId) ?? now;
+      if (now - lastAccess < maxIdleMs) continue;
+      this.workspaces.delete(workspaceId);
+      this.lastAccessMs.delete(workspaceId);
+      if (workspace.mode === "checkout") {
+        const key = contextPathKey(workspace.root);
+        if (this.checkoutByRoot.get(key)?.id === workspaceId) this.checkoutByRoot.delete(key);
+      }
+      evicted.push(workspaceId);
+    }
+    return evicted;
   }
 
   resolvePath(workspace: Workspace, inputPath: string): string {
@@ -235,14 +266,41 @@ export class WorkspaceRegistry {
 
   private async openCheckoutWorkspace(path: string): Promise<WorkspaceContext> {
     const root = assertAllowedPath(path, this.config.allowedRoots);
-    await mkdir(root, { recursive: true });
-
-    const rootStats = await stat(root);
-    if (!rootStats.isDirectory()) {
-      throw new Error(`Workspace root must be a directory: ${path}`);
+    const key = contextPathKey(root);
+    const existing = this.checkoutByRoot.get(key);
+    if (existing) {
+      this.lastAccessMs.set(existing.id, Date.now());
+      this.store?.touchSession(existing.id);
+      return this.workspaceContext(existing);
     }
 
-    return this.createWorkspaceContext({ root, mode: "checkout" });
+    const pending = this.checkoutOpening.get(key);
+    if (pending) return pending;
+
+    const opening = (async () => {
+      let rootStats;
+      try {
+        rootStats = await stat(root);
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+          throw new Error(`Workspace root does not exist: ${path}`);
+        }
+        throw error;
+      }
+      if (!rootStats.isDirectory()) {
+        throw new Error(`Workspace root must be a directory: ${path}`);
+      }
+
+      const context = await this.createWorkspaceContext({ root, mode: "checkout" });
+      this.checkoutByRoot.set(key, context.workspace);
+      return context;
+    })();
+    this.checkoutOpening.set(key, opening);
+    try {
+      return await opening;
+    } finally {
+      if (this.checkoutOpening.get(key) === opening) this.checkoutOpening.delete(key);
+    }
   }
 
   private async openWorktreeWorkspace(
@@ -295,9 +353,13 @@ export class WorkspaceRegistry {
       managed: workspace.worktree?.managed,
     });
     this.workspaces.set(workspace.id, workspace);
+    this.lastAccessMs.set(workspace.id, Date.now());
+    return this.workspaceContext(workspace);
+  }
+
+  private async workspaceContext(workspace: Workspace): Promise<WorkspaceContext> {
     const agentsFiles = this.loadInitialAgentsFiles(workspace.root);
     const availableAgentsFiles = await this.findAvailableAgentsFiles(workspace.root, agentsFiles);
-
     return { workspace, agentsFiles, availableAgentsFiles };
   }
 
@@ -380,6 +442,7 @@ const SKIPPED_CONTEXT_DIRS = new Set([
   ".hg",
   ".svn",
   ".devspace",
+  ".worktrees",
   "node_modules",
   "dist",
   "build",
@@ -415,6 +478,7 @@ async function findGitContextFiles(root: string): Promise<string[] | undefined> 
         stdout
           .split("\0")
           .filter(Boolean)
+          .filter((path) => !path.split(/[\\/]/u).includes(".worktrees"))
           .map((path) => resolve(gitRoot, path))
           .filter((path) => isPathInsideRoot(path, root))
           .map((path) => [contextPathKey(path), path] as const),

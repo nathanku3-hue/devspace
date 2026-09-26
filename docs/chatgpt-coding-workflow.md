@@ -24,6 +24,24 @@ Do not reopen the same folder unless:
 - the user switches between checkout and worktree mode
 - the user explicitly asks to reopen
 
+### Velocity-first startup
+
+Opening a workspace is a complete action. A retained Meta-Harness `CONTINUE`
+state does not by itself mean the user asked to resume it.
+
+When the current turn contains a concrete task, use the returned startup
+projection and execute that task directly. When the turn only asks to open the
+workspace, return the opened workspace without starting retained work.
+
+Call `continue_meta_harness` only when the user explicitly asks to resume or
+continue retained Meta-Harness work. An automatic continuation attempt is
+single-shot per user turn: `STOPPED`, `BLOCKED`, or an error must not trigger
+an automatic retry in that same turn.
+
+Nested instruction discovery also excludes `.worktrees` directories so
+instructions from sibling or stale managed worktrees do not pollute the current
+workspace startup context.
+
 ## Checkout Mode
 
 Checkout mode is the default. DevSpace opens the actual directory:
@@ -189,6 +207,39 @@ Legacy names are available with `DEVSPACE_TOOL_NAMING=legacy`:
 
 Use `DEVSPACE_TOOL_MODE=full` to restore dedicated search and directory tools.
 
+## Live Delegation Acceptance
+
+For deployments that include DELEGATION-R2, verify the **live authenticated** MCP inventory before claiming delegation is available. Source code, a clean candidate build, or a client-side schema snapshot is not sufficient evidence by itself.
+
+The live connector must advertise all five delegation tools:
+
+- `spawn_delegation`
+- `get_delegation`
+- `resume_delegation`
+- `cancel_lane`
+- `lane_submit`
+
+If any of those names is absent from the live `tools/list`, stop there and classify the problem as deployment/schema custody rather than a delegation-controller failure.
+
+The end-to-end acceptance sequence is:
+
+1. `spawn_delegation` with one sealed parent memory packet and bounded lane briefs.
+2. Intentionally `cancel_lane` for one lane and confirm siblings remain unaffected.
+3. Use `get_delegation` for compact fan-in and expand only explicitly requested evidence refs.
+4. The product planner accepts healthy evidence and advisory `worldDelta` exactly once.
+
+DevSpace does not expose a separate planner-acceptance API. `worldDelta` is advisory; DevSpace does not automatically apply it to parent World. A cancelled lane is fenced from later result submission, and cancellation itself must not mutate parent World.
+
+For the protected Windows production layout in this repository, a healthy origin makes the root setup launcher a no-op. After a reviewed 35-tool integration is present in the canonical non-worktree checkout, the operator recycle is:
+
+```powershell
+# Elevated Administrator PowerShell
+powershell -NoProfile -ExecutionPolicy Bypass -File E:\Code\devspace\devspace-src\scripts\operator-stop-devspace.ps1
+powershell -NoProfile -ExecutionPolicy Bypass -File E:\Code\devspace\setup_devspace.ps1 -PinPreferredSource
+```
+
+Production setup must not be pointed at a managed `.worktrees` checkout. The setup close condition is authenticated `tools/list` agreement on both local and public endpoints. After a tool-surface change, refresh or republish the ChatGPT connector schema and start a fresh conversation before running the live delegation acceptance.
+
 ## Show Changes
 
 By default, `DEVSPACE_WIDGETS=full`.
@@ -213,6 +264,8 @@ File writes should go through the edit/write tools rather than shell
 redirection, heredocs, `tee`, `sed -i`, or generated scripts.
 
 When the user explicitly requests a commit or push, use
-`publish_git_changes` with exact file paths. The tool refuses unrelated staged
-files, runs the cached whitespace check, creates a normal commit, and pushes the
-checked-out branch without force.
+`publish_git_changes` with exact file paths. The tool commits only those paths
+from a private index, leaves unrelated already-staged files untouched, runs the
+cached whitespace check, creates a normal commit, and pushes the checked-out
+branch without force. Do not unstage or reset another slice's index to make a
+partial commit.

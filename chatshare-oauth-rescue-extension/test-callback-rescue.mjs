@@ -196,6 +196,42 @@ try {
     return result.result.value === true;
   }, 8000, "saved plugin settings redirect");
 
+  await cdp.call("Page.navigate", { url: `http://127.0.0.1:${appPort}/` });
+  const guard = await cdp.call("Runtime.evaluate", {
+    expression: `(() => {
+      const host = document.createElement("div");
+      const text = document.createTextNode("Hello");
+      host.appendChild(text);
+      document.body.appendChild(host);
+      const font = document.createElement("font");
+      host.replaceChild(font, text);
+      font.appendChild(text);
+      let removeThrew = false;
+      try { host.removeChild(text); } catch { removeThrew = true; }
+      const sibling = document.createElement("span");
+      host.appendChild(sibling);
+      const extra = document.createElement("em");
+      sibling.appendChild(extra);
+      let insertThrew = false;
+      try { host.insertBefore(document.createElement("i"), extra); } catch { insertThrew = true; }
+      return {
+        removeThrew,
+        insertThrew,
+        translate: document.documentElement.getAttribute("translate"),
+        notranslate: document.documentElement.classList.contains("notranslate"),
+        patched: Boolean(Node.prototype.__chatshareRescueDomGuard),
+      };
+    })()`,
+    returnByValue: true,
+  });
+  const guardValue = guard.result.value;
+  if (!guardValue?.patched) throw new Error("React DOM mismatch guard was not installed");
+  if (guardValue.removeThrew) throw new Error("mismatched removeChild still threw");
+  if (guardValue.insertThrew) throw new Error("mismatched insertBefore still threw");
+  if (guardValue.translate !== "no" || !guardValue.notranslate) {
+    throw new Error(`browser translate was not disabled: ${JSON.stringify(guardValue)}`);
+  }
+
   console.log(JSON.stringify({
     passed: true,
     productionErrorPrevented: true,
@@ -206,6 +242,8 @@ try {
     stayedOnPluginsInsteadOfMissingRoute: true,
     returnedToPluginSettings: true,
     honoredSavedPluginReturn: true,
+    reactDomMismatchGuard: true,
+    browserTranslateDisabled: true,
     finalPage: state.result.value,
   }, null, 2));
   cdp.close();

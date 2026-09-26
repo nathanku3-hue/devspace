@@ -1,12 +1,16 @@
 # Compatibility launcher. Production operators should use E:\Code\devspace\setup_devspace.ps1.
+# Model-facing: does not accept -Stop.
+[CmdletBinding()]
 param(
     [switch]$Monitor,
-    [switch]$Stop,
     [switch]$Reregister,
     [switch]$AllowDirty,
     [switch]$OverridePreferredSource,
     [switch]$PinPreferredSource
 )
+if ($MyInvocation.UnboundArguments -and $MyInvocation.UnboundArguments.Count -gt 0) {
+    throw "Unexpected arguments: $($MyInvocation.UnboundArguments -join ' '). Model-facing setup does not accept -Stop."
+}
 
 $canonicalScript = Join-Path $PSScriptRoot "scripts\setup-devspace.ps1"
 if (!(Test-Path -LiteralPath $canonicalScript -PathType Leaf)) {
@@ -16,7 +20,6 @@ if (!(Test-Path -LiteralPath $canonicalScript -PathType Leaf)) {
 
 $forwardedArguments = @()
 if ($Monitor) { $forwardedArguments += "-Monitor" }
-if ($Stop) { $forwardedArguments += "-Stop" }
 if ($Reregister) { $forwardedArguments += "-Reregister" }
 if ($AllowDirty) { $forwardedArguments += "-AllowDirty" }
 if ($OverridePreferredSource) { $forwardedArguments += "-OverridePreferredSource" }

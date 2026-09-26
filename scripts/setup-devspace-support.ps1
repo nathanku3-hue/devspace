@@ -123,3 +123,56 @@ function Assert-ExpectedToolInventory {
 
     return $actual
 }
+
+function Get-DevSpaceValidatedCachedToolInventory {
+    param(
+        [AllowNull()]$State,
+        [Parameter(Mandatory = $true)][string[]]$ExpectedTools,
+        [int]$ExpectedDevSpacePid = 0,
+        [string]$ExpectedCliSha256 = "",
+        [string]$ExpectedTunnelHost = "",
+        [string]$ExpectedPublicBaseUrl = ""
+    )
+
+    if ($null -eq $State -or $null -eq $State.toolInventory) {
+        return $null
+    }
+    if ($ExpectedDevSpacePid -gt 0 -and [int]$State.devspacePid -ne $ExpectedDevSpacePid) {
+        return $null
+    }
+    if (
+        -not [string]::IsNullOrWhiteSpace($ExpectedCliSha256) -and
+        -not [System.StringComparer]::OrdinalIgnoreCase.Equals([string]$State.source.cliSha256, $ExpectedCliSha256)
+    ) {
+        return $null
+    }
+    if (
+        -not [string]::IsNullOrWhiteSpace($ExpectedTunnelHost) -and
+        -not [System.StringComparer]::OrdinalIgnoreCase.Equals([string]$State.tunnelHost, $ExpectedTunnelHost)
+    ) {
+        return $null
+    }
+    if (
+        -not [string]::IsNullOrWhiteSpace($ExpectedPublicBaseUrl) -and
+        -not [System.StringComparer]::OrdinalIgnoreCase.Equals(
+            ([string]$State.publicBaseUrl).TrimEnd('/'),
+            $ExpectedPublicBaseUrl.TrimEnd('/')
+        )
+    ) {
+        return $null
+    }
+
+    try {
+        $expected = Assert-ExpectedToolInventory -EndpointLabel "Cached expected" -ExpectedTools $ExpectedTools -ActualTools @($State.toolInventory.expected)
+        $local = Assert-ExpectedToolInventory -EndpointLabel "Cached local" -ExpectedTools $ExpectedTools -ActualTools @($State.toolInventory.local)
+        $public = Assert-ExpectedToolInventory -EndpointLabel "Cached public" -ExpectedTools $ExpectedTools -ActualTools @($State.toolInventory.public)
+    } catch {
+        return $null
+    }
+
+    return [pscustomobject]@{
+        Expected = @($expected)
+        Local    = @($local)
+        Public   = @($public)
+    }
+}

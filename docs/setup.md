@@ -8,7 +8,7 @@ projects through DevSpace.
 - Node `>=22.19 <27`
 - npm
 - Git
-- Bash, including Git Bash or WSL on Windows
+- Bash, including Git Bash on Windows (discovered next to `git.exe`; the WSL `System32\bash.exe` stub is not used when Git Bash exists)
 - a public HTTPS URL that forwards to the local DevSpace server
 
 DevSpace does not create the public tunnel for you. Use Cloudflare Tunnel,

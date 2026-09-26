@@ -6,6 +6,7 @@ import * as prompts from "@clack/prompts";
 import { getShellConfig } from "@earendil-works/pi-coding-agent";
 import { satisfies } from "semver";
 import { loadConfig } from "./config.js";
+import { resolveWorkspaceShell } from "./workspace-shell.js";
 import {
   generateOwnerToken,
   loadDevspaceFiles,
@@ -218,7 +219,8 @@ async function runDoctor(): Promise<void> {
   console.log(`Node ABI: ${process.versions.modules}`);
   console.log(`Platform: ${process.platform} ${process.arch}`);
   console.log(`Git: ${checkGitAvailable()}`);
-  console.log(`Bash shell: ${checkBashShell()}`);
+  console.log(`Workspace shell: ${checkBashShell()}`);
+  console.log(`Ripgrep: ${checkRipgrep()}`);
   console.log(`SQLite native dependency: ${checkSqliteNative()}`);
 
   try {
@@ -389,8 +391,32 @@ function checkGitAvailable(): string {
 
 function checkBashShell(): string {
   try {
-    const { shell, args } = getShellConfig();
-    return `${shell} ${args.join(" ")}`;
+    const resolved = resolveWorkspaceShell();
+    const { args } = getShellConfig(resolved.shellPath);
+    const warning =
+      resolved.kind === "wsl-bash"
+        ? " — WSL stub; Windows Git Bash was not found, so rg/git.exe are not on this shell PATH"
+        : "";
+    return `${resolved.shellPath} ${args.join(" ")} [${resolved.kind} via ${resolved.source}]${warning}`;
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    return `unavailable (${message})`;
+  }
+}
+
+function checkRipgrep(): string {
+  try {
+    const { spawnSync } = require("node:child_process") as typeof import("node:child_process");
+    const result = spawnSync("rg", ["--version"], {
+      encoding: "utf8",
+      timeout: 5000,
+      windowsHide: true,
+    });
+    if (result.status === 0 && result.stdout) {
+      return result.stdout.trim().split(/\r?\n/)[0] ?? "ok";
+    }
+    const detail = result.error?.message ?? result.stderr?.trim() ?? `exit ${result.status}`;
+    return `unavailable (${detail})`;
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     return `unavailable (${message})`;

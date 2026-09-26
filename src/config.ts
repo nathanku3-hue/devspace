@@ -258,7 +258,7 @@ function parseDeviceAuthorization(env: NodeJS.ProcessEnv): OAuthConfig["deviceAu
     enabled,
     required:
       env.DEVSPACE_DEVICE_AUTH_REQUIRED === undefined
-        ? enabled
+        ? false
         : parseBoolean(env.DEVSPACE_DEVICE_AUTH_REQUIRED),
     loopbackPort,
     extensionId: env.DEVSPACE_DEVICE_AUTH_EXTENSION_ID?.trim() || DEFAULT_DEVICE_AUTH_EXTENSION_ID,
@@ -312,6 +312,7 @@ function parseOAuthConfig(env: NodeJS.ProcessEnv, ownerToken: string | undefined
     scopes: parseStringList(env.DEVSPACE_OAUTH_SCOPES, ["devspace"]),
     allowedRedirectHosts: parseStringList(env.DEVSPACE_OAUTH_ALLOWED_REDIRECT_HOSTS, [
       "chatgpt.com",
+      "chatshare.xyz",
       "localhost",
       "127.0.0.1",
     ]),

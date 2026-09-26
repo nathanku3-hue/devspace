@@ -29,6 +29,21 @@ After this one-time setup, a valid Chatshare OAuth authorization page obtains a
 one-time proof from `127.0.0.1:7677` and submits automatically. There is no
 password prompt or approval click while DevSpace is running normally.
 
+Version `1.12.0` also keeps Chatshare from white-screening with:
+
+```text
+Application Error
+NotFoundError: Failed to execute 'removeChild' on 'Node':
+The node to be removed is not a child of this node.
+```
+
+That stack is Chatshare's own React reconciler (`chatgpt-remix.openoai.net`),
+not DevSpace. Chrome Translate and other page-mutating extensions wrap text
+nodes React still thinks it owns. The content script now marks the document
+`translate="no"` and swallows only the mismatched-parent `removeChild` /
+`insertBefore` case so Chatshare does not unmount the whole app. Reload the
+unpacked extension after this update.
+
 Version `1.11.0` fetches that proof from the authorize tab, not only from the
 service worker, so Chrome can show the local-network prompt. Version `1.10.0`
 still stays on the ChatGPT document at `/` and, after the callback POST,

@@ -1,6 +1,12 @@
 (() => {
   "use strict";
 
+  // Chatshare's Remix tree throws NotFoundError on Node.removeChild when
+  // Chrome Translate or another extension wraps a text node React still
+  // owns. That uncaught exception is the white-screen "Application Error".
+  installReactDomMismatchGuard();
+  disableBrowserTranslate();
+
   const fragmentPrefix = "#cs_oauth_callback=";
   const callbackRouteId = "routes/connector.oauth.$callback_id";
   const rescueStatusKey = "chatshare-oauth-callback-rescue-status";
@@ -492,6 +498,39 @@
   function nextShellUrl() {
     if (isLoginSurface()) return loginPath;
     return documentShellPath;
+  }
+
+  function installReactDomMismatchGuard() {
+    if (typeof Node !== "function" || !Node.prototype) return;
+    if (Node.prototype.__chatshareRescueDomGuard) return;
+    Object.defineProperty(Node.prototype, "__chatshareRescueDomGuard", {
+      value: true,
+      configurable: true,
+    });
+
+    const originalRemoveChild = Node.prototype.removeChild;
+    Node.prototype.removeChild = function (child) {
+      if (child && child.parentNode !== this) return child;
+      return originalRemoveChild.apply(this, arguments);
+    };
+
+    const originalInsertBefore = Node.prototype.insertBefore;
+    Node.prototype.insertBefore = function (newNode, referenceNode) {
+      if (referenceNode && referenceNode.parentNode !== this) return newNode;
+      return originalInsertBefore.apply(this, arguments);
+    };
+  }
+
+  function disableBrowserTranslate() {
+    const apply = () => {
+      const html = document.documentElement;
+      if (!html) return false;
+      html.setAttribute("translate", "no");
+      html.classList.add("notranslate");
+      return true;
+    };
+    if (apply()) return;
+    document.addEventListener("DOMContentLoaded", apply, { once: true });
   }
 
   function watchLoginThenResume() {

@@ -17,6 +17,9 @@ import {
   type AgentToolResult,
 } from "@earendil-works/pi-coding-agent";
 import { resolveAllowedPath } from "./roots.js";
+import { evaluateBashRuntimePolicy, loadRuntimePolicyContext } from "./bash-runtime-policy.js";
+import { resolveWorkspaceShell, type WorkspaceShellKind } from "./workspace-shell.js";
+import { createGuardedBashOperations } from "./shell-runtime.js";
 
 type McpContent = { type: "text"; text: string } | { type: "image"; data: string; mimeType: string };
 export type ToolResponse<TDetails = unknown> = {
@@ -98,11 +101,18 @@ export async function editFileTool(input: EditToolInput, context: ToolContext): 
   }, context);
 }
 
-export async function grepFilesTool(input: GrepToolInput, context: ToolContext): Promise<ToolResponse> {
+export async function grepFilesTool(
+  input: GrepToolInput & { include?: string },
+  context: ToolContext,
+): Promise<ToolResponse> {
   if (input.path) resolveAllowedPath(input.path, context.cwd, context.allowedRoots ?? [context.root]);
   const tool = createGrepTool(context.cwd);
+  const { include, ...rest } = input;
 
-  return runTool((params) => tool.execute("grep_files", params), input, context);
+  return runTool((params) => tool.execute("grep_files", params), {
+    ...rest,
+    glob: rest.glob ?? include,
+  }, context);
 }
 
 export async function findFilesTool(input: FindToolInput, context: ToolContext): Promise<ToolResponse> {
@@ -119,18 +129,47 @@ export async function listDirectoryTool(input: LsToolInput, context: ToolContext
   return runTool((params) => tool.execute("list_directory", params), input, context);
 }
 
-function shellCommand(command: string): string {
-  if (process.platform !== "win32") return command;
+function shellCommand(command: string, kind: WorkspaceShellKind): string {
+  if (process.platform !== "win32" || kind === "wsl-bash") return command;
 
   return `git() { command git.exe "$@"; }\n${command}`;
 }
 
-export async function runShellTool(input: BashToolInput, context: ToolContext): Promise<ToolResponse> {
-  const tool = createBashTool(context.cwd);
+export async function runShellTool(
+  input: BashToolInput,
+  context: ToolContext,
+  signal?: AbortSignal,
+): Promise<ToolResponse> {
+  const policy = evaluateBashRuntimePolicy(input.command, loadRuntimePolicyContext());
+  if (!policy.allowed) {
+    return {
+      isError: true,
+      content: [
+        {
+          type: "text",
+          text: `Denied ${policy.capability}: ${policy.reason ?? "command is not granted to MCP bash."}`,
+        },
+      ],
+    };
+  }
+
+  const workspaceShell = resolveWorkspaceShell();
+  const tool = createBashTool(context.cwd, {
+    shellPath: workspaceShell.shellPath,
+    operations: createGuardedBashOperations(workspaceShell),
+  });
   const timeout = input.timeout === undefined ? 30 : Math.min(input.timeout, 300);
 
-  return runTool((params) => tool.execute("run_shell", params), {
-    command: shellCommand(input.command),
-    timeout,
-  }, context);
+  try {
+    const result = await tool.execute("run_shell", {
+      command: shellCommand(input.command, workspaceShell.kind),
+      timeout,
+    }, signal);
+    return {
+      content: toMcpContent(result),
+      details: result.details,
+    };
+  } catch (error) {
+    return { content: formatToolError(error), isError: true };
+  }
 }

@@ -172,10 +172,16 @@ needed.
 
 ## Windows Shell Commands Fail
 
-DevSpace shell execution requires Bash. Native PowerShell and `cmd.exe` command
-execution are not supported yet.
+DevSpace shell execution requires a native Windows Bash. Git Bash is resolved
+from the Git for Windows install next to `git.exe`, including custom prefixes
+such as `D:\Git\bin\bash.exe`. `C:\Windows\System32\bash.exe` is the WSL stub
+and is not used when Git Bash exists: that stub runs Linux, so Windows `rg` and
+`git.exe` are not on its PATH.
 
-Install Git for Windows and use Git Bash, or use WSL, MSYS2, or Cygwin Bash.
+Native PowerShell and `cmd.exe` command execution are not supported yet.
+
+Install Git for Windows, or set `DEVSPACE_SHELL` to a Bash executable such as
+Git Bash, MSYS2, or Cygwin Bash.
 
 Run:
 
@@ -183,7 +189,8 @@ Run:
 npx @waishnav/devspace doctor
 ```
 
-Confirm Bash is detected.
+Confirm `Workspace shell` is Git Bash (`git-bash`) and `Ripgrep` is detected.
+A `wsl-bash` result means Git Bash was not found.
 
 ## Skills Do Not Appear
 
