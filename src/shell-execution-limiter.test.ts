@@ -54,3 +54,39 @@ controller.abort();
 await assert.rejects(() => waiting, /cancelled while waiting/i);
 held.release();
 assert.equal(abortLimiter.snapshot().queued, 0);
+
+// Test custom queueTimeoutMs
+const timeoutLimiter = new ShellExecutionLimiter({
+  maxActive: 1,
+  maxActivePerKey: 1,
+  maxQueued: 2,
+  queueTimeoutMs: 5_000,
+});
+const activeLease = await timeoutLimiter.acquire("x");
+const keepAlive = setInterval(() => {}, 10);
+try {
+  await assert.rejects(
+    () => timeoutLimiter.acquire("y", { queueTimeoutMs: 20 }),
+    /DevSpace shell queue wait exceeded 20ms/,
+  );
+} finally {
+  clearInterval(keepAlive);
+}
+assert.equal(timeoutLimiter.snapshot().queued, 0);
+
+// Test queueTimeoutMs: 0 disables queue timeout
+let longWaitResolved = false;
+const longWaitPromise = timeoutLimiter
+  .acquire("z", { queueTimeoutMs: 0 })
+  .then((lease) => {
+    longWaitResolved = true;
+    return lease;
+  });
+assert.equal(timeoutLimiter.snapshot().queued, 1);
+await new Promise((resolve) => setTimeout(resolve, 50));
+assert.equal(longWaitResolved, false, "queueTimeoutMs: 0 should not expire");
+activeLease.release();
+const zLease = await longWaitPromise;
+assert.equal(longWaitResolved, true);
+zLease.release();
+assert.equal(timeoutLimiter.snapshot().queued, 0);

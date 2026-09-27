@@ -25,6 +25,11 @@ export interface ShellExecutionLease {
   release(): void;
 }
 
+export interface ShellAcquireOptions {
+  signal?: AbortSignal;
+  queueTimeoutMs?: number | null;
+}
+
 export class ShellExecutionLimiter {
   private active = 0;
   private readonly activeByKey = new Map<string, number>();
@@ -38,8 +43,24 @@ export class ShellExecutionLimiter {
     }
   }
 
-  acquire(key: string, signal?: AbortSignal): Promise<ShellExecutionLease> {
+  acquire(
+    key: string,
+    optionsOrSignal?: AbortSignal | ShellAcquireOptions,
+  ): Promise<ShellExecutionLease> {
     const normalizedKey = key || ".";
+    let signal: AbortSignal | undefined;
+    let queueTimeoutMs: number | null | undefined;
+
+    if (optionsOrSignal && "aborted" in optionsOrSignal) {
+      signal = optionsOrSignal;
+      queueTimeoutMs = this.limits.queueTimeoutMs;
+    } else if (optionsOrSignal) {
+      signal = optionsOrSignal.signal;
+      queueTimeoutMs = optionsOrSignal.queueTimeoutMs;
+    } else {
+      queueTimeoutMs = this.limits.queueTimeoutMs;
+    }
+
     if (signal?.aborted) {
       return Promise.reject(new Error("Shell request was cancelled before execution."));
     }
@@ -58,16 +79,21 @@ export class ShellExecutionLimiter {
 
     return new Promise<ShellExecutionLease>((resolve, reject) => {
       const waiter: Waiter = { key: normalizedKey, resolve, reject, signal };
-      waiter.timeout = setTimeout(() => {
-        if (!this.removeWaiter(waiter)) return;
-        this.detachAbort(waiter);
-        reject(
-          new Error(
-            `DevSpace shell queue wait exceeded ${this.limits.queueTimeoutMs}ms. Retry after an active shell command finishes.`,
-          ),
-        );
-      }, this.limits.queueTimeoutMs);
-      waiter.timeout.unref?.();
+      const effectiveTimeoutMs =
+        queueTimeoutMs === undefined ? this.limits.queueTimeoutMs : queueTimeoutMs;
+
+      if (effectiveTimeoutMs !== null && effectiveTimeoutMs > 0) {
+        waiter.timeout = setTimeout(() => {
+          if (!this.removeWaiter(waiter)) return;
+          this.detachAbort(waiter);
+          reject(
+            new Error(
+              `DevSpace shell queue wait exceeded ${effectiveTimeoutMs}ms. Retry after an active shell command finishes.`,
+            ),
+          );
+        }, effectiveTimeoutMs);
+        waiter.timeout.unref?.();
+      }
 
       if (signal) {
         waiter.onAbort = () => {

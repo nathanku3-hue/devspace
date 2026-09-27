@@ -69,15 +69,18 @@ $AllowedRoots = @($PrimaryAllowedRoot, $LegacyWorktreeMigrationRoot)
 $AllowedRootsEnv = $AllowedRoots -join ","
 $ExpectedTools = @(
     "bash",
+    "cancel_long_task",
     "close_workspace",
     "continue_meta_harness",
     "create_worktree_workspace",
     "edit",
+    "long_task_status",
     "open_workspace",
     "publish_git_changes",
     "read",
     "read_files",
     "safe_rename_file",
+    "start_long_task",
     "web_launch",
     "write"
 )
