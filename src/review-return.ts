@@ -5,12 +5,26 @@ const DEFAULT_RUN_TIMEOUT_MS = 120_000;
 const DEFAULT_RUN_RETENTION_MS = 10 * 60_000;
 const HEX_64_PATTERN = /^[0-9a-f]{64}$/;
 const SLICE = "REVIEW-RETURN-2" as const;
-const ROLE = "PRODUCT" as const;
+const DEFAULT_ROLE = "PRODUCT" as const;
 const MAX_SUMMARY_CHARS = 4_000;
 const MAX_FINDINGS = 20;
 const MAX_FINDING_CLAIM_CHARS = 2_000;
 const MAX_FINDING_EVIDENCE_REF_CHARS = 512;
 const MAX_MANIFEST_CHARS = 50_000;
+
+export type ReviewRole = "PRODUCT" | "SAW_A" | "SAW_B" | "SAW_C";
+export type SawReviewRole = Exclude<ReviewRole, "PRODUCT">;
+export type ReviewExecutionSurface = "chatgpt_web" | "chatshare";
+export type ReviewResultVerdict = "pass" | "fail" | "abstain";
+export type ReviewFindingSeverity = "blocking" | "material" | "advisory";
+export type ReviewRunStatus = "pending" | "succeeded" | "failed" | "expired";
+export type SawReviewSetStatus = ReviewRunStatus;
+
+export const SAW_REVIEW_ROLES = [
+  "SAW_A",
+  "SAW_B",
+  "SAW_C",
+] as const satisfies readonly SawReviewRole[];
 
 export const PRODUCT_ROLE_POLICY = [
   "REVIEW-RETURN-2 PRODUCT role policy v1.",
@@ -22,11 +36,41 @@ export const PRODUCT_ROLE_POLICY = [
   "Do not invoke any connector tool other than review_submit.",
 ].join("\n");
 
-export const PRODUCT_ROLE_POLICY_DIGEST = sha256Hex(PRODUCT_ROLE_POLICY);
+function buildSawRolePolicy(role: SawReviewRole): string {
+  return [
+    `REVIEW-RETURN-2 ${role} role policy v1.`,
+    "Act as one independent reviewer in the SAW A/B/C post-phase gate.",
+    "Review only the candidate manifest and evidence manifest supplied in this packet.",
+    "Judge correctness, regression and safety risk, scope fit, and whether the supplied evidence supports closure.",
+    "result must be pass, fail, or abstain.",
+    "findings must cite evidenceRef values present in the evidence manifest when possible.",
+    "Do not infer or request another SAW reviewer's result, reasoning, transcript, or verdict.",
+    "Do not invent repository state, prior reviewer output, or assistant transcript content.",
+    "Do not invoke any connector tool other than review_submit.",
+  ].join("\n");
+}
 
-export type ReviewResultVerdict = "pass" | "fail" | "abstain";
-export type ReviewFindingSeverity = "blocking" | "material" | "advisory";
-export type ReviewRunStatus = "pending" | "succeeded" | "failed" | "expired";
+export const SAW_A_ROLE_POLICY = buildSawRolePolicy("SAW_A");
+export const SAW_B_ROLE_POLICY = buildSawRolePolicy("SAW_B");
+export const SAW_C_ROLE_POLICY = buildSawRolePolicy("SAW_C");
+
+export const REVIEW_ROLE_POLICIES: Readonly<Record<ReviewRole, string>> =
+  Object.freeze({
+    PRODUCT: PRODUCT_ROLE_POLICY,
+    SAW_A: SAW_A_ROLE_POLICY,
+    SAW_B: SAW_B_ROLE_POLICY,
+    SAW_C: SAW_C_ROLE_POLICY,
+  });
+
+export const REVIEW_ROLE_POLICY_DIGESTS: Readonly<Record<ReviewRole, string>> =
+  Object.freeze({
+    PRODUCT: sha256Hex(PRODUCT_ROLE_POLICY),
+    SAW_A: sha256Hex(SAW_A_ROLE_POLICY),
+    SAW_B: sha256Hex(SAW_B_ROLE_POLICY),
+    SAW_C: sha256Hex(SAW_C_ROLE_POLICY),
+  });
+
+export const PRODUCT_ROLE_POLICY_DIGEST = REVIEW_ROLE_POLICY_DIGESTS.PRODUCT;
 
 export interface ReviewFinding {
   severity: ReviewFindingSeverity;
@@ -35,6 +79,7 @@ export interface ReviewFinding {
 }
 
 export interface ReviewStartInput {
+  role?: ReviewRole;
   candidateManifest: string;
   candidateManifestDigest: string;
   evidenceManifest: string;
@@ -50,7 +95,7 @@ export interface ReviewCallbackInput {
 
 export interface ReviewStructuredResult {
   reviewId: string;
-  role: "PRODUCT";
+  role: ReviewRole;
   result: ReviewResultVerdict;
   summary: string;
   findings: ReviewFinding[];
@@ -60,7 +105,8 @@ export interface ReviewStructuredResult {
 export interface ReviewStartAcknowledgement extends Record<string, unknown> {
   slice: "REVIEW-RETURN-2";
   reviewId: string;
-  role: "PRODUCT";
+  role: ReviewRole;
+  executionSurface: ReviewExecutionSurface;
   status: "pending";
   startedAt: string;
   expiresAt: string;
@@ -78,6 +124,7 @@ export interface ReviewSubmitAcknowledgement extends Record<string, unknown> {
 }
 
 export interface ReviewReturnResult extends ReviewStructuredResult {
+  executionSurface: ReviewExecutionSurface;
   candidateManifestDigest: string;
   evidenceManifestDigest: string;
   rolePolicyDigest: string;
@@ -89,7 +136,8 @@ export interface ReviewReturnResult extends ReviewStructuredResult {
 interface ReviewStatusBase extends Record<string, unknown> {
   slice: "REVIEW-RETURN-2";
   reviewId: string;
-  role: "PRODUCT";
+  role: ReviewRole;
+  executionSurface: ReviewExecutionSurface;
   status: ReviewRunStatus;
   startedAt: string;
   expiresAt: string;
@@ -103,7 +151,9 @@ export interface ReviewPendingStatus extends ReviewStatusBase {
   status: "pending";
 }
 
-export interface ReviewSucceededStatus extends ReviewStatusBase, ReviewReturnResult {
+export interface ReviewSucceededStatus
+  extends ReviewStatusBase,
+    ReviewReturnResult {
   status: "succeeded";
 }
 
@@ -122,15 +172,38 @@ export type ReviewStatusAcknowledgement =
   | ReviewFailedStatus
   | ReviewExpiredStatus;
 
+export interface SawReviewSetStartAcknowledgement
+  extends Record<string, unknown> {
+  slice: "REVIEW-RETURN-2";
+  batchId: string;
+  executionSurface: ReviewExecutionSurface;
+  status: "pending";
+  startedAt: string;
+  reviews: ReviewStartAcknowledgement[];
+}
+
+export interface SawReviewSetStatusAcknowledgement
+  extends Record<string, unknown> {
+  slice: "REVIEW-RETURN-2";
+  batchId: string;
+  executionSurface: ReviewExecutionSurface;
+  status: SawReviewSetStatus;
+  result?: ReviewResultVerdict;
+  reviews: ReviewStatusAcknowledgement[];
+}
+
 export interface ReviewReturnOptions {
   reviewIdFactory?: () => string;
   challengeFactory?: () => string;
+  batchIdFactory?: () => string;
+  executionSurface?: ReviewExecutionSurface;
   now?: () => Date;
   timeoutMs?: number;
   retentionMs?: number;
 }
 
 interface FrozenReviewBindings {
+  role: ReviewRole;
   candidateManifestDigest: string;
   evidenceManifestDigest: string;
   rolePolicyDigest: string;
@@ -153,6 +226,12 @@ interface ReviewRun {
   cleanupTimer?: NodeJS.Timeout;
 }
 
+interface SawReviewSet {
+  id: string;
+  reviewIds: string[];
+  cleanupTimer?: NodeJS.Timeout;
+}
+
 export class ReviewReturnError extends Error {
   constructor(message: string, options?: ErrorOptions) {
     super(message, options);
@@ -165,6 +244,8 @@ export class ReviewReturnController {
     Partial<Pick<WebLaunchBrowserController, "stopWebConversationRecovery">>;
   readonly #reviewIdFactory: () => string;
   readonly #challengeFactory: () => string;
+  readonly #batchIdFactory: () => string;
+  readonly #executionSurface: ReviewExecutionSurface;
   readonly #now: () => Date;
   readonly #timeoutMs: number;
   readonly #retentionMs: number;
@@ -173,7 +254,8 @@ export class ReviewReturnController {
   readonly #submissionByReviewId = new Map<string, PendingSubmission>();
   readonly #reviewIdByChallenge = new Map<string, string>();
   readonly #challengeByReviewId = new Map<string, string>();
-  #activeReviewId: string | undefined;
+  readonly #sawReviewSets = new Map<string, SawReviewSet>();
+  #launchQueue: Promise<void> = Promise.resolve();
 
   constructor(
     browser: Pick<WebLaunchBrowserController, "launchWebConversation"> &
@@ -185,6 +267,9 @@ export class ReviewReturnController {
       options.reviewIdFactory ?? (() => randomBytes(32).toString("hex"));
     this.#challengeFactory =
       options.challengeFactory ?? (() => randomBytes(32).toString("hex"));
+    this.#batchIdFactory =
+      options.batchIdFactory ?? (() => `saw-${randomBytes(16).toString("hex")}`);
+    this.#executionSurface = options.executionSurface ?? "chatgpt_web";
     this.#now = options.now ?? (() => new Date());
     this.#timeoutMs = assertPositiveInteger(
       options.timeoutMs ?? DEFAULT_RUN_TIMEOUT_MS,
@@ -197,6 +282,7 @@ export class ReviewReturnController {
   }
 
   startReview(input: ReviewStartInput): ReviewStartAcknowledgement {
+    const role = normalizeReviewRole(input.role ?? DEFAULT_ROLE);
     const candidateManifest = assertBoundedManifest(
       input.candidateManifest,
       "candidateManifest",
@@ -215,11 +301,8 @@ export class ReviewReturnController {
       input.evidenceManifestDigest,
       "evidenceManifestDigest",
     );
-    const rolePolicyDigest = PRODUCT_ROLE_POLICY_DIGEST;
-
-    if (this.#activeReviewId) {
-      throw new ReviewReturnError("REVIEW-RETURN-2 already has a review in progress");
-    }
+    const rolePolicy = REVIEW_ROLE_POLICIES[role];
+    const rolePolicyDigest = REVIEW_ROLE_POLICY_DIGESTS[role];
 
     const reviewId = this.#reviewIdFactory();
     const challenge = this.#challengeFactory();
@@ -227,15 +310,21 @@ export class ReviewReturnController {
     assertHex64(challenge, "challenge");
 
     if (this.#runs.has(reviewId)) {
-      throw new ReviewReturnError("REVIEW-RETURN-2 generated a duplicate review ID");
+      throw new ReviewReturnError(
+        "REVIEW-RETURN-2 generated a duplicate review ID",
+      );
     }
     if (this.#reviewIdByChallenge.has(challenge)) {
-      throw new ReviewReturnError("REVIEW-RETURN-2 generated a duplicate challenge");
+      throw new ReviewReturnError(
+        "REVIEW-RETURN-2 generated a duplicate challenge",
+      );
     }
 
     const startedAtDate = this.#now();
     const startedAt = startedAtDate.toISOString();
-    const expiresAt = new Date(startedAtDate.getTime() + this.#timeoutMs).toISOString();
+    const expiresAt = new Date(
+      startedAtDate.getTime() + this.#timeoutMs,
+    ).toISOString();
     const run: ReviewRun = {
       id: reviewId,
       status: "pending",
@@ -247,8 +336,8 @@ export class ReviewReturnController {
     run.timeoutTimer.unref?.();
 
     this.#runs.set(reviewId, run);
-    this.#activeReviewId = reviewId;
     this.#bindingsByReviewId.set(reviewId, {
+      role,
       candidateManifestDigest,
       evidenceManifestDigest,
       rolePolicyDigest,
@@ -256,40 +345,22 @@ export class ReviewReturnController {
     this.#reviewIdByChallenge.set(challenge, reviewId);
     this.#challengeByReviewId.set(reviewId, challenge);
 
-    void Promise.resolve()
-      .then(() =>
-        this.#browser.launchWebConversation(
-          buildReviewReturnPrompt({
-            challenge,
-            candidateManifest,
-            candidateManifestDigest,
-            evidenceManifest,
-            evidenceManifestDigest,
-            rolePolicy: PRODUCT_ROLE_POLICY,
-            rolePolicyDigest,
-          }),
-          { attachDevSpace: true },
-        ),
-      )
-      .then(
-        (launch) => {
-          const current = this.#runs.get(reviewId);
-          if (!current || current.status !== "pending") {
-            this.#stopRecovery(launch.conversationIdentitySha256);
-            return;
-          }
-          current.launchIdentity = launch.conversationIdentitySha256;
-          this.#maybeComplete(reviewId);
-        },
-        () => {
-          this.#fail(reviewId, "launch_failed");
-        },
-      );
+    this.#enqueueLaunch(reviewId, {
+      role,
+      challenge,
+      candidateManifest,
+      candidateManifestDigest,
+      evidenceManifest,
+      evidenceManifestDigest,
+      rolePolicy,
+      rolePolicyDigest,
+    });
 
     return {
       slice: SLICE,
       reviewId,
-      role: ROLE,
+      role,
+      executionSurface: this.#executionSurface,
       status: "pending",
       startedAt,
       expiresAt,
@@ -297,6 +368,50 @@ export class ReviewReturnController {
       evidenceManifestDigest,
       rolePolicyDigest,
       assistantOutputCaptured: false,
+    };
+  }
+
+  startSawReviewSet(
+    input: Omit<ReviewStartInput, "role">,
+  ): SawReviewSetStartAcknowledgement {
+    const batchId = this.#batchIdFactory().trim();
+    if (!batchId) {
+      throw new ReviewReturnError(
+        "REVIEW-RETURN-2 generated an empty SAW batch ID",
+      );
+    }
+    if (this.#sawReviewSets.has(batchId)) {
+      throw new ReviewReturnError(
+        "REVIEW-RETURN-2 generated a duplicate SAW batch ID",
+      );
+    }
+
+    const startedAt = this.#now().toISOString();
+    const reviews = SAW_REVIEW_ROLES.map((role) =>
+      this.startReview({
+        ...input,
+        role,
+      }),
+    );
+
+    const batch: SawReviewSet = {
+      id: batchId,
+      reviewIds: reviews.map((review) => review.reviewId),
+    };
+    batch.cleanupTimer = setTimeout(
+      () => this.#forgetSawReviewSet(batchId),
+      this.#timeoutMs + this.#retentionMs,
+    );
+    batch.cleanupTimer.unref?.();
+    this.#sawReviewSets.set(batchId, batch);
+
+    return {
+      slice: SLICE,
+      batchId,
+      executionSurface: this.#executionSurface,
+      status: "pending",
+      startedAt,
+      reviews,
     };
   }
 
@@ -317,7 +432,9 @@ export class ReviewReturnController {
       );
     }
     if (this.#submissionByReviewId.has(reviewId)) {
-      throw new ReviewReturnError("REVIEW-RETURN-2 review callback already consumed");
+      throw new ReviewReturnError(
+        "REVIEW-RETURN-2 review callback already consumed",
+      );
     }
 
     this.#reviewIdByChallenge.delete(callback.challenge);
@@ -326,7 +443,7 @@ export class ReviewReturnController {
     const reviewedAt = this.#now().toISOString();
     const structured: ReviewStructuredResult = {
       reviewId,
-      role: ROLE,
+      role: bindings.role,
       result: callback.result,
       summary: callback.summary,
       findings: callback.findings,
@@ -357,7 +474,8 @@ export class ReviewReturnController {
     const base = {
       slice: SLICE,
       reviewId,
-      role: ROLE,
+      role: bindings.role,
+      executionSurface: this.#executionSurface,
       status: run.status,
       startedAt: run.startedAt,
       expiresAt: run.expiresAt,
@@ -387,6 +505,45 @@ export class ReviewReturnController {
     }
   }
 
+  getSawReviewSetStatus(batchId: string): SawReviewSetStatusAcknowledgement {
+    const batch = this.#sawReviewSets.get(batchId);
+    if (!batch) {
+      throw new ReviewReturnError(
+        "REVIEW-RETURN-2 SAW batch is unknown or no longer retained",
+      );
+    }
+
+    const reviews = batch.reviewIds.map((reviewId) =>
+      this.getReviewStatus(reviewId),
+    );
+    const status: SawReviewSetStatus =
+      reviews.some((review) => review.status === "failed")
+        ? "failed"
+        : reviews.some((review) => review.status === "expired")
+          ? "expired"
+          : reviews.some((review) => review.status === "pending")
+            ? "pending"
+            : "succeeded";
+
+    const result =
+      status === "succeeded"
+        ? aggregateSawVerdict(
+            reviews.map(
+              (review) => (review as ReviewSucceededStatus).result,
+            ),
+          )
+        : undefined;
+
+    return {
+      slice: SLICE,
+      batchId: batch.id,
+      executionSurface: this.#executionSurface,
+      status,
+      ...(result === undefined ? {} : { result }),
+      reviews,
+    };
+  }
+
   close(): void {
     for (const run of this.#runs.values()) {
       if (run.timeoutTimer) clearTimeout(run.timeoutTimer);
@@ -397,7 +554,43 @@ export class ReviewReturnController {
     this.#submissionByReviewId.clear();
     this.#reviewIdByChallenge.clear();
     this.#challengeByReviewId.clear();
-    this.#activeReviewId = undefined;
+    for (const batch of this.#sawReviewSets.values()) {
+      if (batch.cleanupTimer) clearTimeout(batch.cleanupTimer);
+    }
+    this.#sawReviewSets.clear();
+    this.#launchQueue = Promise.resolve();
+  }
+
+  #enqueueLaunch(
+    reviewId: string,
+    packet: Parameters<typeof buildReviewReturnPrompt>[0],
+  ): void {
+    const launch = async (): Promise<void> => {
+      const current = this.#runs.get(reviewId);
+      if (!current || current.status !== "pending") return;
+
+      try {
+        const acknowledgement = await this.#browser.launchWebConversation(
+          buildReviewReturnPrompt(packet),
+          { attachDevSpace: true },
+        );
+        const latest = this.#runs.get(reviewId);
+        if (!latest || latest.status !== "pending") {
+          this.#stopRecovery(acknowledgement.conversationIdentitySha256);
+          return;
+        }
+        latest.launchIdentity = acknowledgement.conversationIdentitySha256;
+        this.#maybeComplete(reviewId);
+      } catch {
+        this.#fail(reviewId, "launch_failed");
+      }
+    };
+
+    const queued = this.#launchQueue.then(launch, launch);
+    this.#launchQueue = queued.then(
+      () => undefined,
+      () => undefined,
+    );
   }
 
   #maybeComplete(reviewId: string): void {
@@ -417,6 +610,7 @@ export class ReviewReturnController {
 
     run.result = {
       ...submission.structured,
+      executionSurface: this.#executionSurface,
       candidateManifestDigest: bindings.candidateManifestDigest,
       evidenceManifestDigest: bindings.evidenceManifestDigest,
       rolePolicyDigest: bindings.rolePolicyDigest,
@@ -450,11 +644,15 @@ export class ReviewReturnController {
       clearTimeout(run.timeoutTimer);
       run.timeoutTimer = undefined;
     }
-    if (this.#activeReviewId === run.id) this.#activeReviewId = undefined;
     this.#removeChallengeForReview(run.id);
     if (run.launchIdentity) this.#stopRecovery(run.launchIdentity);
-    run.cleanupTimer = setTimeout(() => this.#forget(run.id), this.#retentionMs);
-    run.cleanupTimer.unref?.();
+    const belongsToSawBatch = [...this.#sawReviewSets.values()].some((batch) =>
+      batch.reviewIds.includes(run.id),
+    );
+    if (!belongsToSawBatch) {
+      run.cleanupTimer = setTimeout(() => this.#forget(run.id), this.#retentionMs);
+      run.cleanupTimer.unref?.();
+    }
   }
 
   #forget(reviewId: string): void {
@@ -465,7 +663,23 @@ export class ReviewReturnController {
     this.#runs.delete(reviewId);
     this.#bindingsByReviewId.delete(reviewId);
     this.#submissionByReviewId.delete(reviewId);
-    if (this.#activeReviewId === reviewId) this.#activeReviewId = undefined;
+  }
+
+  #forgetSawReviewSet(batchId: string): void {
+    const batch = this.#sawReviewSets.get(batchId);
+    if (!batch) return;
+    if (batch.cleanupTimer) clearTimeout(batch.cleanupTimer);
+
+    for (const reviewId of batch.reviewIds) {
+      const run = this.#runs.get(reviewId);
+      if (run?.timeoutTimer) clearTimeout(run.timeoutTimer);
+      if (run?.cleanupTimer) clearTimeout(run.cleanupTimer);
+      this.#removeChallengeForReview(reviewId);
+      this.#runs.delete(reviewId);
+      this.#bindingsByReviewId.delete(reviewId);
+      this.#submissionByReviewId.delete(reviewId);
+    }
+    this.#sawReviewSets.delete(batchId);
   }
 
   #removeChallengeForReview(reviewId: string): void {
@@ -485,6 +699,7 @@ export class ReviewReturnController {
 }
 
 export function buildReviewReturnPrompt(input: {
+  role?: ReviewRole;
   challenge: string;
   candidateManifest: string;
   candidateManifestDigest: string;
@@ -493,15 +708,17 @@ export function buildReviewReturnPrompt(input: {
   rolePolicy: string;
   rolePolicyDigest: string;
 }): string {
+  const role = normalizeReviewRole(input.role ?? DEFAULT_ROLE);
   assertHex64(input.challenge, "challenge");
   assertHex64(input.candidateManifestDigest, "candidateManifestDigest");
   assertHex64(input.evidenceManifestDigest, "evidenceManifestDigest");
   assertHex64(input.rolePolicyDigest, "rolePolicyDigest");
+
   return [
-    "REVIEW-RETURN-2 PRODUCT review packet.",
+    `REVIEW-RETURN-2 ${role} review packet.`,
     "Use the connected DevSpace connector through the normal ChatGPT tool interface.",
-    "You are the PRODUCT reviewer for this candidate.",
-    "Review only the candidate and evidence content in this packet under the PRODUCT policy.",
+    `You are the ${role} reviewer for this candidate.`,
+    `Review only the candidate and evidence content in this packet under the ${role} policy.`,
     `challenge: ${input.challenge}`,
     `candidateManifestDigest: ${input.candidateManifestDigest}`,
     `evidenceManifestDigest: ${input.evidenceManifestDigest}`,
@@ -512,15 +729,16 @@ export function buildReviewReturnPrompt(input: {
     "----- BEGIN EVIDENCE MANIFEST -----",
     input.evidenceManifest,
     "----- END EVIDENCE MANIFEST -----",
-    "----- BEGIN PRODUCT ROLE POLICY -----",
+    `----- BEGIN ${role} ROLE POLICY -----`,
     input.rolePolicy,
-    "----- END PRODUCT ROLE POLICY -----",
+    `----- END ${role} ROLE POLICY -----`,
     "Invoke the bounded `review_submit` tool exactly once with:",
     "- challenge matching the value above",
     "- result one of pass | fail | abstain",
     "- summary bounded text",
     "- findings array of {severity: blocking|material|advisory, claim, evidenceRef}",
     "Do not supply reviewId, role, rolePolicyDigest, or reviewedAt; the server owns those.",
+    "Do not supply executionSurface; the server owns it.",
     "Do not invoke any other connector tool.",
     "Do not include previous reviewer output.",
     "Do not capture or return assistant transcript text.",
@@ -532,9 +750,35 @@ export function sha256Hex(value: string): string {
   return createHash("sha256").update(value, "utf8").digest("hex");
 }
 
-function normalizeCallbackInput(payload: ReviewCallbackInput): ReviewCallbackInput {
+function aggregateSawVerdict(
+  results: ReviewResultVerdict[],
+): ReviewResultVerdict {
+  if (results.some((result) => result === "fail")) return "fail";
+  if (results.some((result) => result === "abstain")) return "abstain";
+  return "pass";
+}
+
+function normalizeReviewRole(value: ReviewRole): ReviewRole {
+  if (
+    value !== "PRODUCT" &&
+    value !== "SAW_A" &&
+    value !== "SAW_B" &&
+    value !== "SAW_C"
+  ) {
+    throw new ReviewReturnError(
+      "REVIEW-RETURN-2 role must be PRODUCT|SAW_A|SAW_B|SAW_C",
+    );
+  }
+  return value;
+}
+
+function normalizeCallbackInput(
+  payload: ReviewCallbackInput,
+): ReviewCallbackInput {
   if (!payload || typeof payload !== "object") {
-    throw new ReviewReturnError("REVIEW-RETURN-2 callback payload must be an object");
+    throw new ReviewReturnError(
+      "REVIEW-RETURN-2 callback payload must be an object",
+    );
   }
   const challenge = assertHex64(payload.challenge, "challenge");
   if (
@@ -547,18 +791,27 @@ function normalizeCallbackInput(payload: ReviewCallbackInput): ReviewCallbackInp
     );
   }
   if (typeof payload.summary !== "string") {
-    throw new ReviewReturnError("REVIEW-RETURN-2 summary must be a string");
+    throw new ReviewReturnError(
+      "REVIEW-RETURN-2 summary must be a string",
+    );
   }
-  if (payload.summary.length === 0 || payload.summary.length > MAX_SUMMARY_CHARS) {
+  if (
+    payload.summary.length === 0 ||
+    payload.summary.length > MAX_SUMMARY_CHARS
+  ) {
     throw new ReviewReturnError(
       `REVIEW-RETURN-2 summary must be 1..${MAX_SUMMARY_CHARS} characters`,
     );
   }
   if (payload.summary.includes("\r")) {
-    throw new ReviewReturnError("REVIEW-RETURN-2 summary rejects carriage returns");
+    throw new ReviewReturnError(
+      "REVIEW-RETURN-2 summary rejects carriage returns",
+    );
   }
   if (!Array.isArray(payload.findings)) {
-    throw new ReviewReturnError("REVIEW-RETURN-2 findings must be an array");
+    throw new ReviewReturnError(
+      "REVIEW-RETURN-2 findings must be an array",
+    );
   }
   if (payload.findings.length > MAX_FINDINGS) {
     throw new ReviewReturnError(
@@ -569,13 +822,20 @@ function normalizeCallbackInput(payload: ReviewCallbackInput): ReviewCallbackInp
     challenge,
     result: payload.result,
     summary: payload.summary,
-    findings: payload.findings.map((finding, index) => normalizeFinding(finding, index)),
+    findings: payload.findings.map((finding, index) =>
+      normalizeFinding(finding, index),
+    ),
   };
 }
 
-function normalizeFinding(finding: ReviewFinding, index: number): ReviewFinding {
+function normalizeFinding(
+  finding: ReviewFinding,
+  index: number,
+): ReviewFinding {
   if (!finding || typeof finding !== "object") {
-    throw new ReviewReturnError(`REVIEW-RETURN-2 findings[${index}] must be an object`);
+    throw new ReviewReturnError(
+      `REVIEW-RETURN-2 findings[${index}] must be an object`,
+    );
   }
   if (
     finding.severity !== "blocking" &&
@@ -596,7 +856,10 @@ function normalizeFinding(finding: ReviewFinding, index: number): ReviewFinding 
       `REVIEW-RETURN-2 findings[${index}].claim exceeds ${MAX_FINDING_CLAIM_CHARS} characters`,
     );
   }
-  if (typeof finding.evidenceRef !== "string" || finding.evidenceRef.length === 0) {
+  if (
+    typeof finding.evidenceRef !== "string" ||
+    finding.evidenceRef.length === 0
+  ) {
     throw new ReviewReturnError(
       `REVIEW-RETURN-2 findings[${index}].evidenceRef must be non-empty`,
     );
@@ -615,7 +878,9 @@ function normalizeFinding(finding: ReviewFinding, index: number): ReviewFinding 
 
 function assertBoundedManifest(value: string, label: string): string {
   if (typeof value !== "string") {
-    throw new ReviewReturnError(`REVIEW-RETURN-2 ${label} must be a string`);
+    throw new ReviewReturnError(
+      `REVIEW-RETURN-2 ${label} must be a string`,
+    );
   }
   if (value.length === 0 || value.length > MAX_MANIFEST_CHARS) {
     throw new ReviewReturnError(

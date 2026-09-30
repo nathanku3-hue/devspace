@@ -77,6 +77,8 @@ test("Control-plane / execution-plane long task tools and bash fast-path", async
       "review_status",
       "review_submit",
       "safe_rename_file",
+      "saw_review_start",
+      "saw_review_status",
       "source_resolve_start",
       "source_resolve_status",
       "source_resolve_submit",

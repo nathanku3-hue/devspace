@@ -11,6 +11,7 @@ import {
   buildReviewReturnPrompt,
   PRODUCT_ROLE_POLICY,
   PRODUCT_ROLE_POLICY_DIGEST,
+  REVIEW_ROLE_POLICY_DIGESTS,
   ReviewReturnController,
   sha256Hex,
   type ReviewCallbackInput,
@@ -337,9 +338,26 @@ test("MCP exposes review tools with challenge-only callback schema and completes
     await Promise.all([server.connect(serverTransport), client.connect(clientTransport)]);
     const listed = await client.listTools();
     const byName = new Map(listed.tools.map((tool) => [tool.name, tool]));
-    for (const name of ["review_start", "review_status", "review_submit"]) {
+    for (const name of [
+      "review_start",
+      "review_status",
+      "review_submit",
+      "saw_review_start",
+      "saw_review_status",
+    ]) {
       assert.ok(byName.has(name), `missing ${name}`);
     }
+
+    const reviewStartProperties = Object.keys(
+      (byName.get("review_start")?.inputSchema.properties ?? {}) as Record<string, unknown>,
+    ).sort();
+    assert.deepEqual(reviewStartProperties, [
+      "candidateManifest",
+      "candidateManifestDigest",
+      "evidenceManifest",
+      "evidenceManifestDigest",
+      "role",
+    ]);
 
     const submitProperties = Object.keys(
       (byName.get("review_submit")?.inputSchema.properties ?? {}) as Record<string, unknown>,
@@ -481,5 +499,197 @@ test("review state survives across independent MCP sessions when controller is o
     await serverA.close().catch(() => undefined);
     await serverB.close().catch(() => undefined);
     await rm(parent, { recursive: true, force: true });
+  }
+});
+
+test("SAW A/B/C review set keeps independent roles, challenges, conversations, and ChatShare provenance", async () => {
+  const reviewIds = ["1".repeat(64), "2".repeat(64), "3".repeat(64)];
+  const challenges = ["4".repeat(64), "5".repeat(64), "6".repeat(64)];
+  const conversationHashes = ["7".repeat(64), "8".repeat(64), "9".repeat(64)];
+  const prompts: string[] = [];
+  const stopped: string[] = [];
+  let launchIndex = 0;
+
+  const review = new ReviewReturnController(
+    {
+      launchWebConversation: async (prompt, options) => {
+        assert.equal(options?.attachDevSpace, true);
+        prompts.push(prompt);
+        const conversationIdentitySha256 = conversationHashes[launchIndex++];
+        assert.ok(conversationIdentitySha256);
+        return {
+          ...launchAcknowledgement(),
+          conversationIdentitySha256,
+        };
+      },
+      stopWebConversationRecovery: (identity) => {
+        stopped.push(identity);
+        return true;
+      },
+    },
+    {
+      reviewIdFactory: () => {
+        const reviewId = reviewIds.shift();
+        assert.ok(reviewId);
+        return reviewId;
+      },
+      challengeFactory: () => {
+        const challenge = challenges.shift();
+        assert.ok(challenge);
+        return challenge;
+      },
+      batchIdFactory: () => "saw-batch-test",
+      executionSurface: "chatshare",
+      now: () => new Date(START_TIME),
+      timeoutMs: 1_000,
+      retentionMs: 1_000,
+    },
+  );
+
+  try {
+    const started = review.startSawReviewSet(startInput());
+    assert.equal(started.batchId, "saw-batch-test");
+    assert.equal(started.executionSurface, "chatshare");
+    assert.deepEqual(
+      started.reviews.map((item) => item.role),
+      ["SAW_A", "SAW_B", "SAW_C"],
+    );
+    assert.deepEqual(
+      started.reviews.map((item) => item.rolePolicyDigest),
+      [
+        REVIEW_ROLE_POLICY_DIGESTS.SAW_A,
+        REVIEW_ROLE_POLICY_DIGESTS.SAW_B,
+        REVIEW_ROLE_POLICY_DIGESTS.SAW_C,
+      ],
+    );
+    assert.equal(review.getSawReviewSetStatus(started.batchId).status, "pending");
+
+    await waitFor(() => prompts.length === 3);
+    assert.match(prompts[0] ?? "", /REVIEW-RETURN-2 SAW_A review packet/);
+    assert.match(prompts[1] ?? "", /REVIEW-RETURN-2 SAW_B review packet/);
+    assert.match(prompts[2] ?? "", /REVIEW-RETURN-2 SAW_C review packet/);
+    for (const prompt of prompts) {
+      assert.doesNotMatch(prompt, /previous reviewer output:\s*pass/i);
+    }
+
+    const callbackChallenges = prompts.map(
+      (prompt) => /challenge: ([0-9a-f]{64})/.exec(prompt)?.[1],
+    );
+    assert.equal(new Set(callbackChallenges).size, 3);
+
+    const verdicts = ["pass", "abstain", "fail"] as const;
+    callbackChallenges.forEach((challenge, index) => {
+      assert.ok(challenge);
+      review.submitReview({
+        challenge,
+        result: verdicts[index]!,
+        summary: `Independent SAW reviewer ${index + 1} completed.`,
+        findings: [],
+      });
+    });
+
+    await waitFor(
+      () => review.getSawReviewSetStatus(started.batchId).status === "succeeded",
+    );
+    const finalStatus = review.getSawReviewSetStatus(started.batchId);
+    assert.equal(finalStatus.status, "succeeded");
+    assert.equal(finalStatus.result, "fail");
+    assert.deepEqual(
+      finalStatus.reviews.map((item) => item.role),
+      ["SAW_A", "SAW_B", "SAW_C"],
+    );
+    assert.deepEqual(
+      finalStatus.reviews.map((item) => item.executionSurface),
+      ["chatshare", "chatshare", "chatshare"],
+    );
+    assert.deepEqual(
+      finalStatus.reviews.map((item) =>
+        item.status === "succeeded" ? item.conversationIdentitySha256 : null,
+      ),
+      conversationHashes,
+    );
+    assert.deepEqual(stopped, conversationHashes);
+  } finally {
+    review.close();
+  }
+});
+
+test("one SAW launch failure fails the gate without contaminating sibling reviewers", async () => {
+  const reviewIds = ["a".repeat(64), "b".repeat(64), "c".repeat(64)];
+  const challenges = ["d".repeat(64), "e".repeat(64), "f".repeat(64)];
+  const successfulConversationHashes = ["1".repeat(64), "2".repeat(64)];
+  const prompts: string[] = [];
+  let launchAttempt = 0;
+
+  const review = new ReviewReturnController(
+    {
+      launchWebConversation: async (prompt) => {
+        prompts.push(prompt);
+        launchAttempt += 1;
+        if (launchAttempt === 1) {
+          throw new Error("synthetic first reviewer launch failure");
+        }
+        const conversationIdentitySha256 =
+          successfulConversationHashes[launchAttempt - 2];
+        assert.ok(conversationIdentitySha256);
+        return {
+          ...launchAcknowledgement(),
+          conversationIdentitySha256,
+        };
+      },
+    },
+    {
+      reviewIdFactory: () => {
+        const reviewId = reviewIds.shift();
+        assert.ok(reviewId);
+        return reviewId;
+      },
+      challengeFactory: () => {
+        const challenge = challenges.shift();
+        assert.ok(challenge);
+        return challenge;
+      },
+      batchIdFactory: () => "saw-failure-isolation",
+      executionSurface: "chatshare",
+      timeoutMs: 1_000,
+      retentionMs: 1_000,
+    },
+  );
+
+  try {
+    const started = review.startSawReviewSet(startInput());
+    await waitFor(() => prompts.length === 3);
+
+    const afterLaunches = review.getSawReviewSetStatus(started.batchId);
+    assert.equal(afterLaunches.status, "failed");
+    assert.equal(afterLaunches.reviews[0]?.status, "failed");
+    assert.equal(afterLaunches.reviews[1]?.status, "pending");
+    assert.equal(afterLaunches.reviews[2]?.status, "pending");
+
+    for (const prompt of prompts.slice(1)) {
+      const challenge = /challenge: ([0-9a-f]{64})/.exec(prompt)?.[1];
+      assert.ok(challenge);
+      review.submitReview({
+        challenge,
+        result: "pass",
+        summary: "Sibling SAW reviewer completed independently.",
+        findings: [],
+      });
+    }
+
+    await waitFor(() => {
+      const status = review.getSawReviewSetStatus(started.batchId);
+      return status.reviews.slice(1).every((item) => item.status === "succeeded");
+    });
+
+    const finalStatus = review.getSawReviewSetStatus(started.batchId);
+    assert.equal(finalStatus.status, "failed");
+    assert.equal(finalStatus.result, undefined);
+    assert.deepEqual(
+      finalStatus.reviews.map((item) => item.status),
+      ["failed", "succeeded", "succeeded"],
+    );
+  } finally {
+    review.close();
   }
 });

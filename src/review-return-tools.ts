@@ -7,6 +7,29 @@ const NO_APP_META = { _meta: {} } as const;
 const HEX_64_PATTERN = /^[0-9a-f]{64}$/;
 const MAX_MANIFEST_CHARS = 50_000;
 
+const reviewRoleSchema = z.enum(["PRODUCT", "SAW_A", "SAW_B", "SAW_C"]);
+
+const manifestInputSchema = {
+  candidateManifest: z
+    .string()
+    .min(1)
+    .max(MAX_MANIFEST_CHARS)
+    .describe("Exact candidate manifest text included in the fresh-Web packet."),
+  candidateManifestDigest: z
+    .string()
+    .regex(HEX_64_PATTERN)
+    .describe("SHA-256 hex digest of candidateManifest exact UTF-8 bytes."),
+  evidenceManifest: z
+    .string()
+    .min(1)
+    .max(MAX_MANIFEST_CHARS)
+    .describe("Exact evidence manifest text included in the fresh-Web packet."),
+  evidenceManifestDigest: z
+    .string()
+    .regex(HEX_64_PATTERN)
+    .describe("SHA-256 hex digest of evidenceManifest exact UTF-8 bytes."),
+};
+
 const findingSchema = z
   .object({
     severity: z.enum(["blocking", "material", "advisory"]),
@@ -28,7 +51,11 @@ export function registerReviewReturnTools(input: {
   server: McpServer;
   controller: Pick<
     ReviewReturnController,
-    "startReview" | "submitReview" | "getReviewStatus"
+    | "startReview"
+    | "startSawReviewSet"
+    | "submitReview"
+    | "getReviewStatus"
+    | "getSawReviewSetStatus"
   >;
 }): void {
   const { server, controller } = input;
@@ -37,28 +64,14 @@ export function registerReviewReturnTools(input: {
     server,
     "review_start",
     {
-      title: "Start PRODUCT review return",
+      title: "Start independent review return",
       description:
-        "REVIEW-RETURN-2 only. Starts one bounded asynchronous PRODUCT review. Requires exact candidate and evidence manifest bytes plus their SHA-256 digests. The server recomputes digests, owns the PRODUCT role policy, returns a source-visible reviewId, and launches a fixed review packet containing the manifests and a prompt-only one-time challenge. It does not capture assistant output, open a workspace, or accept previous reviewer output.",
+        "REVIEW-RETURN-2 only. Starts one bounded asynchronous independent review for PRODUCT or one SAW A/B/C role. Requires exact candidate and evidence manifest bytes plus SHA-256 digests. The server owns the selected role policy, returns a source-visible reviewId, and launches a fresh review packet with a prompt-only one-time challenge. It does not capture assistant output or accept previous reviewer output.",
       inputSchema: {
-        candidateManifest: z
-          .string()
-          .min(1)
-          .max(MAX_MANIFEST_CHARS)
-          .describe("Exact candidate manifest text included in the fresh-Web packet."),
-        candidateManifestDigest: z
-          .string()
-          .regex(HEX_64_PATTERN)
-          .describe("SHA-256 hex digest of candidateManifest exact UTF-8 bytes."),
-        evidenceManifest: z
-          .string()
-          .min(1)
-          .max(MAX_MANIFEST_CHARS)
-          .describe("Exact evidence manifest text included in the fresh-Web packet."),
-        evidenceManifestDigest: z
-          .string()
-          .regex(HEX_64_PATTERN)
-          .describe("SHA-256 hex digest of evidenceManifest exact UTF-8 bytes."),
+        role: reviewRoleSchema
+          .optional()
+          .describe("Independent review role. Defaults to PRODUCT."),
+        ...manifestInputSchema,
       },
       ...NO_APP_META,
       annotations: {
@@ -69,12 +82,14 @@ export function registerReviewReturnTools(input: {
       },
     },
     async ({
+      role,
       candidateManifest,
       candidateManifestDigest,
       evidenceManifest,
       evidenceManifestDigest,
     }) => {
       const acknowledgement = controller.startReview({
+        role,
         candidateManifest,
         candidateManifestDigest,
         evidenceManifest,
@@ -94,11 +109,51 @@ export function registerReviewReturnTools(input: {
 
   registerAppTool(
     server,
+    "saw_review_start",
+    {
+      title: "Start SAW A/B/C review set",
+      description:
+        "REVIEW-RETURN-2 SAW orchestration. Starts three independent post-phase reviewers (SAW_A, SAW_B, SAW_C) over the exact same candidate and evidence manifests. Each review gets a distinct reviewId, one-time challenge, role-policy digest, and fresh conversation identity. Reviewer packets never contain another reviewer's output.",
+      inputSchema: manifestInputSchema,
+      ...NO_APP_META,
+      annotations: {
+        readOnlyHint: false,
+        destructiveHint: false,
+        idempotentHint: false,
+        openWorldHint: true,
+      },
+    },
+    async ({
+      candidateManifest,
+      candidateManifestDigest,
+      evidenceManifest,
+      evidenceManifestDigest,
+    }) => {
+      const acknowledgement = controller.startSawReviewSet({
+        candidateManifest,
+        candidateManifestDigest,
+        evidenceManifest,
+        evidenceManifestDigest,
+      });
+      return {
+        content: [
+          {
+            type: "text" as const,
+            text: "REVIEW-RETURN-2 SAW A/B/C review set started. Use saw_review_status with the returned batchId.",
+          },
+        ],
+        structuredContent: acknowledgement,
+      };
+    },
+  );
+
+  registerAppTool(
+    server,
     "review_submit",
     {
-      title: "Submit PRODUCT review result",
+      title: "Submit independent review result",
       description:
-        "REVIEW-RETURN-2 internal bounded callback. Invoke exactly once only when a newly launched ChatGPT conversation contains the prompt-only one-time challenge. Accepts only challenge, result, summary, and findings. The server owns reviewId, role, role policy digest, reviewedAt, and callback timestamps. It does not open a workspace, access files, run commands, or capture assistant transcripts.",
+        "REVIEW-RETURN-2 internal bounded callback. Invoke exactly once only when the current newly launched review conversation contains the prompt-only one-time challenge. Accepts only challenge, result, summary, and findings. The server owns reviewId, role, role policy digest, execution surface, reviewedAt, and callback timestamps.",
       inputSchema: {
         challenge: callbackSchema.shape.challenge,
         result: callbackSchema.shape.result,
@@ -132,14 +187,14 @@ export function registerReviewReturnTools(input: {
     server,
     "review_status",
     {
-      title: "Read PRODUCT review status",
+      title: "Read independent review status",
       description:
-        "REVIEW-RETURN-2 only. Retrieves the retained bounded state for one source-visible review ID. Returns pending, succeeded, failed, or expired metadata with server-owned digest bindings. Does not access assistant output, browser content, workspaces, files, commands, or persistent storage.",
+        "REVIEW-RETURN-2 only. Retrieves retained bounded state for one review ID. Returns pending, succeeded, failed, or expired metadata with server-owned role, execution-surface, digest, and conversation-identity bindings.",
       inputSchema: {
         reviewId: z
           .string()
           .regex(HEX_64_PATTERN)
-          .describe("Exact REVIEW-RETURN-2 review ID returned by review_start."),
+          .describe("Exact REVIEW-RETURN-2 review ID returned by review_start or saw_review_start."),
       },
       ...NO_APP_META,
       annotations: {
@@ -156,6 +211,41 @@ export function registerReviewReturnTools(input: {
           {
             type: "text" as const,
             text: `REVIEW-RETURN-2 review status: ${acknowledgement.status}.`,
+          },
+        ],
+        structuredContent: acknowledgement,
+      };
+    },
+  );
+
+  registerAppTool(
+    server,
+    "saw_review_status",
+    {
+      title: "Read SAW A/B/C review-set status",
+      description:
+        "REVIEW-RETURN-2 SAW orchestration. Returns the three independent reviewer states for one batch. Batch result is fail if any completed reviewer fails, abstain if none fail and at least one abstains, and pass only when all three pass. Infrastructure failure or expiry is reported separately as failed or expired status.",
+      inputSchema: {
+        batchId: z
+          .string()
+          .min(1)
+          .describe("SAW batch identifier returned by saw_review_start."),
+      },
+      ...NO_APP_META,
+      annotations: {
+        readOnlyHint: true,
+        destructiveHint: false,
+        idempotentHint: true,
+        openWorldHint: false,
+      },
+    },
+    async ({ batchId }) => {
+      const acknowledgement = controller.getSawReviewSetStatus(batchId);
+      return {
+        content: [
+          {
+            type: "text" as const,
+            text: `REVIEW-RETURN-2 SAW review-set status: ${acknowledgement.status}.`,
           },
         ],
         structuredContent: acknowledgement,
