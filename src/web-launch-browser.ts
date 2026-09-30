@@ -134,6 +134,7 @@ export interface DevSpaceChatShareRecoveryOptions {
   pollMs?: number;
   signal?: AbortSignal;
   ensurePluginConnected?: () => Promise<void>;
+  shouldRecover?: () => boolean | Promise<boolean>;
 }
 
 export class WebLaunchBrowserError extends Error {
@@ -157,6 +158,8 @@ export class WebLaunchBrowserController {
   readonly #recoveryWatchAbortByPage = new WeakMap<Page, AbortController>();
   readonly #recoveryWatchControllers = new Set<AbortController>();
   readonly #recoveryWatchPageByConversationIdentitySha256 = new Map<string, Page>();
+  readonly #devSpaceManagedConversationIdentitySha256 = new Set<string>();
+  readonly #recoveryLifecycleBoundPages = new WeakSet<Page>();
 
   constructor(allowedRoots: string[], options: WebLaunchBrowserOptions = {}) {
     this.#allowedRoots = [...allowedRoots];
@@ -248,9 +251,6 @@ export class WebLaunchBrowserController {
       } else {
         await injectAndSubmitPrompt(page, prompt);
       }
-      if (this.#sessionProvider === "chatshare") {
-        this.#startChatShareRecoveryWatch(page);
-      }
       if (useDevSpaceSession) {
         await activateDevSpaceForConversation(page, 8_000, {
           deviceProofProvider: this.#deviceProofProvider,
@@ -266,11 +266,11 @@ export class WebLaunchBrowserController {
       }
 
       const conversationIdentitySha256 = sha256(conversationIdentity);
-      if (this.#sessionProvider === "chatshare") {
-        this.#recoveryWatchPageByConversationIdentitySha256.set(
+      if (useDevSpaceSession) {
+        this.#devSpaceManagedConversationIdentitySha256.add(
           conversationIdentitySha256,
-          page,
         );
+        this.#trackManagedConversationPage(page);
       }
 
       await page.bringToFront().catch(() => undefined);
@@ -312,6 +312,10 @@ export class WebLaunchBrowserController {
     });
     if (!page || page.isClosed()) return "missing";
 
+    const isManagedDevSpaceConversation =
+      this.#devSpaceManagedConversationIdentitySha256.has(
+        conversationIdentitySha256,
+      );
     const recoverySignal = await detectDevSpaceRecoverySignal(page);
     if (
       recoverySignal === "terminal_capacity" ||
@@ -343,12 +347,8 @@ export class WebLaunchBrowserController {
         // active turn before doing any connector recovery or navigation.
         const rescued = await resumeInterruptedDevSpaceConversationViaComposer(page, prompt);
         if (rescued) {
-          if (this.#sessionProvider === "chatshare") {
-            this.#startChatShareRecoveryWatch(page);
-            this.#recoveryWatchPageByConversationIdentitySha256.set(
-              conversationIdentitySha256,
-              page,
-            );
+          if (isManagedDevSpaceConversation) {
+            this.#trackManagedConversationPage(page);
           }
           await page.bringToFront().catch(() => undefined);
           return "sent";
@@ -356,8 +356,8 @@ export class WebLaunchBrowserController {
       }
     }
 
-    if (this.#sessionProvider === "chatshare" && isResumePrompt) {
-      await ensureChatShareDevSpacePluginConnectedForRecovery(page, {
+    if (isManagedDevSpaceConversation && isResumePrompt) {
+      await ensureDevSpacePluginConnectedForRecovery(page, {
         devSpacePublicBaseUrl: this.#devSpacePublicBaseUrl,
         deviceProofProvider: this.#deviceProofProvider,
       });
@@ -366,12 +366,8 @@ export class WebLaunchBrowserController {
     if (interrupted && isResumePrompt) {
       const rescued = await resumeInterruptedDevSpaceConversationViaComposer(page, prompt);
       if (rescued) {
-        if (this.#sessionProvider === "chatshare") {
-          this.#startChatShareRecoveryWatch(page);
-          this.#recoveryWatchPageByConversationIdentitySha256.set(
-            conversationIdentitySha256,
-            page,
-          );
+        if (isManagedDevSpaceConversation) {
+          this.#trackManagedConversationPage(page);
         }
         await page.bringToFront().catch(() => undefined);
         return "sent";
@@ -388,12 +384,8 @@ export class WebLaunchBrowserController {
 
     await insertAndVerifyPrompt(composers[0]!, prompt);
     await submitPrompt(page, composers[0]!, prompt);
-    if (this.#sessionProvider === "chatshare") {
-      this.#startChatShareRecoveryWatch(page);
-      this.#recoveryWatchPageByConversationIdentitySha256.set(
-        conversationIdentitySha256,
-        page,
-      );
+    if (isManagedDevSpaceConversation) {
+      this.#trackManagedConversationPage(page);
     }
     await page.bringToFront().catch(() => undefined);
     return "sent";
@@ -417,6 +409,9 @@ export class WebLaunchBrowserController {
     }
 
     this.#recoveryWatchPageByConversationIdentitySha256.delete(
+      conversationIdentitySha256,
+    );
+    this.#devSpaceManagedConversationIdentitySha256.delete(
       conversationIdentitySha256,
     );
     if (!page || page.isClosed()) return false;
@@ -471,7 +466,62 @@ export class WebLaunchBrowserController {
     if (lease) await lease.release().catch(() => undefined);
   }
 
-  #startChatShareRecoveryWatch(page: Page): void {
+  #isManagedDevSpacePage(page: Page): boolean {
+    if (page.isClosed()) return false;
+    const identity = chatConversationIdentityFromUrl(page.url());
+    return (
+      identity !== undefined &&
+      this.#devSpaceManagedConversationIdentitySha256.has(sha256(identity))
+    );
+  }
+
+  #trackManagedConversationPage(page: Page): void {
+    if (page.isClosed()) return;
+    this.#bindManagedConversationPageLifecycle(page);
+
+    const identity = chatConversationIdentityFromUrl(page.url());
+    if (!identity) return;
+    const identitySha256 = sha256(identity);
+    if (!this.#devSpaceManagedConversationIdentitySha256.has(identitySha256)) {
+      return;
+    }
+
+    for (const [trackedIdentitySha256, trackedPage] of this
+      .#recoveryWatchPageByConversationIdentitySha256) {
+      if (trackedPage === page && trackedIdentitySha256 !== identitySha256) {
+        this.#recoveryWatchPageByConversationIdentitySha256.delete(
+          trackedIdentitySha256,
+        );
+      }
+    }
+    this.#recoveryWatchPageByConversationIdentitySha256.set(
+      identitySha256,
+      page,
+    );
+    this.#startDevSpaceRecoveryWatch(page);
+  }
+
+  #bindManagedConversationPageLifecycle(page: Page): void {
+    if (this.#recoveryLifecycleBoundPages.has(page)) return;
+    this.#recoveryLifecycleBoundPages.add(page);
+
+    page.on("framenavigated", (frame) => {
+      if (frame !== page.mainFrame()) return;
+      this.#trackManagedConversationPage(page);
+    });
+    page.once("close", () => {
+      for (const [identitySha256, trackedPage] of this
+        .#recoveryWatchPageByConversationIdentitySha256) {
+        if (trackedPage === page) {
+          this.#recoveryWatchPageByConversationIdentitySha256.delete(
+            identitySha256,
+          );
+        }
+      }
+    });
+  }
+
+  #startDevSpaceRecoveryWatch(page: Page): void {
     const current = this.#recoveryWatchAbortByPage.get(page);
     if (current && !current.signal.aborted) return;
 
@@ -481,8 +531,9 @@ export class WebLaunchBrowserController {
 
     void watchForDevSpaceChatShareRecovery(page, 0, {
       signal: abortController.signal,
+      shouldRecover: () => this.#isManagedDevSpacePage(page),
       ensurePluginConnected: () =>
-        ensureChatShareDevSpacePluginConnectedForRecovery(page, {
+        ensureDevSpacePluginConnectedForRecovery(page, {
           devSpacePublicBaseUrl: this.#devSpacePublicBaseUrl,
           deviceProofProvider: this.#deviceProofProvider,
         }),
@@ -565,6 +616,14 @@ export class WebLaunchBrowserController {
 
   #bindContext(context: BrowserContext): void {
     this.#context = context;
+    for (const page of context.pages()) {
+      this.#bindManagedConversationPageLifecycle(page);
+      this.#trackManagedConversationPage(page);
+    }
+    context.on("page", (page) => {
+      this.#bindManagedConversationPageLifecycle(page);
+      this.#trackManagedConversationPage(page);
+    });
     context.once("close", () => {
       if (this.#context !== context) return;
       this.#abortAllRecoveryWatches();
@@ -576,6 +635,10 @@ export class WebLaunchBrowserController {
   }
 
   async #prepareContext(context: BrowserContext): Promise<void> {
+    await context.addInitScript(
+      installDevSpaceRecoveryIntentGuardInDocument,
+      DEVSPACE_RECOVERY_INTENT_GUARD_ARGS,
+    );
     const pages = context.pages();
     const seed = pages[0] ?? (await context.newPage());
     for (const stale of pages.slice(1)) await stale.close().catch(() => undefined);
@@ -2035,6 +2098,73 @@ async function refreshChatShareConversationAfterPluginRecovery(
   }
 }
 
+export async function ensureDevSpacePluginConnectedForRecovery(
+  conversationPage: Page,
+  options: {
+    devSpacePublicBaseUrl?: string;
+    deviceProofProvider?: DeviceProofProvider;
+    timeoutMs?: number;
+  } = {},
+): Promise<void> {
+  if (conversationPage.isClosed()) {
+    throw new WebLaunchBrowserError(
+      "cannot recover DevSpace plugin for a closed conversation",
+    );
+  }
+
+  let conversationUrl: URL;
+  try {
+    conversationUrl = new URL(conversationPage.url());
+  } catch {
+    throw new WebLaunchBrowserError(
+      "cannot recover DevSpace plugin from an invalid conversation URL",
+    );
+  }
+
+  if (conversationUrl.hostname === "chatshare.xyz") {
+    return ensureChatShareDevSpacePluginConnectedForRecovery(
+      conversationPage,
+      options,
+    );
+  }
+  if (conversationUrl.hostname !== "chatgpt.com") return;
+
+  const conversationIdentity = chatConversationIdentityFromUrl(
+    conversationPage.url(),
+  );
+  if (!conversationIdentity) {
+    throw new WebLaunchBrowserError(
+      "cannot recover DevSpace plugin without a durable conversation identity",
+    );
+  }
+
+  const timeoutMs = options.timeoutMs ?? 20_000;
+  const context = conversationPage.context();
+  const pagesBeforeRecovery = new Set(context.pages());
+  const recoveryPage = await context.newPage();
+
+  try {
+    await recoveryPage.goto(CHATGPT_URL, {
+      waitUntil: "domcontentloaded",
+      timeout: Math.min(30_000, Math.max(5_000, timeoutMs)),
+    });
+    await assertAuthenticated(recoveryPage);
+    await navigateToConnectedDevSpaceSurface(recoveryPage, timeoutMs, {
+      refreshIfStale: true,
+      devSpacePublicBaseUrl: options.devSpacePublicBaseUrl,
+      deviceProofProvider:
+        options.deviceProofProvider ?? requestLocalDeviceProof,
+    });
+  } finally {
+    for (const candidate of context.pages()) {
+      if (candidate === conversationPage) continue;
+      if (pagesBeforeRecovery.has(candidate)) continue;
+      await candidate.close().catch(() => undefined);
+    }
+    await conversationPage.bringToFront().catch(() => undefined);
+  }
+}
+
 export async function ensureChatShareDevSpacePluginConnectedForRecovery(
   conversationPage: Page,
   options: {
@@ -2998,13 +3128,51 @@ export async function activateDevSpaceForConversation(
 }
 
 export async function hasDeliveryTimeoutMessage(page: Page): Promise<boolean> {
-  const candidates = await page.getByText(DELIVERY_TIMEOUT_PATTERN).all().catch(() => [] as Locator[]);
-  return anyLocatorVisible(candidates);
+  return hasVisibleTextPattern(page, DELIVERY_TIMEOUT_PATTERN);
+}
+
+async function isCurrentConversationSignalElement(element: Locator): Promise<boolean> {
+  return element
+    .evaluate((candidate) => {
+      const main = candidate.closest("main") ?? document.body;
+      const turnSelectors = [
+        '[data-testid^="conversation-turn"]',
+        "article",
+        "[data-message-author-role]",
+      ];
+
+      for (const selector of turnSelectors) {
+        const turn = candidate.closest(selector);
+        if (!turn) continue;
+
+        const visibleTurns = Array.from(main.querySelectorAll(selector)).filter(
+          (node) => {
+            if (!(node instanceof HTMLElement)) return false;
+            const style = getComputedStyle(node);
+            return (
+              style.visibility !== "hidden" &&
+              style.display !== "none" &&
+              node.getClientRects().length > 0
+            );
+          },
+        );
+        return visibleTurns.length === 0 || visibleTurns[visibleTurns.length - 1] === turn;
+      }
+
+      // Global banners and errors are not nested in a conversation turn, so
+      // they remain valid recovery signals even while a turn is present.
+      return true;
+    })
+    .catch(() => false);
 }
 
 async function hasVisibleTextPattern(page: Page, pattern: RegExp): Promise<boolean> {
   const candidates = await page.getByText(pattern).all().catch(() => [] as Locator[]);
-  return anyLocatorVisible(candidates);
+  for (const candidate of candidates) {
+    if (!(await candidate.isVisible().catch(() => false))) continue;
+    if (await isCurrentConversationSignalElement(candidate)) return true;
+  }
+  return false;
 }
 
 export async function detectDevSpaceRecoverySignal(
@@ -3125,23 +3293,179 @@ async function hasDevSpaceNativeRecoveryControl(page: Page): Promise<boolean> {
   return recoveryButtons.length > 0;
 }
 
+interface DevSpaceRecoveryIntentGuardArgs {
+  stopSelector: string;
+  sendSelector: string;
+  composerSelector: string;
+}
+
+const DEVSPACE_RECOVERY_INTENT_GUARD_ARGS: DevSpaceRecoveryIntentGuardArgs = {
+  stopSelector: STOP_SELECTOR,
+  sendSelector: SEND_SELECTOR,
+  composerSelector: COMPOSER_SELECTORS.join(", "),
+};
+
+function installDevSpaceRecoveryIntentGuardInDocument({
+  stopSelector,
+  sendSelector,
+  composerSelector,
+}: DevSpaceRecoveryIntentGuardArgs): void {
+  const globalState = window as typeof window & {
+    __devspaceRecoveryIntentState?: {
+      installed: boolean;
+      manualStop: boolean;
+      autoActionDepth: number;
+    };
+  };
+  if (globalState.__devspaceRecoveryIntentState?.installed) return;
+
+  const state = {
+    installed: true,
+    manualStop: false,
+    autoActionDepth: 0,
+  };
+  globalState.__devspaceRecoveryIntentState = state;
+
+  document.addEventListener(
+    "click",
+    (event) => {
+      const target =
+        event.target instanceof Element ? event.target : undefined;
+      if (!target) return;
+
+      if (
+        target.closest(stopSelector) &&
+        state.autoActionDepth === 0
+      ) {
+        state.manualStop = true;
+        return;
+      }
+      if (
+        target.closest(sendSelector) &&
+        state.autoActionDepth === 0
+      ) {
+        state.manualStop = false;
+      }
+    },
+    true,
+  );
+
+  document.addEventListener(
+    "submit",
+    () => {
+      if (state.autoActionDepth === 0) state.manualStop = false;
+    },
+    true,
+  );
+
+  document.addEventListener(
+    "keydown",
+    (event) => {
+      if (
+        event.key !== "Enter" ||
+        event.shiftKey ||
+        event.ctrlKey ||
+        event.metaKey ||
+        event.altKey ||
+        state.autoActionDepth !== 0
+      ) {
+        return;
+      }
+      const target =
+        event.target instanceof Element ? event.target : undefined;
+      if (target?.closest(composerSelector)) {
+        state.manualStop = false;
+      }
+    },
+    true,
+  );
+}
+
+async function installDevSpaceRecoveryIntentGuard(page: Page): Promise<void> {
+  if (page.isClosed()) return;
+  await page
+    .evaluate(
+      installDevSpaceRecoveryIntentGuardInDocument,
+      DEVSPACE_RECOVERY_INTENT_GUARD_ARGS,
+    )
+    .catch(() => undefined);
+}
+
+async function hasDevSpaceManualStopLatch(page: Page): Promise<boolean> {
+  if (page.isClosed()) return false;
+  await installDevSpaceRecoveryIntentGuard(page);
+  return page
+    .evaluate(() => {
+      const globalState = window as typeof window & {
+        __devspaceRecoveryIntentState?: {
+          manualStop?: boolean;
+        };
+      };
+      return globalState.__devspaceRecoveryIntentState?.manualStop === true;
+    })
+    .catch(() => false);
+}
+
+async function withDevSpaceAutoRecoveryAction<T>(
+  page: Page,
+  action: () => Promise<T>,
+): Promise<T> {
+  await installDevSpaceRecoveryIntentGuard(page);
+  await page
+    .evaluate(() => {
+      const globalState = window as typeof window & {
+        __devspaceRecoveryIntentState?: {
+          autoActionDepth: number;
+        };
+      };
+      if (globalState.__devspaceRecoveryIntentState) {
+        globalState.__devspaceRecoveryIntentState.autoActionDepth += 1;
+      }
+    })
+    .catch(() => undefined);
+
+  try {
+    return await action();
+  } finally {
+    await page
+      .evaluate(() => {
+        const globalState = window as typeof window & {
+          __devspaceRecoveryIntentState?: {
+            autoActionDepth: number;
+          };
+        };
+        if (globalState.__devspaceRecoveryIntentState) {
+          globalState.__devspaceRecoveryIntentState.autoActionDepth = Math.max(
+            0,
+            globalState.__devspaceRecoveryIntentState.autoActionDepth - 1,
+          );
+        }
+      })
+      .catch(() => undefined);
+  }
+}
+
 async function resumeInterruptedDevSpaceConversationViaComposer(
   page: Page,
   prompt = "resume",
   transitionTimeoutMs = 120_000,
 ): Promise<boolean> {
   if (page.isClosed()) return false;
+  if (await hasDevSpaceManualStopLatch(page)) return false;
 
   let stopControls = await credibleLocators(page.locator(STOP_SELECTOR)).catch(
     () => [] as Locator[],
   );
   const stoppedActiveTurn = stopControls.length > 0;
   if (stoppedActiveTurn) {
+    if (await hasDevSpaceManualStopLatch(page)) return false;
     // UI-first interruption rescue: stop the wedged turn, then wait for the
     // actual UI transition. This is deliberately state-driven rather than a
     // fixed sleep because ChatGPT can take an unpredictable amount of time to
     // replace the square stop control with an idle/send-capable composer.
-    await stopControls[stopControls.length - 1]!.click({ timeout: 5_000 });
+    await withDevSpaceAutoRecoveryAction(page, () =>
+      stopControls[stopControls.length - 1]!.click({ timeout: 5_000 }),
+    );
 
     const stopCleared = await page
       .waitForFunction(
@@ -3161,6 +3485,7 @@ async function resumeInterruptedDevSpaceConversationViaComposer(
       .then(() => true)
       .catch(() => false);
     if (!stopCleared || page.isClosed()) return false;
+    if (await hasDevSpaceManualStopLatch(page)) return false;
   } else {
     stopControls = await credibleLocators(page.locator(STOP_SELECTOR)).catch(
       () => [] as Locator[],
@@ -3214,12 +3539,15 @@ async function resumeInterruptedDevSpaceConversationViaComposer(
   );
   if (activeStops.length > 0) return false;
 
-  await submitPrompt(page, composer, prompt);
+  await withDevSpaceAutoRecoveryAction(page, () =>
+    submitPrompt(page, composer, prompt),
+  );
   return true;
 }
 
 async function resumeDevSpaceConversation(page: Page): Promise<boolean> {
   if (page.isClosed()) return false;
+  if (await hasDevSpaceManualStopLatch(page)) return false;
   const stopControls = await credibleLocators(page.locator(STOP_SELECTOR)).catch(
     () => [] as Locator[],
   );
@@ -3230,6 +3558,7 @@ async function resumeDevSpaceConversation(page: Page): Promise<boolean> {
     true,
   ).catch(() => [] as Locator[]);
   if (recoveryButtons.length === 0) return false;
+  if (await hasDevSpaceManualStopLatch(page)) return false;
 
   await recoveryButtons[recoveryButtons.length - 1]!.click({ timeout: 5_000 });
   return true;
@@ -3435,6 +3764,7 @@ export async function watchForDevSpaceChatShareRecovery(
   let nextPermissionCheckAtMs = 0;
   let resumeAttempts = 0;
   let nextResumeAtMs = 0;
+  await installDevSpaceRecoveryIntentGuard(page);
   let activitySignature = await readChatShareActivitySignature(page);
   let lastActivityAtMs = Date.now();
 
@@ -3442,14 +3772,30 @@ export async function watchForDevSpaceChatShareRecovery(
     while (Date.now() < deadline) {
       if (page.isClosed() || options.signal?.aborted) return acted;
       try {
+        let recoveryAllowed = true;
+        if (options.shouldRecover) {
+          try {
+            recoveryAllowed = await options.shouldRecover();
+          } catch {
+            recoveryAllowed = false;
+          }
+        }
+        if (!recoveryAllowed) {
+          await page.waitForTimeout(Math.max(50, pollMs)).catch(() => undefined);
+          continue;
+        }
+
+        await installDevSpaceRecoveryIntentGuard(page);
+        if (await hasDevSpaceManualStopLatch(page)) {
+          await page.waitForTimeout(Math.max(50, pollMs)).catch(() => undefined);
+          continue;
+        }
+
         const nowMs = Date.now();
         const nextSignature = await readChatShareActivitySignature(page);
         if (nextSignature !== activitySignature) {
           activitySignature = nextSignature;
           lastActivityAtMs = nowMs;
-          if (nowMs >= nextResumeAtMs) {
-            resumeAttempts = 0;
-          }
         }
 
         if (
@@ -3470,70 +3816,95 @@ export async function watchForDevSpaceChatShareRecovery(
           return acted;
         }
 
-        if (resumeAttempts < maxResumeAttempts && Date.now() >= nextResumeAtMs) {
-          const interrupted = recoverySignal === "retryable_interruption";
-          const transientUiError =
-            recoverySignal === "transient_gateway" ||
-            recoverySignal === "generic_error";
-          const silentStall =
-            recoverySignal === "none" &&
-            silentIdleMs > 0 &&
-            Date.now() - lastActivityAtMs >= silentIdleMs &&
-            (await isDevSpaceSilentStallCandidate(page));
+        const interrupted = recoverySignal === "retryable_interruption";
+        const transientUiError =
+          recoverySignal === "transient_gateway" ||
+          recoverySignal === "generic_error";
+        const silentStall =
+          recoverySignal === "none" &&
+          silentIdleMs > 0 &&
+          Date.now() - lastActivityAtMs >= silentIdleMs &&
+          (await isDevSpaceSilentStallCandidate(page));
+        const recoveryEpisodeActive =
+          interrupted || silentStall || transientUiError;
 
-          if (
-            silentStall &&
-            !(await hasDevSpaceNativeRecoveryControl(page))
-          ) {
-            // Silent stalls without a native recovery control are deliberately
-            // detect-only. Ordinary conversations must never synthesize a
-            // user-level "resume" instruction, and there is no safe browser
-            // action to take here.
-            return acted;
+        if (
+          !recoveryEpisodeActive &&
+          resumeAttempts > 0 &&
+          Date.now() >= nextResumeAtMs
+        ) {
+          resumeAttempts = 0;
+        }
+
+        if (
+          silentStall &&
+          !(await hasDevSpaceNativeRecoveryControl(page))
+        ) {
+          // Silent stalls without a native recovery control are deliberately
+          // detect-only. Ordinary conversations must never synthesize a
+          // user-level "resume" instruction, and there is no safe browser
+          // action to take here.
+          return acted;
+        }
+
+        let resumed = false;
+        if (
+          recoveryEpisodeActive &&
+          resumeAttempts < maxResumeAttempts &&
+          Date.now() >= nextResumeAtMs
+        ) {
+          // A user Stop can land after the poll's first latch check but before
+          // recovery classification finishes. Re-check at the action boundary
+          // so a manual stop never triggers connector reconnect or resume.
+          if (await hasDevSpaceManualStopLatch(page)) {
+            continue;
           }
 
-          let resumed = false;
-          if (interrupted || silentStall || transientUiError) {
-            // The budget/cooldown applies to the recovery attempt itself, not
-            // only to a successful click. This prevents repeated plugin
-            // reconnect/retry work when the native control is absent, detached,
-            // or not yet actionable.
-            resumeAttempts += 1;
-            nextResumeAtMs = Date.now() + Math.max(1, resumeCooldownMs);
+          // The budget/cooldown applies to the recovery attempt itself, not
+          // only to a successful click. This prevents repeated plugin
+          // reconnect/retry work when the native control is absent, detached,
+          // or not yet actionable.
+          resumeAttempts += 1;
+          nextResumeAtMs = Date.now() + Math.max(1, resumeCooldownMs);
 
-            if (interrupted) {
-              const activeStops = await credibleLocators(page.locator(STOP_SELECTOR)).catch(
-                () => [] as Locator[],
-              );
-              if (activeStops.length > 0) {
-                // UI first: when the interrupted turn still owns the square
-                // stop control, do not navigate away for connector recovery.
-                // Stop it, wait for the composer/send-arrow transition, and
-                // submit "resume" in the same conversation.
-                resumed = await resumeInterruptedDevSpaceConversationViaComposer(page);
-                if (!resumed) resumed = await resumeDevSpaceConversation(page);
-              } else {
-                await options.ensurePluginConnected?.();
-                if (options.signal?.aborted) return acted;
-                resumed = await resumeInterruptedDevSpaceConversationViaComposer(page);
-                if (!resumed) resumed = await resumeDevSpaceConversation(page);
-              }
+          if (interrupted) {
+            const activeStops = await credibleLocators(page.locator(STOP_SELECTOR)).catch(
+              () => [] as Locator[],
+            );
+            if (activeStops.length > 0) {
+              // UI first: when the interrupted turn still owns the square
+              // stop control, do not navigate away for connector recovery.
+              // Stop it, wait for the composer/send-arrow transition, and
+              // submit "resume" in the same conversation.
+              resumed = await resumeInterruptedDevSpaceConversationViaComposer(page);
+              if (!resumed) resumed = await resumeDevSpaceConversation(page);
             } else {
-              if (silentStall) {
-                await options.ensurePluginConnected?.();
-                if (options.signal?.aborted) return acted;
+              if (await hasDevSpaceManualStopLatch(page)) {
+                continue;
               }
-              // Gateway/generic failures and silent stalls are retried only
-              // through a native UI control. Never synthesize a user-level
-              // "resume" instruction for those states.
-              resumed = await resumeDevSpaceConversation(page);
+              await options.ensurePluginConnected?.();
+              if (options.signal?.aborted) return acted;
+              resumed = await resumeInterruptedDevSpaceConversationViaComposer(page);
+              if (!resumed) resumed = await resumeDevSpaceConversation(page);
             }
+          } else {
+            if (silentStall) {
+              if (await hasDevSpaceManualStopLatch(page)) {
+                continue;
+              }
+              await options.ensurePluginConnected?.();
+              if (options.signal?.aborted) return acted;
+            }
+            // Gateway/generic failures and silent stalls are retried only
+            // through a native UI control. Never synthesize a user-level
+            // "resume" instruction for those states.
+            resumed = await resumeDevSpaceConversation(page);
           }
-          if (resumed) {
-            acted = true;
-            activitySignature = await readChatShareActivitySignature(page);
-            lastActivityAtMs = Date.now();
-          }
+        }
+        if (resumed) {
+          acted = true;
+          activitySignature = await readChatShareActivitySignature(page);
+          lastActivityAtMs = Date.now();
         }
       } catch {
         // Navigation and DOM transitions can detach recovery controls; retry from a fresh snapshot.
