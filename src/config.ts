@@ -8,12 +8,14 @@ import { loadDevspaceFiles } from "./user-config.js";
 
 export type ToolNamingMode = "legacy" | "short";
 export type WidgetMode = "off" | "changes" | "full";
+export type ChatSessionProvider = "chatgpt" | "chatshare";
 const DEFAULT_OAUTH_ACCESS_TOKEN_TTL_SECONDS = 60 * 60;
 const DEFAULT_OAUTH_REFRESH_TOKEN_TTL_SECONDS = 30 * 24 * 60 * 60;
 const DEFAULT_DEVICE_AUTH_LOOPBACK_PORT = 7677;
 const DEFAULT_DEVICE_AUTH_CHALLENGE_TTL_SECONDS = 60;
 const DEFAULT_DEVICE_AUTH_EXTENSION_ID = "aaoelopmdnhifffjefciagfmhjanbaoc";
 const DEFAULT_DEVICE_AUTH_REDIRECT_PREFIXES = [
+  "https://chatgpt.com/connector/oauth/",
   "https://chatshare.xyz/connector/oauth/",
   "https://chatshare.xyz/connector_platform_oauth_redirect",
 ];
@@ -28,6 +30,7 @@ export interface ServerConfig {
   minimalTools: boolean;
   toolNaming: ToolNamingMode;
   widgets: WidgetMode;
+  chatSessionProvider: ChatSessionProvider;
   stateDir: string;
   skillsEnabled: boolean;
   skillPaths: string[];
@@ -113,6 +116,12 @@ export function isAllowedHostHeader(hostHeader: string | undefined, allowedHosts
 
 function parseBoolean(value: string | undefined): boolean {
   return ["1", "true", "yes", "on"].includes(value?.toLowerCase() ?? "");
+}
+
+function parseChatSessionProvider(value: string | undefined): ChatSessionProvider {
+  if (!value || value === "chatgpt") return "chatgpt";
+  if (value === "chatshare") return "chatshare";
+  throw new Error(`Invalid DEVSPACE_CHAT_SESSION_PROVIDER: ${value}`);
 }
 
 function parseMinimalTools(env: NodeJS.ProcessEnv): boolean {
@@ -355,6 +364,9 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ServerConfig {
     minimalTools: parseMinimalTools(env),
     toolNaming: parseToolNaming(env.DEVSPACE_TOOL_NAMING),
     widgets: parseWidgetMode(env.DEVSPACE_WIDGETS),
+    chatSessionProvider: parseChatSessionProvider(
+      env.DEVSPACE_CHAT_SESSION_PROVIDER ?? files.config.chatSessionProvider,
+    ),
     stateDir: resolve(expandHomePath(env.DEVSPACE_STATE_DIR ?? files.config.stateDir ?? defaultStateDir())),
     skillsEnabled: env.DEVSPACE_SKILLS === undefined ? true : parseBoolean(env.DEVSPACE_SKILLS),
     skillPaths: parsePathList(env.DEVSPACE_SKILL_PATHS),

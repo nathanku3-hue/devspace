@@ -14,6 +14,7 @@ export interface DevspaceUserConfig {
   port?: number;
   allowedRoots?: string[];
   publicBaseUrl?: string | null;
+  chatSessionProvider?: "chatgpt" | "chatshare";
   allowedHosts?: string[];
   stateDir?: string;
   agentDir?: string;
@@ -89,7 +90,8 @@ export function generateOwnerToken(): string {
 
 function readJsonFile<T>(filePath: string): T {
   try {
-    return JSON.parse(readFileSync(filePath, "utf8")) as T;
+    const raw = readFileSync(filePath, "utf8").replace(/^\uFEFF/, "");
+    return JSON.parse(raw) as T;
   } catch (error) {
     const reason = error instanceof Error ? error.message : String(error);
     throw new Error(`Unable to read ${filePath}: ${reason}`);

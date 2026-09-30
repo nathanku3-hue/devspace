@@ -26,6 +26,12 @@ export function registerWebLaunchTool(input: {
           .describe(
             "Exact prompt to insert and submit. Carriage returns are rejected rather than modified.",
           ),
+        attachDevSpace: z
+          .boolean()
+          .optional()
+          .describe(
+            "When true, attach the connected DevSpace app before submitting the prompt. Defaults to false.",
+          ),
       },
       ...NO_APP_META,
       annotations: {
@@ -35,8 +41,15 @@ export function registerWebLaunchTool(input: {
         openWorldHint: true,
       },
     },
-    async ({ prompt }) => {
-      const acknowledgement = await browser.launchWebConversation(prompt);
+    async ({ prompt, attachDevSpace }) => {
+      const inferredAttachDevSpace =
+        attachDevSpace ??
+        /(?:\bDevSpace Local tools?\b|\bsource_resolve_(?:start|status|submit)\b)/i.test(
+          prompt,
+        );
+      const acknowledgement = await browser.launchWebConversation(prompt, {
+        attachDevSpace: inferredAttachDevSpace,
+      });
       return {
         content: [{ type: "text" as const, text: "WEB-LAUNCH-0 launch succeeded." }],
         structuredContent: acknowledgement,

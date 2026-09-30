@@ -134,6 +134,7 @@ async function runInit({ force }: { force: boolean }): Promise<void> {
       port,
       allowedRoots,
       publicBaseUrl,
+      chatSessionProvider: files.config.chatSessionProvider ?? "chatgpt",
     };
     const auth = {
       ownerToken: files.auth.ownerToken ?? generateOwnerToken(),
@@ -246,20 +247,35 @@ function runConfigCommand(args: string[]): void {
   if (subcommand !== "set") {
     throw new Error(`Unknown config command: ${subcommand}`);
   }
-  if (key !== "publicBaseUrl") {
-    throw new Error("Only `devspace config set publicBaseUrl <url|null>` is supported right now.");
-  }
-
   const value = rest.join(" ").trim();
   if (!value) {
-    throw new Error("Missing publicBaseUrl value.");
+    throw new Error(`Missing ${key ?? "config"} value.`);
   }
 
-  writeDevspaceConfig({
-    ...files.config,
-    publicBaseUrl: normalizeOptionalPublicBaseUrl(value),
-  });
-  console.log(`Updated ${files.configPath}`);
+  if (key === "publicBaseUrl") {
+    writeDevspaceConfig({
+      ...files.config,
+      publicBaseUrl: normalizeOptionalPublicBaseUrl(value),
+    });
+    console.log(`Updated ${files.configPath}`);
+    return;
+  }
+
+  if (key === "chatSessionProvider") {
+    if (value !== "chatgpt" && value !== "chatshare") {
+      throw new Error("chatSessionProvider must be `chatgpt` or `chatshare`.");
+    }
+    writeDevspaceConfig({
+      ...files.config,
+      chatSessionProvider: value,
+    });
+    console.log(`Updated ${files.configPath}`);
+    return;
+  }
+
+  throw new Error(
+    "Supported config keys: publicBaseUrl, chatSessionProvider.",
+  );
 }
 
 function printHelp(): void {
@@ -274,6 +290,7 @@ function printHelp(): void {
       "  devspace doctor          Show config, runtime, and native dependency status",
       "  devspace config get      Print persisted config",
       "  devspace config set publicBaseUrl <url|null>",
+      "  devspace config set chatSessionProvider <chatgpt|chatshare>",
       "  devspace -v, --version   Print the installed version",
       "",
       "For temporary tunnels:",

@@ -37,6 +37,7 @@ function testConfig(parent: string): ServerConfig {
     minimalTools: false,
     toolNaming: "short",
     widgets: "off",
+    chatSessionProvider: "chatgpt",
     stateDir: join(parent, "state"),
     skillsEnabled: false,
     skillPaths: [],

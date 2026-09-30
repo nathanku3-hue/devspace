@@ -19,6 +19,15 @@ assert.equal(loadConfig(baseEnv).toolNaming, "short");
 assert.equal(loadConfig({ ...baseEnv, DEVSPACE_TOOL_NAMING: "short" }).toolNaming, "short");
 assert.equal(loadConfig({ ...baseEnv, DEVSPACE_TOOL_NAMING: "legacy" }).toolNaming, "legacy");
 assert.equal(loadConfig(baseEnv).minimalTools, true);
+assert.equal(loadConfig(baseEnv).chatSessionProvider, "chatgpt");
+assert.equal(
+  loadConfig({ ...baseEnv, DEVSPACE_CHAT_SESSION_PROVIDER: "chatshare" }).chatSessionProvider,
+  "chatshare",
+);
+assert.equal(
+  loadConfig({ ...baseEnv, DEVSPACE_CHAT_SESSION_PROVIDER: "chatgpt" }).chatSessionProvider,
+  "chatgpt",
+);
 assert.equal(loadConfig({ ...baseEnv, DEVSPACE_TOOL_MODE: "minimal" }).minimalTools, true);
 assert.equal(loadConfig({ ...baseEnv, DEVSPACE_TOOL_MODE: "full" }).minimalTools, false);
 assert.equal(loadConfig({ ...baseEnv, DEVSPACE_MINIMAL_TOOLS: "0" }).minimalTools, false);
@@ -46,6 +55,10 @@ assert.throws(
 assert.throws(
   () => loadConfig({ ...baseEnv, DEVSPACE_TOOL_NAMING: "invalid" }),
   /Invalid DEVSPACE_TOOL_NAMING: invalid/,
+);
+assert.throws(
+  () => loadConfig({ ...baseEnv, DEVSPACE_CHAT_SESSION_PROVIDER: "invalid" }),
+  /Invalid DEVSPACE_CHAT_SESSION_PROVIDER: invalid/,
 );
 
 assert.deepEqual(loadConfig(baseEnv).logging, {
@@ -100,6 +113,7 @@ assert.deepEqual(loadConfig(baseEnv).oauth.deviceAuthorization, {
   loopbackPort: 7677,
   extensionId: "aaoelopmdnhifffjefciagfmhjanbaoc",
   allowedRedirectPrefixes: [
+    "https://chatgpt.com/connector/oauth/",
     "https://chatshare.xyz/connector/oauth/",
     "https://chatshare.xyz/connector_platform_oauth_redirect",
   ],
@@ -113,6 +127,7 @@ assert.deepEqual(
     loopbackPort: 7677,
     extensionId: "aaoelopmdnhifffjefciagfmhjanbaoc",
     allowedRedirectPrefixes: [
+      "https://chatgpt.com/connector/oauth/",
       "https://chatshare.xyz/connector/oauth/",
       "https://chatshare.xyz/connector_platform_oauth_redirect",
     ],

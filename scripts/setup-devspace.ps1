@@ -68,6 +68,11 @@ $LegacyWorktreeMigrationRoot = Join-Path $env:USERPROFILE ".devspace\worktrees"
 $AllowedRoots = @($PrimaryAllowedRoot, $LegacyWorktreeMigrationRoot)
 $AllowedRootsEnv = $AllowedRoots -join ","
 $ExpectedTools = @(
+    "audit_batch_start",
+    "audit_batch_status",
+    "audit_start",
+    "audit_status",
+    "audit_submit",
     "bash",
     "cancel_long_task",
     "close_workspace",
@@ -79,7 +84,13 @@ $ExpectedTools = @(
     "publish_git_changes",
     "read",
     "read_files",
+    "review_start",
+    "review_status",
+    "review_submit",
     "safe_rename_file",
+    "source_resolve_start",
+    "source_resolve_status",
+    "source_resolve_submit",
     "start_long_task",
     "web_launch",
     "write"
@@ -1067,7 +1078,7 @@ function Start-DevSpaceServer([string]$devspaceCli, [string]$tunnelHost) {
     $env:DEVSPACE_DEVICE_AUTH_REQUIRED = "false"
     $env:DEVSPACE_DEVICE_AUTH_LOOPBACK_PORT = "$DeviceProofPort"
     $env:DEVSPACE_DEVICE_AUTH_EXTENSION_ID = "aaoelopmdnhifffjefciagfmhjanbaoc"
-    $env:DEVSPACE_DEVICE_AUTH_ALLOWED_REDIRECT_PREFIXES = "https://chatshare.xyz/connector/oauth/,https://chatshare.xyz/connector_platform_oauth_redirect"
+    $env:DEVSPACE_DEVICE_AUTH_ALLOWED_REDIRECT_PREFIXES = "https://chatgpt.com/connector/oauth/,https://chatshare.xyz/connector/oauth/,https://chatshare.xyz/connector_platform_oauth_redirect"
     $env:GIT_TERMINAL_PROMPT = "0"
     $env:GIT_EDITOR = "true"
     $env:GIT_ASKPASS = "true"

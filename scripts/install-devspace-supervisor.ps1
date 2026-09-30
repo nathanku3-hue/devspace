@@ -6,10 +6,24 @@
 param(
     [string]$SupervisorTaskName = "DevSpaceOriginSupervisor",
     [string]$OriginTaskName = "DevSpaceOriginUser",
+    [int]$ShellMaxActive = 4,
+    [int]$ShellMaxActivePerWorkspace = 2,
+    [int]$ShellMaxQueued = 16,
+    [int]$FastPathQueueWaitMs = 8000,
+    [int]$FastPathExecutionMs = 15000,
     [switch]$ApplyNow
 )
 
 $ErrorActionPreference = "Stop"
+
+if ($ShellMaxActive -lt 1) { throw "ShellMaxActive must be at least 1." }
+if ($ShellMaxActivePerWorkspace -lt 1) { throw "ShellMaxActivePerWorkspace must be at least 1." }
+if ($ShellMaxActivePerWorkspace -gt $ShellMaxActive) {
+    throw "ShellMaxActivePerWorkspace cannot exceed ShellMaxActive."
+}
+if ($ShellMaxQueued -lt 1) { throw "ShellMaxQueued must be at least 1." }
+if ($FastPathQueueWaitMs -lt 1) { throw "FastPathQueueWaitMs must be at least 1." }
+if ($FastPathExecutionMs -lt 1) { throw "FastPathExecutionMs must be at least 1." }
 
 function Assert-DevSpaceElevatedOperator {
     $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
@@ -189,15 +203,18 @@ $envLines = @(
     'set "DEVSPACE_DEVICE_AUTH_REQUIRED=false"',
     'set "DEVSPACE_DEVICE_AUTH_LOOPBACK_PORT=7677"',
     'set "DEVSPACE_DEVICE_AUTH_EXTENSION_ID=aaoelopmdnhifffjefciagfmhjanbaoc"',
-    'set "DEVSPACE_DEVICE_AUTH_ALLOWED_REDIRECT_PREFIXES=https://chatshare.xyz/connector/oauth/,https://chatshare.xyz/connector_platform_oauth_redirect"',
+    'set "DEVSPACE_DEVICE_AUTH_ALLOWED_REDIRECT_PREFIXES=https://chatgpt.com/connector/oauth/,https://chatshare.xyz/connector/oauth/,https://chatshare.xyz/connector_platform_oauth_redirect"',
+    'set "DEVSPACE_OAUTH_ACCESS_TOKEN_TTL_SECONDS=86400"',
     'set "GIT_TERMINAL_PROMPT=0"',
     'set "GIT_EDITOR=true"',
     'set "GIT_ASKPASS=true"',
     'set "GCM_INTERACTIVE=never"',
-    'set "DEVSPACE_SHELL_MAX_ACTIVE=2"',
-    'set "DEVSPACE_SHELL_MAX_ACTIVE_PER_WORKSPACE=1"',
-    'set "DEVSPACE_SHELL_MAX_QUEUED=16"',
+    ('set "DEVSPACE_SHELL_MAX_ACTIVE={0}"' -f $ShellMaxActive),
+    ('set "DEVSPACE_SHELL_MAX_ACTIVE_PER_WORKSPACE={0}"' -f $ShellMaxActivePerWorkspace),
+    ('set "DEVSPACE_SHELL_MAX_QUEUED={0}"' -f $ShellMaxQueued),
     'set "DEVSPACE_SHELL_QUEUE_TIMEOUT_MS=60000"',
+    ('set "DEVSPACE_FAST_PATH_QUEUE_WAIT_MS={0}"' -f $FastPathQueueWaitMs),
+    ('set "DEVSPACE_FAST_PATH_EXECUTION_MS={0}"' -f $FastPathExecutionMs),
     'set "DEVSPACE_SHELL_MAX_OUTPUT_BYTES=8388608"',
     # Keep the V8 cap scoped to the DevSpace origin itself. Do not use NODE_OPTIONS:
     # bash children such as npm/tsc/vite must not inherit the server heap limit.

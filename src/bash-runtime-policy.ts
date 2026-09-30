@@ -34,8 +34,31 @@ const INDISCRIMINATE_NODE_KILL =
 
 const DEFAULT_SERVICES = ["DevSpaceOrigin", "DevSpaceTunnel"];
 const DEFAULT_TASKS = ["DevSpaceOriginSupervisor"];
+const RUNTIME_POLICY_CACHE_MS = 5_000;
+
+let cachedDefaultRuntimePolicy:
+  | { expiresAt: number; context: RuntimePolicyContext }
+  | undefined;
+
+function cloneRuntimePolicyContext(context: RuntimePolicyContext): RuntimePolicyContext {
+  return {
+    originPids: [...context.originPids],
+    cloudflaredPids: [...context.cloudflaredPids],
+    serviceNames: [...context.serviceNames],
+    supervisorTaskNames: [...context.supervisorTaskNames],
+  };
+}
 
 export function loadRuntimePolicyContext(originPid = process.pid): RuntimePolicyContext {
+  const now = Date.now();
+  if (
+    originPid === process.pid &&
+    cachedDefaultRuntimePolicy &&
+    cachedDefaultRuntimePolicy.expiresAt > now
+  ) {
+    return cloneRuntimePolicyContext(cachedDefaultRuntimePolicy.context);
+  }
+
   const originPids = new Set<number>([originPid]);
   const cloudflaredPids = new Set<number>();
   try {
@@ -51,12 +74,24 @@ export function loadRuntimePolicyContext(originPid = process.pid): RuntimePolicy
   } catch {
     // Missing or unreadable runtime still protects this serve process.
   }
-  return {
+
+  const context: RuntimePolicyContext = {
     originPids: [...originPids],
     cloudflaredPids: [...cloudflaredPids],
     serviceNames: DEFAULT_SERVICES,
     supervisorTaskNames: DEFAULT_TASKS,
   };
+  if (originPid === process.pid) {
+    cachedDefaultRuntimePolicy = {
+      expiresAt: now + RUNTIME_POLICY_CACHE_MS,
+      context: cloneRuntimePolicyContext(context),
+    };
+  }
+  return context;
+}
+
+export function clearRuntimePolicyContextCacheForTests(): void {
+  cachedDefaultRuntimePolicy = undefined;
 }
 
 export function evaluateBashRuntimePolicy(

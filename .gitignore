@@ -5,3 +5,8 @@ releases/
 .env
 *.log
 nul
+data/chatshare-agentic/
+jobs.jsonl
+tmp/
+*.tgz
+上海大都市圈*.md

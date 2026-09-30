@@ -6,8 +6,8 @@ export interface ShellExecutionLimits {
 }
 
 export const DEFAULT_SHELL_EXECUTION_LIMITS: ShellExecutionLimits = {
-  maxActive: 2,
-  maxActivePerKey: 1,
+  maxActive: 4,
+  maxActivePerKey: 2,
   maxQueued: 16,
   queueTimeoutMs: 60_000,
 };

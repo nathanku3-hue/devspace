@@ -49,22 +49,37 @@ test("Control-plane / execution-plane long task tools and bash fast-path", async
     await server.connect(serverTransport);
     await client.connect(clientTransport);
 
-    // 1. Verify exactly 15 tools are exposed, including the 3 control plane tools
+    // 1. Verify the full current tool surface, including long-task,
+    // source-resolve, and audit control-plane tools.
     const listed = await client.listTools();
     const toolNames = listed.tools.map((t) => t.name).sort();
     assert.deepEqual(toolNames, [
+      "audit_batch_start",
+      "audit_batch_status",
+      "audit_start",
+      "audit_status",
+      "audit_submit",
       "bash",
       "cancel_long_task",
       "close_workspace",
       "continue_meta_harness",
       "create_worktree_workspace",
       "edit",
+      "glob",
+      "grep",
       "long_task_status",
+      "ls",
       "open_workspace",
       "publish_git_changes",
       "read",
       "read_files",
+      "review_start",
+      "review_status",
+      "review_submit",
       "safe_rename_file",
+      "source_resolve_start",
+      "source_resolve_status",
+      "source_resolve_submit",
       "start_long_task",
       "web_launch",
       "write",
@@ -277,6 +292,7 @@ test("Compatibility and failure semantics stay schema-safe", async () => {
     const outputKeys = [
       "completedAt",
       "createdAt",
+      "diagnostics",
       "error",
       "kind",
       "operationId",
@@ -509,7 +525,7 @@ test("Regression Gate 1: Actual automatic bash fast-path handoff with injectable
     const gate1Data = gate1BashRes.structuredContent as any;
     assert.ok(gate1Data.operationId, "operationId must be returned on fast-path timeout");
     assert.ok(gate1Data.status === "running" || gate1Data.status === "queued");
-    assert.match(gate1Data.result, /Command exceeded 60ms fast-path and is executing in the background/);
+    assert.match(gate1Data.result, /Command exceeded 60ms execution fast-path and is continuing in the background/);
     const gate1OpId = gate1Data.operationId;
 
     // Poll long_task_status until completion

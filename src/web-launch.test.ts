@@ -39,6 +39,7 @@ function testConfig(parent: string): ServerConfig {
     minimalTools: false,
     toolNaming: "short",
     widgets: "off",
+    chatSessionProvider: "chatgpt",
     stateDir: join(parent, "state"),
     skillsEnabled: false,
     skillPaths: [],
@@ -58,7 +59,7 @@ function testConfig(parent: string): ServerConfig {
 test("public web_launch exposes only WEB-LAUNCH-0 and preserves the supplied prompt", async () => {
   const parent = await mkdtemp(join(tmpdir(), "devspace-web-launch-tool-"));
   const config = testConfig(parent);
-  const prompts: string[] = [];
+  const launches: Array<{ prompt: string; attachDevSpace: boolean }> = [];
   const acknowledgement: WebLaunchAcknowledgement = {
     slice: "WEB-LAUNCH-0",
     launchSuccess: true,
@@ -67,8 +68,14 @@ test("public web_launch exposes only WEB-LAUNCH-0 and preserves the supplied pro
     assistantOutputCaptured: false,
   };
   const browser = {
-    launchWebConversation: async (prompt: string) => {
-      prompts.push(prompt);
+    launchWebConversation: async (
+      prompt: string,
+      options?: { attachDevSpace?: boolean },
+    ) => {
+      launches.push({
+        prompt,
+        attachDevSpace: options?.attachDevSpace ?? false,
+      });
       return acknowledgement;
     },
   } as Pick<WebLaunchBrowserController, "launchWebConversation">;
@@ -88,7 +95,7 @@ test("public web_launch exposes only WEB-LAUNCH-0 and preserves the supplied pro
     const tool = listed.tools.find((candidate) => candidate.name === "web_launch");
     assert.ok(tool);
     assert.match(tool.description ?? "", /explicitly requests/i);
-    assert.deepEqual(Object.keys(tool.inputSchema.properties ?? {}), ["prompt"]);
+    assert.deepEqual(Object.keys(tool.inputSchema.properties ?? {}), ["prompt", "attachDevSpace"]);
 
     const metaContinuation = listed.tools.find((candidate) => candidate.name === "continue_meta_harness");
     assert.ok(metaContinuation);
@@ -97,8 +104,29 @@ test("public web_launch exposes only WEB-LAUNCH-0 and preserves the supplied pro
 
     const prompt = "Keep  exact spacing.\nDo not continue.";
     const result = await client.callTool({ name: "web_launch", arguments: { prompt } });
-    assert.deepEqual(prompts, [prompt]);
+    const attachedResult = await client.callTool({
+      name: "web_launch",
+      arguments: { prompt: "Attached bootstrap", attachDevSpace: true },
+    });
+    const inferredResult = await client.callTool({
+      name: "web_launch",
+      arguments: {
+        prompt:
+          "Use DevSpace Local tools as the control plane and invoke source_resolve_start exactly once.",
+      },
+    });
+    assert.deepEqual(launches, [
+      { prompt, attachDevSpace: false },
+      { prompt: "Attached bootstrap", attachDevSpace: true },
+      {
+        prompt:
+          "Use DevSpace Local tools as the control plane and invoke source_resolve_start exactly once.",
+        attachDevSpace: true,
+      },
+    ]);
     assert.deepEqual(result.structuredContent, acknowledgement);
+    assert.deepEqual(attachedResult.structuredContent, acknowledgement);
+    assert.deepEqual(inferredResult.structuredContent, acknowledgement);
     assert.equal("assistantOutput" in (result.structuredContent ?? {}), false);
   } finally {
     await client.close().catch(() => undefined);

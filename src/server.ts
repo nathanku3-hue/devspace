@@ -53,6 +53,12 @@ import { globalShellExecutionLimiter } from "./shell-execution-limiter.js";
 import { killTrackedShellProcesses } from "./shell-runtime.js";
 import { WebLaunchBrowserController } from "./web-launch-browser.js";
 import { registerWebLaunchTool } from "./web-launch-tools.js";
+import { AuditReturnController } from "./audit-return.js";
+import { registerAuditReturnTools } from "./audit-return-tools.js";
+import { SourceResolveController } from "./source-resolve.js";
+import { registerSourceResolveTools } from "./source-resolve-tools.js";
+import { ReviewReturnController } from "./review-return.js";
+import { registerReviewReturnTools } from "./review-return-tools.js";
 import {
   defaultMetaHarnessHost,
   type MetaContinuationReadiness,
@@ -88,7 +94,24 @@ export interface LongTaskToolResult {
   taskValidation?: z.infer<typeof nativeTaskValidationOutputSchema>;
 }
 
-const FAST_PATH_TIMEOUT_MS = 15_000;
+const DEFAULT_FAST_PATH_QUEUE_WAIT_MS = 8_000;
+const DEFAULT_FAST_PATH_EXECUTION_MS = 15_000;
+
+function positiveIntegerEnv(name: string, fallback: number): number {
+  const raw = process.env[name]?.trim();
+  if (!raw) return fallback;
+  const parsed = Number(raw);
+  return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : fallback;
+}
+
+const FAST_PATH_QUEUE_WAIT_MS = positiveIntegerEnv(
+  "DEVSPACE_FAST_PATH_QUEUE_WAIT_MS",
+  DEFAULT_FAST_PATH_QUEUE_WAIT_MS,
+);
+const FAST_PATH_EXECUTION_MS = positiveIntegerEnv(
+  "DEVSPACE_FAST_PATH_EXECUTION_MS",
+  positiveIntegerEnv("DEVSPACE_FAST_PATH_TIMEOUT_MS", DEFAULT_FAST_PATH_EXECUTION_MS),
+);
 export const globalLongTaskOperations = new LongTaskOperationManager<LongTaskToolResult>(100);
 
 type Transport = StreamableHTTPServerTransport;
@@ -252,7 +275,41 @@ interface ToolLogFields {
   commandLength?: number;
   success: boolean;
   durationMs: number;
+  queueWaitMs?: number;
+  executionMs?: number;
+  limiterActive?: number;
+  limiterQueued?: number;
+  limiterActiveForWorkspace?: number;
   error?: string;
+}
+
+interface ShellLimiterTelemetry {
+  active: number;
+  queued: number;
+  activeForWorkspace: number;
+}
+
+function shellLimiterTelemetry(workspaceRoot: string): ShellLimiterTelemetry {
+  const snapshot = globalShellExecutionLimiter.snapshot();
+  return {
+    active: snapshot.active,
+    queued: snapshot.queued,
+    activeForWorkspace: snapshot.activeByKey[workspaceRoot] ?? 0,
+  };
+}
+
+function diagnosticNumber(
+  diagnostics: Record<string, unknown> | undefined,
+  key: string,
+): number | undefined {
+  const value = diagnostics?.[key];
+  return typeof value === "number" && Number.isFinite(value) ? value : undefined;
+}
+
+function formatDurationMs(durationMs: number): string {
+  return durationMs >= 1000 && durationMs % 1000 === 0
+    ? `${durationMs / 1000}s`
+    : `${durationMs}ms`;
 }
 
 function toolNamesFor(config: ServerConfig): ToolNames {
@@ -286,9 +343,8 @@ function toolNamesFor(config: ServerConfig): ToolNames {
 }
 
 function serverInstructions(config: ServerConfig, toolNames: ToolNames): string {
-  const inspection = config.minimalTools
-    ? `In minimal tool mode, ${toolNames.grep}, ${toolNames.glob}, and ${toolNames.ls} are disabled; use ${toolNames.shell} with command-line tools such as grep, rg, find, ls, and tree for search and directory inspection. `
-    : `Prefer ${toolNames.readBatch} when two or more known text files are needed in the same reasoning step; use ${toolNames.read}, ${toolNames.grep}, ${toolNames.glob}, and ${toolNames.ls} for single-file or discovery work. `;
+  const inspection =
+    `Prefer ${toolNames.readBatch} when two or more known text files are needed in the same reasoning step; use ${toolNames.read}, ${toolNames.grep}, ${toolNames.glob}, and ${toolNames.ls} for single-file, search, and directory discovery. These native inspection tools do not consume shell execution slots, so do not use ${toolNames.shell} for file search or directory listing when a native tool fits. `;
 
   const skills = config.skillsEnabled
     ? `When ${toolNames.openWorkspace} returns available skills and a task matches a skill, use ${toolNames.read} or ${toolNames.readBatch} to read that skill's path before proceeding. Skill paths may be outside the workspace, but read tools only permit advertised SKILL.md files and files under already-loaded skill directories. `
@@ -301,7 +357,7 @@ function serverInstructions(config: ServerConfig, toolNames: ToolNames): string 
       ? " After creating, editing, or overwriting files, call show_changes once after the related file changes are complete so the user can see the aggregate diff."
       : "";
 
-  return `Use DevSpace as a local coding workspace. Call ${toolNames.openWorkspace} once to open an existing project directory or checkout and obtain a workspaceId; it does not create missing folders. Use ${toolNames.createWorktreeWorkspace} only when an isolated managed Git worktree is actually needed. Reuse the returned workspaceId for all later file, search, edit, write, show-changes, shell, and Git publication tools in that folder; do not reopen the same folder unless the workspaceId is rejected as unknown, the user explicitly asks to reopen, or you intentionally switch to a different folder/worktree. For Meta-Harness repositories, use metaStartup as the authoritative startup-loading state. READY means metaStartup.lines is the canonical repo-declared startup projection; do not reconstruct project state from chat history or undeclared legacy context files. BLOCKED means do not invoke continuation or fall back to undeclared context; treat the listed blockers as recoverable repository-context gaps rather than an owner gate. UNDECLARED means Meta-Harness was detected but inspect returned legacy meta-entry/v1 without repo-declared startup context: do not claim startup context is loaded and do not reconstruct it from chat history. INSPECTION_FAILED is a recoverable host diagnostic, not a product stop. When metaContinuation.status=BLOCKED, do not invoke continue_meta_harness and do not synthesize Meta-Harness decision-plane state from DevSpace. A concrete task in the user's current turn is the velocity-first path: use the returned startup context and execute that task directly instead of invoking continuation merely because metaEntry.action=CONTINUE. Opening a workspace is also a complete user action, not implicit resume intent. Invoke continue_meta_harness only when the user explicitly asks to resume/continue retained Meta-Harness work. Automatically invoke it at most once per user turn. If continue_meta_harness returns STOPPED or BLOCKED, or the call errors, do not retry it automatically in the same turn; continue the user's concrete task with scoped tools when possible, otherwise surface the controller result. When metaEntry.action=IDLE, do not invoke continuation. Close managed worktree sessions with ${toolNames.closeWorkspace}; it refuses dirty worktrees and removes clean worktrees through Git. When the user explicitly requests one fresh ChatGPT Web conversation with a supplied prompt, invoke web_launch; do not infer this trigger from text typed in another composer. WEB-LAUNCH-0 returns only launch acknowledgement and does not capture assistant output or continue the spawned conversation. ${agentsMd}${skills}${inspection}Batch known context reads with ${toolNames.readBatch} to reduce host approval prompts. Prefer ${toolNames.edit} for targeted modifications, ${toolNames.write} only for new files or complete rewrites, and ${toolNames.shell} for tests, builds, Git inspection, package scripts, and commands that are better executed by the shell. Commands exceeding 15 seconds continue in the background and return an operationId; poll long_task_status to inspect progress or cancel_long_task to terminate them. For commands expected to exceed 60 seconds, you may also invoke start_long_task directly. When the user explicitly requests a commit or push, use publish_git_changes with the existing workspaceId, a workingDirectory relative to the workspace root, and exact file paths. Do not construct /mnt paths, Windows absolute paths, or shell cd commands for workspace navigation; use the workingDirectory field. Do not use ${toolNames.shell} to edit working-tree contents or mutate the Git index, history, remotes, or branches. Avoid shell redirection, heredocs, tee, sed -i, perl -i, node/python/ruby scripts, generated scripts, or other commands whose purpose is to write project files. Use ${toolNames.edit} or ${toolNames.write} for content changes.${showChanges}`;
+  return `Use DevSpace as a local coding workspace. Call ${toolNames.openWorkspace} once to open an existing project directory or checkout and obtain a workspaceId; it does not create missing folders. Use ${toolNames.createWorktreeWorkspace} only when an isolated managed Git worktree is actually needed. Reuse the returned workspaceId for all later file, search, edit, write, show-changes, shell, and Git publication tools in that folder; do not reopen the same folder unless the workspaceId is rejected as unknown, the user explicitly asks to reopen, or you intentionally switch to a different folder/worktree. For Meta-Harness repositories, use metaStartup as the authoritative startup-loading state. READY means metaStartup.lines is the canonical repo-declared startup projection; do not reconstruct project state from chat history or undeclared legacy context files. BLOCKED means do not invoke continuation or fall back to undeclared context; treat the listed blockers as recoverable repository-context gaps rather than an owner gate. UNDECLARED means Meta-Harness was detected but inspect returned legacy meta-entry/v1 without repo-declared startup context: do not claim startup context is loaded and do not reconstruct it from chat history. INSPECTION_FAILED is a recoverable host diagnostic, not a product stop. When metaContinuation.status=BLOCKED, do not invoke continue_meta_harness and do not synthesize Meta-Harness decision-plane state from DevSpace. A concrete task in the user's current turn is the velocity-first path: use the returned startup context and execute that task directly instead of invoking continuation merely because metaEntry.action=CONTINUE. Opening a workspace is also a complete user action, not implicit resume intent. Invoke continue_meta_harness only when the user explicitly asks to resume/continue retained Meta-Harness work. Automatically invoke it at most once per user turn. If continue_meta_harness returns STOPPED or BLOCKED, or the call errors, do not retry it automatically in the same turn; continue the user's concrete task with scoped tools when possible, otherwise surface the controller result. When metaEntry.action=IDLE, do not invoke continuation. Close managed worktree sessions with ${toolNames.closeWorkspace}; it refuses dirty worktrees and removes clean worktrees through Git. When the user explicitly requests one fresh ChatGPT Web conversation with a supplied prompt, invoke web_launch; do not infer this trigger from text typed in another composer. WEB-LAUNCH-0 returns only launch acknowledgement and does not capture assistant output or continue the spawned conversation. When the user explicitly requests one bounded independent PRODUCT review, invoke review_start with exact candidate and evidence manifest bytes plus their SHA-256 digests, retain the returned reviewId, and later invoke review_status with that reviewId. Do not invoke review_submit directly unless the current launched conversation contains the exact REVIEW-RETURN-2 one-time challenge. ${agentsMd}${skills}${inspection}Batch known context reads with ${toolNames.readBatch} to reduce host approval prompts. Prefer ${toolNames.edit} for targeted modifications, ${toolNames.write} only for new files or complete rewrites, and ${toolNames.shell} for tests, builds, Git inspection, package scripts, and commands that are better executed by the shell. Shell commands that wait more than ${formatDurationMs(FAST_PATH_QUEUE_WAIT_MS)} for an execution slot, or run more than ${formatDurationMs(FAST_PATH_EXECUTION_MS)} after admission, continue in the background and return an operationId; poll long_task_status to inspect progress or cancel_long_task to terminate them. For commands expected to exceed 60 seconds, you may also invoke start_long_task directly. When the user explicitly requests a commit or push, use publish_git_changes with the existing workspaceId, a workingDirectory relative to the workspace root, and exact file paths. Do not construct /mnt paths, Windows absolute paths, or shell cd commands for workspace navigation; use the workingDirectory field. Do not use ${toolNames.shell} to edit working-tree contents or mutate the Git index, history, remotes, or branches. Avoid shell redirection, heredocs, tee, sed -i, perl -i, node/python/ruby scripts, generated scripts, or other commands whose purpose is to write project files. Use ${toolNames.edit} or ${toolNames.write} for content changes.${showChanges}`;
 }
 function resultOutputSchema(extra: z.ZodRawShape = {}): z.ZodRawShape {
   return {
@@ -313,6 +369,21 @@ function resultOutputSchema(extra: z.ZodRawShape = {}): z.ZodRawShape {
     ...extra,
   };
 }
+
+const shellLimiterTelemetryOutputSchema = z.object({
+  active: z.number().int().nonnegative(),
+  queued: z.number().int().nonnegative(),
+  activeForWorkspace: z.number().int().nonnegative(),
+});
+
+const longTaskDiagnosticsOutputSchema = z.object({
+  queueWaitMs: z.number().int().nonnegative().optional(),
+  executionMs: z.number().int().nonnegative().optional(),
+  totalMs: z.number().int().nonnegative().optional(),
+  handoffReason: z.enum(["queue_wait", "execution"]).optional(),
+  limiterAtAccept: shellLimiterTelemetryOutputSchema.optional(),
+  limiterAtStart: shellLimiterTelemetryOutputSchema.optional(),
+});
 
 const longTaskOperationOutputSchema = {
   operationId: z.string(),
@@ -330,6 +401,7 @@ const longTaskOperationOutputSchema = {
   startedAt: z.string().optional(),
   completedAt: z.string().optional(),
   progress: z.string(),
+  diagnostics: longTaskDiagnosticsOutputSchema.optional(),
   result: z
     .object({
       output: z.string(),
@@ -347,6 +419,12 @@ function longTaskOperationText(
     `Kind: ${operation.kind}`,
     `Status: ${operation.status}`,
     `Progress: ${operation.progress}`,
+    diagnosticNumber(operation.diagnostics, "queueWaitMs") !== undefined
+      ? `Queue wait: ${diagnosticNumber(operation.diagnostics, "queueWaitMs")}ms`
+      : undefined,
+    diagnosticNumber(operation.diagnostics, "executionMs") !== undefined
+      ? `Execution: ${diagnosticNumber(operation.diagnostics, "executionMs")}ms`
+      : undefined,
     operation.result?.output ? `Result:\n${operation.result.output}` : undefined,
     operation.error ? `Error: ${operation.error}` : undefined,
   ]
@@ -657,7 +735,13 @@ export function createMcpServer(
   webLaunchBrowser: Pick<WebLaunchBrowserController, "launchWebConversation">,
   metaHarness: MetaHarnessHost = defaultMetaHarnessHost,
   longTaskOperations: LongTaskOperationManager<LongTaskToolResult> = globalLongTaskOperations,
-  fastPathTimeoutMs: number = FAST_PATH_TIMEOUT_MS,
+  fastPathTimeoutMs: number = FAST_PATH_EXECUTION_MS,
+  sharedControllers?: {
+    auditReturnController?: AuditReturnController;
+    sourceResolveController?: SourceResolveController;
+    reviewReturnController?: ReviewReturnController;
+  },
+  fastPathQueueWaitMs: number = FAST_PATH_QUEUE_WAIT_MS,
 ): McpServer {
   const toolNames = toolNamesFor(config);
   const server = new McpServer(
@@ -705,6 +789,18 @@ export function createMcpServer(
   );
 
   registerWebLaunchTool({ server, browser: webLaunchBrowser });
+
+  const auditReturnController =
+    sharedControllers?.auditReturnController ?? new AuditReturnController(webLaunchBrowser);
+  registerAuditReturnTools({ server, controller: auditReturnController });
+
+  const sourceResolveController =
+    sharedControllers?.sourceResolveController ?? new SourceResolveController(webLaunchBrowser);
+  registerSourceResolveTools({ server, controller: sourceResolveController });
+
+  const reviewReturnController =
+    sharedControllers?.reviewReturnController ?? new ReviewReturnController(webLaunchBrowser);
+  registerReviewReturnTools({ server, controller: reviewReturnController });
 
   const workspaceOpenOutputSchema = {
     workspaceId: z.string(),
@@ -1542,10 +1638,9 @@ export function createMcpServer(
     );
   }
 
-  if (!config.minimalTools) {
-    registerAppTool(
-      server,
-      toolNames.grep,
+  registerAppTool(
+    server,
+    toolNames.grep,
       {
         title: config.toolNaming === "short" ? "Grep" : "Grep files",
         description:
@@ -1753,8 +1848,7 @@ export function createMcpServer(
           },
         };
       },
-    );
-  }
+  );
 
   registerAppTool(
     server,
@@ -1878,9 +1972,8 @@ export function createMcpServer(
     toolNames.shell,
     {
       title: config.toolNaming === "short" ? "Bash" : "Run shell",
-      description: config.minimalTools
-        ? `Run a shell command inside an open workspace. Use for tests, builds, Git inspection, package scripts, search, file discovery, and directory inspection. In minimal tool mode, ${toolNames.grep}, ${toolNames.glob}, and ${toolNames.ls} are disabled; use command-line tools such as grep, rg, find, ls, and tree for those read-only inspection actions. Use publish_git_changes, not ${toolNames.shell}, when the user explicitly requests staging, commit, or push. Do not use ${toolNames.shell} to edit working-tree file contents or mutate the Git index, history, remotes, or branches. Do not use shell redirection, heredocs, tee, sed -i, perl -i, node/python/ruby scripts, generated scripts, or other commands to write project files; use ${toolNames.edit} for targeted changes and ${toolNames.write} for new files or full rewrites. Prefer ${toolNames.read} for direct file reads. Use the workingDirectory field instead of cd or translated absolute paths. Call open_workspace first and pass workspaceId. This is powerful local execution and should only be exposed behind strong authentication.`
-        : `Run a shell command inside an open workspace. Use for tests, builds, Git inspection, package scripts, and commands that are better executed by the shell. Use publish_git_changes, not ${toolNames.shell}, when the user explicitly requests staging, commit, or push. Do not use ${toolNames.shell} to edit working-tree file contents or mutate the Git index, history, remotes, or branches. Do not use shell redirection, heredocs, tee, sed -i, perl -i, node/python/ruby scripts, generated scripts, or other commands to write project files; use ${toolNames.edit} for targeted changes and ${toolNames.write} for new files or full rewrites. Prefer ${toolNames.read}, ${toolNames.grep}, ${toolNames.glob}, and ${toolNames.ls} for file inspection. Use the workingDirectory field instead of cd or translated absolute paths. Call open_workspace first and pass workspaceId. This is powerful local execution and should only be exposed behind strong authentication.`,
+      description:
+        `Run a shell command inside an open workspace. Use for tests, builds, Git inspection, package scripts, and commands that genuinely require a shell. Native ${toolNames.read}, ${toolNames.readBatch}, ${toolNames.grep}, ${toolNames.glob}, and ${toolNames.ls} do not consume shell execution slots; prefer them for file inspection, search, discovery, and directory listing. Use publish_git_changes, not ${toolNames.shell}, when the user explicitly requests staging, commit, or push. Do not use ${toolNames.shell} to edit working-tree file contents or mutate the Git index, history, remotes, or branches. Do not use shell redirection, heredocs, tee, sed -i, perl -i, node/python/ruby scripts, generated scripts, or other commands to write project files; use ${toolNames.edit} for targeted changes and ${toolNames.write} for new files or full rewrites. Use the workingDirectory field instead of cd or translated absolute paths. Call open_workspace first and pass workspaceId. This is powerful local execution and should only be exposed behind strong authentication.`,
       inputSchema: {
         workspaceId: z
           .string()
@@ -1920,6 +2013,10 @@ export function createMcpServer(
           .string()
           .optional()
           .describe("Current progress description."),
+        queueWaitMs: z.number().int().nonnegative().optional(),
+        executionMs: z.number().int().nonnegative().optional(),
+        totalMs: z.number().int().nonnegative().optional(),
+        handoffReason: z.enum(["queue_wait", "execution"]).optional(),
       }),
       ...toolWidgetDescriptorMeta(config, "shell"),
       annotations: SHELL_TOOL_ANNOTATIONS,
@@ -1956,19 +2053,36 @@ export function createMcpServer(
         };
       }
 
-      // 1. Managed from t=0 by LongTaskOperationManager
-      // Public identity is workspaceId; limiter key is workspace.root
+      // 1. Managed from t=0 by LongTaskOperationManager.
+      // Public identity is workspaceId; limiter key is workspace.root.
+      let markExecutionStarted!: () => void;
+      const executionStarted = new Promise<void>((resolve) => {
+        markExecutionStarted = resolve;
+      });
       const op = longTaskOperations.start(
         "shell",
         workspaceId,
         async (context) => {
-          // Background queue timeout is disabled (queueTimeoutMs: 0) to avoid 60s queue expiry hole
+          context.updateDiagnostics({
+            limiterAtAccept: shellLimiterTelemetry(workspace.root),
+          });
+
+          // Managed background work intentionally does not expire in the limiter queue.
+          // The synchronous request has its own shorter queue-wait handoff budget below.
           const lease = await globalShellExecutionLimiter.acquire(workspace.root, {
             signal: context.signal,
             queueTimeoutMs: 0,
           });
+          const executionStartedAt = performance.now();
+          const queueWaitMs = Math.round(executionStartedAt - startedAt);
+          context.updateDiagnostics({
+            queueWaitMs,
+            limiterAtStart: shellLimiterTelemetry(workspace.root),
+          });
+          context.update("running", `Executing: ${input.command.slice(0, 80)}`);
+          markExecutionStarted();
+
           try {
-            context.update("running", `Executing: ${input.command.slice(0, 80)}`);
             const response = await runShellTool(
               input,
               {
@@ -1985,13 +2099,18 @@ export function createMcpServer(
             }
             return { output, response };
           } finally {
+            const completedAt = performance.now();
+            context.updateDiagnostics({
+              executionMs: Math.round(completedAt - executionStartedAt),
+              totalMs: Math.round(completedAt - startedAt),
+            });
             lease.release();
           }
         },
       );
 
       // 2. Client abort ownership:
-      // Before 15s async handoff: request abort cancels operation.
+      // Before async handoff, request abort cancels the managed operation.
       let handedOff = false;
       const onClientAbort = () => {
         if (!handedOff) {
@@ -2000,29 +2119,67 @@ export function createMcpServer(
       };
       extra.signal?.addEventListener("abort", onClientAbort, { once: true });
 
-      // 3. Fast-path timeout race
-      let timeoutId: NodeJS.Timeout | undefined;
-      const timeoutPromise = new Promise<{ isTimeout: true }>((resolve) => {
-        timeoutId = setTimeout(() => resolve({ isTimeout: true }), fastPathTimeoutMs);
-        timeoutId.unref?.();
+      // 3. Fast path has two budgets: queue wait, then execution.
+      type FastPathMarker =
+        | { fastPathState: "started" }
+        | {
+            fastPathState: "timeout";
+            reason: "queue_wait" | "execution";
+          };
+
+      let queueTimeoutId: NodeJS.Timeout | undefined;
+      const queueTimeoutPromise = new Promise<FastPathMarker>((resolve) => {
+        queueTimeoutId = setTimeout(
+          () => resolve({ fastPathState: "timeout", reason: "queue_wait" }),
+          fastPathQueueWaitMs,
+        );
+        queueTimeoutId.unref?.();
       });
 
-      let outcome: LongTaskOperationSnapshot<LongTaskToolResult> | { isTimeout: true };
+      let outcome: LongTaskOperationSnapshot<LongTaskToolResult> | FastPathMarker;
       try {
-        outcome = await Promise.race([op.completion, timeoutPromise]);
+        outcome = await Promise.race([
+          op.completion,
+          executionStarted.then(() => ({ fastPathState: "started" }) as const),
+          queueTimeoutPromise,
+        ]);
       } finally {
-        if (timeoutId) clearTimeout(timeoutId);
+        if (queueTimeoutId) clearTimeout(queueTimeoutId);
       }
 
-      // Case A: Finished within fast-path
-      if (!("isTimeout" in outcome)) {
+      if ("fastPathState" in outcome && outcome.fastPathState === "started") {
+        let executionTimeoutId: NodeJS.Timeout | undefined;
+        const executionTimeoutPromise = new Promise<FastPathMarker>((resolve) => {
+          executionTimeoutId = setTimeout(
+            () => resolve({ fastPathState: "timeout", reason: "execution" }),
+            fastPathTimeoutMs,
+          );
+          executionTimeoutId.unref?.();
+        });
+        try {
+          outcome = await Promise.race([op.completion, executionTimeoutPromise]);
+        } finally {
+          if (executionTimeoutId) clearTimeout(executionTimeoutId);
+        }
+      }
+
+      // Case A: Finished within both fast-path budgets.
+      if (!("fastPathState" in outcome)) {
         extra.signal?.removeEventListener("abort", onClientAbort);
+        const queueWaitMs = diagnosticNumber(outcome.diagnostics, "queueWaitMs");
+        const executionMs = diagnosticNumber(outcome.diagnostics, "executionMs");
+        const totalMs = diagnosticNumber(outcome.diagnostics, "totalMs");
+        const limiterAtStart = outcome.diagnostics?.limiterAtStart as
+          | ShellLimiterTelemetry
+          | undefined;
 
         if (outcome.status === "succeeded" && outcome.result?.response) {
           const response = outcome.result.response;
           const summary = {
             command: input.command,
             workingDirectory: workingDirectory ?? ".",
+            queueWaitMs,
+            executionMs,
             ...textSummary(response.content),
           };
           logToolCall(config, {
@@ -2033,6 +2190,11 @@ export function createMcpServer(
             commandLength: input.command.length,
             success: true,
             durationMs: Math.round(performance.now() - startedAt),
+            queueWaitMs,
+            executionMs,
+            limiterActive: limiterAtStart?.active,
+            limiterQueued: limiterAtStart?.queued,
+            limiterActiveForWorkspace: limiterAtStart?.activeForWorkspace,
           });
 
           return {
@@ -2049,6 +2211,9 @@ export function createMcpServer(
             structuredContent: {
               result: contentText(response.content),
               status: "succeeded",
+              queueWaitMs,
+              executionMs,
+              totalMs,
             },
           };
         }
@@ -2063,6 +2228,11 @@ export function createMcpServer(
             workingDirectory: workingDirectory ?? ".",
             command: input.command,
             commandLength: input.command.length,
+            queueWaitMs,
+            executionMs,
+            limiterActive: limiterAtStart?.active,
+            limiterQueued: limiterAtStart?.queued,
+            limiterActiveForWorkspace: limiterAtStart?.activeForWorkspace,
           },
           content,
           startedAt,
@@ -2073,23 +2243,45 @@ export function createMcpServer(
           structuredContent: {
             result: errorMessage,
             status: outcome.status,
+            queueWaitMs,
+            executionMs,
+            totalMs,
           },
         };
       }
 
-      // Case B: Exceeded fast-path timeout
-      // Ownership handoff: detach client abort so operation survives HTTP disconnection
+      // Case B: Queue-wait or execution budget exceeded.
+      // Ownership handoff detaches client abort so the operation survives HTTP disconnection.
       handedOff = true;
       extra.signal?.removeEventListener("abort", onClientAbort);
+      if (!("fastPathState" in outcome) || outcome.fastPathState !== "timeout") {
+        throw new Error("Unexpected shell fast-path marker state after handoff");
+      }
+      const handoffReason = outcome.reason;
+      const elapsedQueueWaitMs =
+        handoffReason === "queue_wait"
+          ? Math.round(performance.now() - startedAt)
+          : undefined;
+      longTaskOperations.updateDiagnostics(op.operationId, {
+        ...(elapsedQueueWaitMs === undefined ? {} : { queueWaitMs: elapsedQueueWaitMs }),
+        handoffReason,
+      });
 
-      // Fetch fresh live snapshot (snapshot captured at t=0 is stale)
+      // Fetch a fresh live snapshot; the snapshot returned by start() is intentionally t=0.
       const freshSnapshot = longTaskOperations.get(op.operationId);
-      const durationText =
-        fastPathTimeoutMs >= 1000
-          ? `${fastPathTimeoutMs / 1000}s`
-          : `${fastPathTimeoutMs}ms`;
+      const queueWaitMs = diagnosticNumber(freshSnapshot.diagnostics, "queueWaitMs");
+      const executionMs = diagnosticNumber(freshSnapshot.diagnostics, "executionMs");
+      const totalMs = diagnosticNumber(freshSnapshot.diagnostics, "totalMs");
+      const limiterAtStart = freshSnapshot.diagnostics?.limiterAtStart as
+        | ShellLimiterTelemetry
+        | undefined;
+      const durationText = formatDurationMs(
+        handoffReason === "queue_wait" ? fastPathQueueWaitMs : fastPathTimeoutMs,
+      );
       const message =
-        `Command exceeded ${durationText} fast-path and is executing in the background.\n` +
+        (handoffReason === "queue_wait"
+          ? `Command waited ${durationText} for a shell execution slot and is continuing in the background.\n`
+          : `Command exceeded ${durationText} execution fast-path and is continuing in the background.\n`) +
         `status: ${freshSnapshot.status}\n` +
         `operationId: ${freshSnapshot.operationId}\n\n` +
         `Use long_task_status(operationId: "${freshSnapshot.operationId}") to inspect progress.`;
@@ -2102,6 +2294,11 @@ export function createMcpServer(
         commandLength: input.command.length,
         success: true,
         durationMs: Math.round(performance.now() - startedAt),
+        queueWaitMs,
+        executionMs,
+        limiterActive: limiterAtStart?.active,
+        limiterQueued: limiterAtStart?.queued,
+        limiterActiveForWorkspace: limiterAtStart?.activeForWorkspace,
       });
 
       return {
@@ -2111,6 +2308,10 @@ export function createMcpServer(
           operationId: freshSnapshot.operationId,
           status: freshSnapshot.status,
           progress: freshSnapshot.progress,
+          queueWaitMs,
+          executionMs,
+          totalMs,
+          handoffReason,
         },
       };
     },
@@ -2273,6 +2474,7 @@ export function createMcpServer(
           startedAt: op.startedAt,
           completedAt: op.completedAt,
           progress: op.progress,
+          diagnostics: op.diagnostics,
           result: op.result
             ? {
                 output: op.result.output,
@@ -2328,6 +2530,7 @@ export function createMcpServer(
           startedAt: operation.startedAt,
           completedAt: operation.completedAt,
           progress: operation.progress,
+          diagnostics: operation.diagnostics,
           result: operation.result
             ? {
                 output: operation.result.output,
@@ -2382,6 +2585,7 @@ export function createMcpServer(
           startedAt: operation.startedAt,
           completedAt: operation.completedAt,
           progress: operation.progress,
+          diagnostics: operation.diagnostics,
           result: operation.result
             ? {
                 output: operation.result.output,
@@ -2470,6 +2674,10 @@ export function createMcpServer(
     },
   );
 
+  server.server.oninitialized = () => {
+    server.sendToolListChanged();
+  };
+
   return server;
 }
 
@@ -2501,6 +2709,7 @@ export function createServer(
   config = loadConfig(),
   options?: {
     fastPathTimeoutMs?: number;
+    fastPathQueueWaitMs?: number;
     longTaskOperations?: LongTaskOperationManager<LongTaskToolResult>;
   },
 ): RunningServer {
@@ -2523,7 +2732,18 @@ export function createServer(
   const workspaceStore = createWorkspaceStore(config.stateDir);
   const workspaces = new WorkspaceRegistry(config, workspaceStore);
   const reviewCheckpoints = createReviewCheckpointManager();
-  const webLaunchBrowser = new WebLaunchBrowserController(config.allowedRoots);
+  const webLaunchBrowser = new WebLaunchBrowserController(config.allowedRoots, {
+    sessionProvider: config.chatSessionProvider,
+    devSpacePublicBaseUrl: config.publicBaseUrl,
+  });
+  const executionSurface =
+    config.chatSessionProvider === "chatshare" ? "chatshare" : "chatgpt_web";
+  const auditReturnController = new AuditReturnController(webLaunchBrowser, { executionSurface });
+  const sourceResolveController = new SourceResolveController(webLaunchBrowser, {
+    executionSurface,
+    cleanupSucceededConversations: executionSurface === "chatshare",
+  });
+  const reviewReturnController = new ReviewReturnController(webLaunchBrowser);
 
   if (config.logging.trustProxy) {
     app.set("trust proxy", () => true);
@@ -2698,7 +2918,13 @@ export function createServer(
           webLaunchBrowser,
           defaultMetaHarnessHost,
           options?.longTaskOperations ?? globalLongTaskOperations,
-          options?.fastPathTimeoutMs ?? FAST_PATH_TIMEOUT_MS,
+          options?.fastPathTimeoutMs ?? FAST_PATH_EXECUTION_MS,
+          {
+            auditReturnController,
+            sourceResolveController,
+            reviewReturnController,
+          },
+          options?.fastPathQueueWaitMs ?? FAST_PATH_QUEUE_WAIT_MS,
         );
         await server.connect(transport);
       } else {
@@ -2769,6 +2995,7 @@ export function createServer(
       await Promise.allSettled([...transports.values()].map((transport) => transport.close()));
       transports.clear();
       transportActivity.clear();
+      reviewReturnController.close();
       await webLaunchBrowser.close();
       oauthProvider.close();
       workspaceStore.close?.();

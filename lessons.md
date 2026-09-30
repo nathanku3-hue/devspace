@@ -1,5 +1,28 @@
 # DevSpace Durable Lessons
 
+## 2026-09-30 — "link_id must identify an eligible linked account" diagnosis, link selectors, and boundary verification
+
+**Symptom:** DevSpace MCP tool calls (e.g. `open_workspace` or `continue_meta_harness`) return `link_id must identify an eligible linked account`.
+
+**Core Concepts:**
+- `link_id` is a **linked-account selector/identifier**, not an OAuth access token. In platform environments managing third-party connectors (including ChatGPT developer mode / ASDK and aggregation/proxy surfaces like `chatshare.xyz`), the host dispatches tool calls using a `link_id` identifying which authorized account connection to execute against.
+- The error indicates that the supplied `link_id` is unmapped, expired, detached from the current workspace/conversation context, or marked ineligible by the hosting platform layer.
+
+**Diagnostic Boundaries & Fallacies to Avoid:**
+1. **Avoid sweeping claims without telemetry:** You cannot assert that "the request never reached Cloudflare Worker" or "OpenAI credentials fully expired" merely from the error text.
+2. **Account for intermediary architecture:** Surfaces like `chatshare.xyz` introduce their own session, account-mapping, and proxy layers between the user client and upstream MCP endpoints. A failure can reside in stale mapping in the intermediate layer rather than upstream OpenAI or downstream DevSpace.
+3. **Check for counter-evidence (partial vs. universal failure):** If another tool call within the same session or conversation successfully opens a workspace (`E:\code\devspace`), the DevSpace server, Cloudflare proxy, and tunnel are demonstrably healthy. The error reflects a stale selector or context-specific ineligibility, not universal integration failure.
+4. **The single definitive discriminator is Worker access logs:**
+   - **0 requests at Worker:** Failure is in the client / host / linked-account selector layer before egress.
+   - **Requests arrive with 401/403:** Failure is in the Worker proxy or MCP OAuth token validation.
+   - **Requests arrive and forward to localhost:** Failure is inside the local DevSpace daemon.
+
+**Resolution & Recovery:**
+- **Reconnect:** Reconnecting via Settings → Plugins re-establishes the account link and refreshes the selector token.
+- **Reboot / Restart Effect:** When a reboot resolves the issue, it clears volatile desync states across multiple layers: browser session storage/caches, background extension workers, and local supervisor/tunnel processes, forcing clean renegotiation upon startup.
+
+---
+
 ## 2026-09-21 — Plugin "not installed/connected" at startup is access-token expiry, not a server bug
 
 **Symptom:** After PC wake or IDE restart, the Antigravity DevSpace Local plugin reports "not installed/connected" and `open_workspace` is not exposed. Clicking "Connect/Reconnect" restores it immediately.

@@ -12,6 +12,7 @@ const config: DeviceAuthorizationConfig = {
   loopbackPort: port,
   extensionId,
   allowedRedirectPrefixes: [
+    "https://chatgpt.com/connector/oauth/",
     "https://chatshare.xyz/connector/oauth/",
     "https://chatshare.xyz/connector_platform_oauth_redirect",
   ],
@@ -20,12 +21,20 @@ const config: DeviceAuthorizationConfig = {
 const authorization = new DeviceAuthorization(config);
 
 assert.equal(
+  authorization.isRedirectAllowed("https://chatgpt.com/connector/oauth/callback-id"),
+  true,
+);
+assert.equal(
   authorization.isRedirectAllowed("https://chatshare.xyz/connector/oauth/callback-id"),
   true,
 );
 assert.equal(
   authorization.isRedirectAllowed("https://chatshare.xyz/connector_platform_oauth_redirect?state=one"),
   true,
+);
+assert.equal(
+  authorization.isRedirectAllowed("https://chatgpt.com.evil.example/connector/oauth/callback-id"),
+  false,
 );
 assert.equal(
   authorization.isRedirectAllowed("https://chatshare.xyz.evil.example/connector/oauth/callback-id"),
@@ -75,6 +84,20 @@ try {
     true,
   );
 
+  const nativeBinding = "D".repeat(43);
+  const nativeChallenge = authorization.createChallenge(nativeBinding);
+  const acceptedNative = await postProof({
+    port,
+    extensionId,
+    challenge: nativeChallenge,
+    binding: nativeBinding,
+  });
+  assert.equal(acceptedNative.status, 200);
+  assert.equal(
+    authorization.verifyProof(nativeChallenge, nativeBinding, String(acceptedNative.body.proof)),
+    true,
+  );
+
   const rejectedOrigin = await postProof({
     port,
     origin: "https://evil.example",
@@ -110,7 +133,7 @@ async function reservePort(): Promise<number> {
 
 async function postProof(params: {
   port: number;
-  origin: string;
+  origin?: string;
   extensionId: string;
   challenge: string;
   binding: string;
@@ -129,7 +152,7 @@ async function postProof(params: {
         method: "POST",
         headers: {
           Host: `127.0.0.1:${params.port}`,
-          Origin: params.origin,
+          ...(params.origin ? { Origin: params.origin } : {}),
           "Content-Type": "application/json",
           "Content-Length": Buffer.byteLength(payload),
           "X-DevSpace-Extension-Id": params.extensionId,

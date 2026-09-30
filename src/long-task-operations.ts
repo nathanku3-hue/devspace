@@ -12,6 +12,7 @@ export type LongTaskStatus =
 export interface LongTaskRunContext {
   signal: AbortSignal;
   update(status: "queued" | "running", progress: string): void;
+  updateDiagnostics(fields: Record<string, unknown>): void;
 }
 
 export interface LongTaskOperationSnapshot<TResult = unknown> {
@@ -23,6 +24,7 @@ export interface LongTaskOperationSnapshot<TResult = unknown> {
   startedAt?: string;
   completedAt?: string;
   progress: string;
+  diagnostics?: Record<string, unknown>;
   result?: TResult;
   error?: string;
 }
@@ -61,6 +63,7 @@ function snapshot<TResult>(
     startedAt: record.startedAt,
     completedAt: record.completedAt,
     progress: record.progress,
+    diagnostics: record.diagnostics ? { ...record.diagnostics } : undefined,
     result: record.result,
     error: record.error,
   };
@@ -130,6 +133,16 @@ export class LongTaskOperationManager<TResult = unknown> {
     return record.completion;
   }
 
+  updateDiagnostics(
+    operationId: string,
+    fields: Record<string, unknown>,
+  ): LongTaskOperationSnapshot<TResult> {
+    const record = this.#operations.get(operationId);
+    if (!record) throw new Error(`Unknown long-task operation: ${operationId}`);
+    record.diagnostics = { ...record.diagnostics, ...fields };
+    return snapshot(record);
+  }
+
   list(workspaceId?: string): LongTaskOperationSnapshot<TResult>[] {
     const result: LongTaskOperationSnapshot<TResult>[] = [];
     for (const record of this.#operations.values()) {
@@ -172,6 +185,9 @@ export class LongTaskOperationManager<TResult = unknown> {
             record.startedAt = new Date().toISOString();
           }
           record.progress = progress;
+        },
+        updateDiagnostics: (fields) => {
+          record.diagnostics = { ...record.diagnostics, ...fields };
         },
       });
       if (record.controller.signal.aborted) throw abortError();
