@@ -18,6 +18,7 @@ import {
   ensureDevSpacePluginConnectedForRecovery,
   findExactlyOneComposer,
   hasDeliveryTimeoutMessage,
+  hasDevSpaceConversationEvidence,
   hasDevSpaceInterruptionMessage,
   injectAndSubmitConnectedPrompt,
   insertAndVerifyPrompt,
@@ -1150,6 +1151,7 @@ test("ChatShare connected launch uses the already-connected fresh-chat fast path
   let controller: WebLaunchBrowserController | undefined;
   try {
     const context = await browser.newContext();
+    let pluginPageRequests = 0;
     await context.route("https://chatshare.xyz/**", async (route) => {
       const url = new URL(route.request().url());
       if (url.pathname === "/pastel/") {
@@ -1177,7 +1179,56 @@ test("ChatShare connected launch uses the already-connected fresh-chat fast path
         assert.equal(url.searchParams.get("carid"), "pro-connected");
         return route.fulfill({ status: 200, contentType: "application/json", body: "{\"code\":1}" });
       }
+      if (url.pathname === "/c/universal-recovery-12345678") {
+        return route.fulfill({
+          status: 200,
+          contentType: "text/html; charset=utf-8",
+          body: `<!doctype html><html><body><main>
+<p>Stopped talking to devspace</p>
+<form>
+  <textarea id="prompt-textarea"></textarea>
+  <button id="turn-control" data-testid="stop-button" aria-label="Stop generating" type="button">■</button>
+</form>
+</main>
+<script>
+  const control = document.querySelector('#turn-control');
+  const composer = document.querySelector('#prompt-textarea');
+  control.addEventListener('click', () => {
+    if (control.getAttribute('data-testid') === 'stop-button') {
+      document.body.dataset.universalStopClicked = 'true';
+      control.setAttribute('data-testid', 'send-button');
+      control.setAttribute('aria-label', 'Send prompt');
+      control.textContent = '↑';
+      return;
+    }
+    document.body.dataset.universalResumeSubmitted = composer.value;
+  });
+</script>
+</body></html>`,
+        });
+      }
+      if (url.pathname === "/c/universal-generic-12345678") {
+        return route.fulfill({
+          status: 200,
+          contentType: "text/html; charset=utf-8",
+          body: `<!doctype html><html><body><main>
+<p>Connection interrupted</p>
+<form>
+  <textarea id="prompt-textarea"></textarea>
+  <button data-testid="send-button" aria-label="Send prompt" type="button">↑</button>
+</form>
+</main>
+<script>
+  const composer = document.querySelector('#prompt-textarea');
+  document.querySelector('[data-testid="send-button"]').addEventListener('click', () => {
+    document.body.dataset.genericResumeSubmitted = composer.value;
+  });
+</script>
+</body></html>`,
+        });
+      }
       if (url.pathname === "/plugins") {
+        pluginPageRequests += 1;
         return route.fulfill({
           status: 200,
           contentType: "text/html",
@@ -1185,6 +1236,7 @@ test("ChatShare connected launch uses the already-connected fresh-chat fast path
         });
       }
       if (url.pathname === "/plugins/plugin_asdk_app_chatshare_current123") {
+        pluginPageRequests += 1;
         return route.fulfill({
           status: 200,
           contentType: "text/html",
@@ -1250,6 +1302,9 @@ test("ChatShare connected launch uses the already-connected fresh-chat fast path
       return route.fulfill({ status: 404, body: "unexpected route" });
     });
 
+    const universalPage = await context.newPage();
+    await universalPage.goto("https://chatshare.xyz/c/universal-recovery-12345678");
+
     controller = new WebLaunchBrowserController([parent], {
       contextFactory: async () => context,
       sessionProvider: "chatshare",
@@ -1259,12 +1314,45 @@ test("ChatShare connected launch uses the already-connected fresh-chat fast path
     const acknowledgement = await controller.launchWebConversation(prompt, { attachDevSpace: true });
     const conversationPage = context
       .pages()
-      .find((page) => chatConversationIdentityFromUrl(page.url()) !== undefined);
+      .find(
+        (page) =>
+          page !== universalPage &&
+          chatConversationIdentityFromUrl(page.url()) !== undefined,
+      );
 
     assert.ok(conversationPage);
     assert.equal(await conversationPage.evaluate(() => document.body.dataset.devspaceConnected), "true");
     assert.equal(await conversationPage.evaluate(() => document.body.dataset.submitted), prompt);
     assert.equal(acknowledgement.launchSuccess, true);
+
+    await universalPage.waitForFunction(
+      () => document.body.dataset.universalResumeSubmitted === "resume",
+      undefined,
+      { timeout: 8_000 },
+    );
+    assert.equal(
+      await universalPage.evaluate(() => document.body.dataset.universalStopClicked),
+      "true",
+    );
+    assert.equal(
+      await universalPage.evaluate(() => document.body.dataset.universalResumeSubmitted),
+      "resume",
+    );
+
+    const pluginRequestsBeforeGenericRecovery = pluginPageRequests;
+    const genericPage = await context.newPage();
+    await genericPage.goto("https://chatshare.xyz/c/universal-generic-12345678");
+    await genericPage.waitForFunction(
+      () => document.body.dataset.genericResumeSubmitted === "resume",
+      undefined,
+      { timeout: 8_000 },
+    );
+    assert.equal(
+      await genericPage.evaluate(() => document.body.dataset.genericResumeSubmitted),
+      "resume",
+    );
+    assert.equal(pluginPageRequests, pluginRequestsBeforeGenericRecovery);
+
     assert.equal(
       controller.stopWebConversationRecovery(
         acknowledgement.conversationIdentitySha256,
@@ -2231,6 +2319,43 @@ test("connection interrupted and message timeout are immediate DevSpace resume t
     assert.equal(await hasDevSpaceInterruptionMessage(page), true);
     await page.setContent("<main><p>Normal assistant response.</p></main>");
     assert.equal(await hasDevSpaceInterruptionMessage(page), false);
+    await context.close();
+  } finally {
+    await browser.close();
+  }
+});
+
+test("universal ChatShare recovery adopts DevSpace-evidenced sessions but rejects unrelated chats", async () => {
+  const browser = await launchInstalledChrome();
+  try {
+    const context = await browser.newContext();
+    await context.route(
+      "https://chatshare.xyz/c/universal-devspace-evidence-12345678",
+      (route) =>
+        route.fulfill({
+          status: 200,
+          contentType: "text/html; charset=utf-8",
+          body: "<!doctype html><html><body><main><p>Stopped talking to devspace</p></main></body></html>",
+        }),
+    );
+    const page = await context.newPage();
+    await page.goto("https://chatshare.xyz/c/universal-devspace-evidence-12345678");
+
+    assert.equal(await hasDevSpaceConversationEvidence(page), true);
+
+    await page.setContent("<!doctype html><html><body><main><p>Connection interrupted</p></main></body></html>");
+    assert.equal(await hasDevSpaceConversationEvidence(page), false);
+
+    await page.setContent(`<!doctype html><html><body><main>
+<form>
+  <div id="prompt-textarea" role="textbox" contenteditable="true">
+    <span data-inline-selection-pill="" data-keyword="DevSpace Local" data-system-hint-type="plugin:asdk_app_devspace123">DevSpace Local</span>
+  </div>
+</form>
+<p>Connection interrupted</p>
+</main></body></html>`);
+    assert.equal(await hasDevSpaceConversationEvidence(page), true);
+
     await context.close();
   } finally {
     await browser.close();

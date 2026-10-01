@@ -227,8 +227,18 @@ function Get-DevSpaceHealDecision {
         [Parameter(Mandatory = $true)][bool]$LocalHealthy,
         [Parameter(Mandatory = $true)][bool]$WorkerHealthy,
         [Parameter(Mandatory = $true)][bool]$QuickTunnelAlive,
-        [switch]$ForceReregister
+        [switch]$ForceReregister,
+        [switch]$ForceRecycle
     )
+
+    if ($ForceRecycle) {
+        return [pscustomobject]@{
+            Action                  = "staged-recycle"
+            PreserveNode            = $false
+            PreserveActiveDist      = $false
+            PreserveTunnelHostname  = $false
+        }
+    }
 
     if (-not $LocalHealthy) {
         return [pscustomobject]@{

@@ -12,6 +12,7 @@ param(
     [switch]$Monitor,
     [switch]$LibraryOnly,
     [switch]$Reregister,
+    [switch]$ForceRecycle,
     [switch]$AllowDirty,
     [switch]$OverridePreferredSource,
     [switch]$PinPreferredSource
@@ -1778,7 +1779,8 @@ $decision = Get-DevSpaceHealDecision `
     -LocalHealthy $localOk `
     -WorkerHealthy $workerOk `
     -QuickTunnelAlive $tunnelAlive `
-    -ForceReregister:$Reregister
+    -ForceReregister:$Reregister `
+    -ForceRecycle:$ForceRecycle
 Write-SetupLog "Heal decision: action=$($decision.Action) preserveNode=$($decision.PreserveNode) preserveDist=$($decision.PreserveActiveDist) preserveTunnelHost=$($decision.PreserveTunnelHostname)"
 
 $preNodePid = $null
@@ -1842,7 +1844,7 @@ switch ($decision.Action) {
     }
     "staged-recycle" {
         Assert-DevSpaceSourceCleanForRecycle -Repository $devspaceSourceDir -AllowDirty:$AllowDirty -Pin $pin
-        Write-SetupLog "Local origin is down; stopping leftover processes before staged build."
+        Write-SetupLog "Staged recycle selected; stopping existing DevSpace processes before staged build."
         Stop-DevSpaceRelatedProcesses
         Start-Sleep -Seconds 2
         Write-Host "Preparing local DevSpace build (staged snapshot, then build)..."

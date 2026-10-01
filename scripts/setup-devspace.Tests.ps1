@@ -212,11 +212,19 @@ Describe "DevSpace heal decision" {
         $d.PreserveTunnelHostname | Should Be $false
     }
 
-    It "uses staged recycle only when local origin is down" {
+    It "uses staged recycle when local origin is down" {
         $d = Get-DevSpaceHealDecision -LocalHealthy $false -WorkerHealthy $false -QuickTunnelAlive $false
         $d.Action | Should Be "staged-recycle"
         $d.PreserveNode | Should Be $false
         $d.PreserveActiveDist | Should Be $false
+    }
+
+    It "force-recycles a healthy origin only when explicitly requested" {
+        $d = Get-DevSpaceHealDecision -LocalHealthy $true -WorkerHealthy $true -QuickTunnelAlive $true -ForceRecycle
+        $d.Action | Should Be "staged-recycle"
+        $d.PreserveNode | Should Be $false
+        $d.PreserveActiveDist | Should Be $false
+        $d.PreserveTunnelHostname | Should Be $false
     }
 }
 
