@@ -79,7 +79,10 @@ $ExpectedTools = @(
     "continue_meta_harness",
     "create_worktree_workspace",
     "edit",
+    "glob",
+    "grep",
     "long_task_status",
+    "ls",
     "open_workspace",
     "publish_git_changes",
     "read",
@@ -88,6 +91,8 @@ $ExpectedTools = @(
     "review_status",
     "review_submit",
     "safe_rename_file",
+    "saw_review_start",
+    "saw_review_status",
     "source_resolve_start",
     "source_resolve_status",
     "source_resolve_submit",
@@ -546,14 +551,13 @@ function Invoke-AuthenticatedToolsList {
     if ($null -eq $initializeBody.result) {
         throw "MCP initialize at '$BaseUrl' did not return a result."
     }
-    $sessionId = $initialize.Headers['mcp-session-id']
-    if ([string]::IsNullOrWhiteSpace($sessionId)) {
-        throw "MCP initialize at '$BaseUrl' did not return mcp-session-id."
-    }
+    $sessionId = [string]$initialize.Headers['mcp-session-id']
     $sessionHeaders = @{
-        Authorization    = "Bearer $AccessToken"
-        Accept           = "application/json, text/event-stream"
-        'mcp-session-id' = $sessionId
+        Authorization = "Bearer $AccessToken"
+        Accept        = "application/json, text/event-stream"
+    }
+    if (-not [string]::IsNullOrWhiteSpace($sessionId)) {
+        $sessionHeaders['mcp-session-id'] = $sessionId
     }
 
     try {
@@ -591,10 +595,12 @@ function Invoke-AuthenticatedToolsList {
         }
         return @($toolsBody.result.tools | ForEach-Object { [string]$_.name } | Sort-Object)
     } finally {
-        try {
-            [void](Invoke-NoProxyHttpRequest -Url "$BaseUrl/mcp" -Method "DELETE" -Headers $sessionHeaders)
-        } catch {
-            Write-SetupLog "MCP probe session cleanup failed at '$BaseUrl': $_" "WARN"
+        if (-not [string]::IsNullOrWhiteSpace($sessionId)) {
+            try {
+                [void](Invoke-NoProxyHttpRequest -Url "$BaseUrl/mcp" -Method "DELETE" -Headers $sessionHeaders)
+            } catch {
+                Write-SetupLog "MCP probe session cleanup failed at '$BaseUrl': $_" "WARN"
+            }
         }
     }
 }
@@ -1079,6 +1085,8 @@ function Start-DevSpaceServer([string]$devspaceCli, [string]$tunnelHost) {
     $env:DEVSPACE_DEVICE_AUTH_LOOPBACK_PORT = "$DeviceProofPort"
     $env:DEVSPACE_DEVICE_AUTH_EXTENSION_ID = "aaoelopmdnhifffjefciagfmhjanbaoc"
     $env:DEVSPACE_DEVICE_AUTH_ALLOWED_REDIRECT_PREFIXES = "https://chatgpt.com/connector/oauth/,https://chatshare.xyz/connector/oauth/,https://chatshare.xyz/connector_platform_oauth_redirect"
+    $env:DEVSPACE_OAUTH_ACCESS_TOKEN_TTL_SECONDS = "86400"
+    $env:DEVSPACE_MCP_TRANSPORT_MODE = "stateless"
     $env:GIT_TERMINAL_PROMPT = "0"
     $env:GIT_EDITOR = "true"
     $env:GIT_ASKPASS = "true"
@@ -1113,6 +1121,8 @@ function Start-DevSpaceServer([string]$devspaceCli, [string]$tunnelHost) {
         "set DEVSPACE_DEVICE_AUTH_LOOPBACK_PORT=$($env:DEVSPACE_DEVICE_AUTH_LOOPBACK_PORT)"
         "set DEVSPACE_DEVICE_AUTH_EXTENSION_ID=$($env:DEVSPACE_DEVICE_AUTH_EXTENSION_ID)"
         "set DEVSPACE_DEVICE_AUTH_ALLOWED_REDIRECT_PREFIXES=$($env:DEVSPACE_DEVICE_AUTH_ALLOWED_REDIRECT_PREFIXES)"
+        "set DEVSPACE_OAUTH_ACCESS_TOKEN_TTL_SECONDS=$($env:DEVSPACE_OAUTH_ACCESS_TOKEN_TTL_SECONDS)"
+        "set DEVSPACE_MCP_TRANSPORT_MODE=$($env:DEVSPACE_MCP_TRANSPORT_MODE)"
         "set GIT_TERMINAL_PROMPT=0"
         "set GIT_EDITOR=true"
         "set GIT_ASKPASS=true"

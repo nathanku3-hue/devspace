@@ -37,8 +37,24 @@ npx @waishnav/devspace config set publicBaseUrl https://devspace.example.com
 | `DEVSPACE_ALLOWED_HOSTS` | Optional Host header allowlist override. |
 | `DEVSPACE_OAUTH_OWNER_TOKEN` | Owner password for OAuth approval when enrolled-PC authorization is disabled. Must be at least 16 characters. |
 | `DEVSPACE_DEVICE_AUTH` | Enables silent enrolled-PC OAuth authorization through a loopback signer. |
+| `DEVSPACE_MCP_TRANSPORT_MODE` | MCP HTTP transport mode: `stateless` (default) or `stateful`. |
 | `DEVSPACE_STATE_DIR` | Directory for SQLite state. Defaults to `~/.local/share/devspace`. |
 | `DEVSPACE_SHELL` | Optional absolute path to the workspace Bash executable. On Windows, Git Bash next to `git.exe` is used when this is unset. |
+
+## MCP HTTP transport
+
+`DEVSPACE_MCP_TRANSPORT_MODE=stateless` is the default. Each MCP HTTP request
+gets a fresh SDK transport/server wrapper while DevSpace's durable application
+state remains in the shared workspace, review, long-task, and SQLite stores.
+This avoids retaining one heavyweight MCP server instance per remote session
+and prevents high-churn clients such as Chatshare from filling the retained
+session pool and evicting other conversations.
+
+Set `DEVSPACE_MCP_TRANSPORT_MODE=stateful` only for a client that specifically
+requires retained Streamable HTTP sessions. The compatibility mode keeps the
+64-session OOM guard and 30-minute idle cleanup. At capacity it reclaims only
+sessions already past the idle threshold; otherwise it rejects the new
+initialization rather than closing a still-valid existing session.
 
 ## OAuth
 

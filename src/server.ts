@@ -97,6 +97,17 @@ export interface LongTaskToolResult {
 const DEFAULT_FAST_PATH_QUEUE_WAIT_MS = 8_000;
 const DEFAULT_FAST_PATH_EXECUTION_MS = 15_000;
 
+export type McpTransportMode = "stateless" | "stateful";
+
+export function resolveMcpTransportMode(value: string | undefined): McpTransportMode {
+  const normalized = value?.trim().toLowerCase();
+  if (!normalized || normalized === "stateless") return "stateless";
+  if (normalized === "stateful") return "stateful";
+  throw new Error(
+    `Invalid DEVSPACE_MCP_TRANSPORT_MODE: ${value}. Expected "stateless" or "stateful".`,
+  );
+}
+
 function positiveIntegerEnv(name: string, fallback: number): number {
   const raw = process.env[name]?.trim();
   if (!raw) return fallback;
@@ -2715,6 +2726,9 @@ export function createServer(
     fastPathTimeoutMs?: number;
     fastPathQueueWaitMs?: number;
     longTaskOperations?: LongTaskOperationManager<LongTaskToolResult>;
+    mcpTransportMode?: McpTransportMode;
+    maxMcpSessions?: number;
+    mcpSessionIdleMs?: number;
   },
 ): RunningServer {
   const app = express();
@@ -2750,6 +2764,26 @@ export function createServer(
   const reviewReturnController = new ReviewReturnController(webLaunchBrowser, {
     executionSurface,
   });
+  const mcpTransportMode =
+    options?.mcpTransportMode ?? resolveMcpTransportMode(process.env.DEVSPACE_MCP_TRANSPORT_MODE);
+  const maxMcpSessions = options?.maxMcpSessions ?? MAX_MCP_SESSIONS;
+  const mcpSessionIdleMs = options?.mcpSessionIdleMs ?? MCP_SESSION_IDLE_MS;
+  const makeMcpServer = () =>
+    createMcpServer(
+      config,
+      workspaces,
+      reviewCheckpoints,
+      webLaunchBrowser,
+      defaultMetaHarnessHost,
+      options?.longTaskOperations ?? globalLongTaskOperations,
+      options?.fastPathTimeoutMs ?? FAST_PATH_EXECUTION_MS,
+      {
+        auditReturnController,
+        sourceResolveController,
+        reviewReturnController,
+      },
+      options?.fastPathQueueWaitMs ?? FAST_PATH_QUEUE_WAIT_MS,
+    );
 
   if (config.logging.trustProxy) {
     app.set("trust proxy", () => true);
@@ -2863,7 +2897,49 @@ export function createServer(
       sessionIdPresent: Boolean(sessionId),
       sessionIdPrefix: sessionIdPrefix(sessionId),
       isInitialize: initializeRequest,
+      transportMode: mcpTransportMode,
     });
+
+    if (mcpTransportMode === "stateless") {
+      if (req.method !== "POST") {
+        sendJsonRpcError(res, 405, -32000, "Method not allowed");
+        return;
+      }
+
+      const transport = new StreamableHTTPServerTransport({
+        sessionIdGenerator: undefined,
+      });
+      const server = makeMcpServer();
+      let cleanedUp = false;
+      const cleanup = () => {
+        if (cleanedUp) return;
+        cleanedUp = true;
+        void server.close().catch((error) => {
+          logEvent(config.logging, "warn", "mcp_stateless_cleanup_error", {
+            requestId,
+            error: error instanceof Error ? error.message : String(error),
+          });
+        });
+      };
+      res.once("finish", cleanup);
+      res.once("close", cleanup);
+
+      try {
+        await server.connect(transport);
+        await transport.handleRequest(req, res, req.body);
+      } catch (error) {
+        cleanup();
+        logEvent(config.logging, "error", "mcp_request_error", {
+          requestId,
+          transportMode: mcpTransportMode,
+          error: error instanceof Error ? error.message : String(error),
+        });
+        if (!res.headersSent) {
+          sendJsonRpcError(res, 500, -32603, "Internal server error");
+        }
+      }
+      return;
+    }
 
     try {
       let transport: Transport | undefined;
@@ -2875,19 +2951,29 @@ export function createServer(
           return;
         }
       } else if (initializeRequest) {
-        if (transports.size >= MAX_MCP_SESSIONS) {
-          const idle = [...transportActivity.entries()]
-            .filter(([, activity]) => activity.inFlight === 0)
+        if (transports.size >= maxMcpSessions) {
+          const now = Date.now();
+          const stale = [...transportActivity.entries()]
+            .filter(
+              ([, activity]) =>
+                activity.inFlight === 0 && now - activity.lastSeenMs >= mcpSessionIdleMs,
+            )
             .sort((a, b) => a[1].lastSeenMs - b[1].lastSeenMs)[0];
-          if (idle) {
-            await transports.get(idle[0])?.close().catch(() => undefined);
+          if (stale) {
+            logEvent(config.logging, "info", "mcp_session_reap", {
+              requestId,
+              reason: "capacity_stale",
+              sessionIdPrefix: sessionIdPrefix(stale[0]),
+              idleMs: now - stale[1].lastSeenMs,
+            });
+            await transports.get(stale[0])?.close().catch(() => undefined);
           }
-          if (transports.size >= MAX_MCP_SESSIONS) {
+          if (transports.size >= maxMcpSessions) {
             sendJsonRpcError(
               res,
               503,
               -32002,
-              `DevSpace is at the MCP session limit (${MAX_MCP_SESSIONS}). Close an idle client session and retry.`,
+              `DevSpace is at the MCP session limit (${maxMcpSessions}). Close an idle client session and retry.`,
             );
             return;
           }
@@ -2917,21 +3003,7 @@ export function createServer(
           }
         };
 
-        const server = createMcpServer(
-          config,
-          workspaces,
-          reviewCheckpoints,
-          webLaunchBrowser,
-          defaultMetaHarnessHost,
-          options?.longTaskOperations ?? globalLongTaskOperations,
-          options?.fastPathTimeoutMs ?? FAST_PATH_EXECUTION_MS,
-          {
-            auditReturnController,
-            sourceResolveController,
-            reviewReturnController,
-          },
-          options?.fastPathQueueWaitMs ?? FAST_PATH_QUEUE_WAIT_MS,
-        );
+        const server = makeMcpServer();
         await server.connect(transport);
       } else {
         sendJsonRpcError(res, 400, -32000, "No valid MCP session");
@@ -2968,12 +3040,17 @@ export function createServer(
   const reaper = setInterval(() => {
     const now = Date.now();
     for (const [sessionId, activity] of transportActivity) {
-      if (activity.inFlight > 0 || now - activity.lastSeenMs < MCP_SESSION_IDLE_MS) continue;
+      if (activity.inFlight > 0 || now - activity.lastSeenMs < mcpSessionIdleMs) continue;
       const transport = transports.get(sessionId);
       if (!transport) {
         transportActivity.delete(sessionId);
         continue;
       }
+      logEvent(config.logging, "info", "mcp_session_reap", {
+        reason: "idle_timeout",
+        sessionIdPrefix: sessionIdPrefix(sessionId),
+        idleMs: now - activity.lastSeenMs,
+      });
       void transport.close().catch((error) => {
         logEvent(config.logging, "warn", "mcp_session_reap_error", {
           sessionIdPrefix: sessionIdPrefix(sessionId),
