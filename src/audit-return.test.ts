@@ -204,6 +204,176 @@ test("AuditReturnController retains ChatShare provenance when configured", async
   );
 });
 
+test("AuditReturnController deletes ChatShare history only after successful submit and retries transient busy state", async () => {
+  const conversationHash = "c".repeat(64);
+  const deleteCalls: string[] = [];
+  let deleteAttempt = 0;
+  const controller = new AuditReturnController(
+    {
+      launchWebConversation: async () => ({
+        slice: "WEB-LAUNCH-0" as const,
+        launchSuccess: true as const,
+        conversationIdentitySha256: conversationHash,
+        timestamp: new Date().toISOString(),
+        assistantOutputCaptured: false as const,
+      }),
+      deleteWebConversation: async (identity) => {
+        deleteCalls.push(identity);
+        deleteAttempt += 1;
+        return deleteAttempt === 1 ? ("busy" as const) : ("deleted" as const);
+      },
+    },
+    {
+      executionSurface: "chatshare",
+      cleanupSucceededConversations: true,
+      cleanupDelayMs: 1,
+      cleanupRetryMs: 5,
+      cleanupWatchMs: 100,
+    },
+  );
+
+  const started = await controller.startAudit({
+    jobId: "chatshare-cleanup-single",
+    evidencePacket: "evidence",
+    evidenceSha256: "a".repeat(64),
+    packetSha256: "b".repeat(64),
+  });
+  await new Promise((resolve) => setTimeout(resolve, 15));
+  assert.deepEqual(deleteCalls, []);
+
+  controller.submitAudit({
+    challenge: started.challenge,
+    result: {
+      summary: "summary",
+      findings: [{ claim: "claim", evidence_quote: "quote" }],
+      uncertainties: [],
+    },
+  });
+  await new Promise((resolve) => setTimeout(resolve, 35));
+
+  assert.equal(controller.getAuditStatus(started.auditId).status, "succeeded");
+  assert.deepEqual(deleteCalls, [conversationHash, conversationHash]);
+});
+
+test("AuditReturnController deletes every succeeded ChatShare batch child conversation", async () => {
+  const conversationHashes = ["d".repeat(64), "e".repeat(64)];
+  const deleted: string[] = [];
+  let launchIndex = 0;
+  const controller = new AuditReturnController(
+    {
+      launchWebConversation: async () => {
+        const conversationIdentitySha256 = conversationHashes[launchIndex++];
+        assert.ok(conversationIdentitySha256);
+        return {
+          slice: "WEB-LAUNCH-0" as const,
+          launchSuccess: true as const,
+          conversationIdentitySha256,
+          timestamp: new Date().toISOString(),
+          assistantOutputCaptured: false as const,
+        };
+      },
+      deleteWebConversation: async (identity) => {
+        deleted.push(identity);
+        return "deleted" as const;
+      },
+    },
+    {
+      executionSurface: "chatshare",
+      cleanupSucceededConversations: true,
+      cleanupDelayMs: 1,
+      cleanupRetryMs: 5,
+      cleanupWatchMs: 5_000,
+    },
+  );
+
+  const batch = await controller.startAuditBatch(
+    [
+      {
+        jobId: "batch-cleanup-a",
+        evidencePacket: "evidence-a",
+        evidenceSha256: "1".repeat(64),
+        packetSha256: "2".repeat(64),
+      },
+      {
+        jobId: "batch-cleanup-b",
+        evidencePacket: "evidence-b",
+        evidenceSha256: "3".repeat(64),
+        packetSha256: "4".repeat(64),
+      },
+    ],
+    { concurrency: 2 },
+  );
+
+  for (const job of batch.jobs) {
+    assert.ok(job.challenge);
+    controller.submitAudit({
+      challenge: job.challenge,
+      result: {
+        summary: `summary ${job.job_id}`,
+        findings: [{ claim: "claim", evidence_quote: "quote" }],
+        uncertainties: [],
+      },
+    });
+  }
+
+  const cleanupDeadline = Date.now() + 2_000;
+  while (deleted.length < 2 && Date.now() < cleanupDeadline) {
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  assert.equal(controller.getAuditBatchStatus(batch.batch_id).status, "succeeded");
+  assert.deepEqual([...deleted].sort(), [...conversationHashes].sort());
+});
+
+test("failed Audit batch child preserves ChatShare history for diagnosis", async () => {
+  const conversationHash = "f".repeat(64);
+  const deleted: string[] = [];
+  const controller = new AuditReturnController(
+    {
+      launchWebConversation: async () => ({
+        slice: "WEB-LAUNCH-0" as const,
+        launchSuccess: true as const,
+        conversationIdentitySha256: conversationHash,
+        timestamp: new Date().toISOString(),
+        assistantOutputCaptured: false as const,
+      }),
+      deleteWebConversation: async (identity) => {
+        deleted.push(identity);
+        return "deleted" as const;
+      },
+    },
+    {
+      executionSurface: "chatshare",
+      cleanupSucceededConversations: true,
+      cleanupDelayMs: 1,
+      cleanupRetryMs: 5,
+      cleanupWatchMs: 100,
+    },
+  );
+
+  const batch = await controller.startAuditBatch(
+    [
+      {
+        jobId: "batch-failure-preserve",
+        evidencePacket: "evidence",
+        evidenceSha256: "5".repeat(64),
+        packetSha256: "6".repeat(64),
+      },
+    ],
+    { concurrency: 1 },
+  );
+  const child = batch.jobs[0];
+  assert.ok(child?.audit_id);
+  controller.recordBatchJobFailure(
+    batch.batch_id,
+    child.audit_id,
+    "synthetic audit failure",
+  );
+
+  await new Promise((resolve) => setTimeout(resolve, 30));
+  assert.equal(controller.getAuditBatchStatus(batch.batch_id).status, "failed");
+  assert.deepEqual(deleted, []);
+});
+
 test("audit state survives across MCP sessions and integrates with seal", async () => {
   const parent = await mkdtemp(join(tmpdir(), "devspace-audit-mcp-test-"));
   const config = testConfig(parent);

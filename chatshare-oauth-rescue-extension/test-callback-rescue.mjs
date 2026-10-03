@@ -5,11 +5,13 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 const chromePath = String.raw`C:\Users\Lenovo\AppData\Local\ms-playwright\chromium-1208\chrome-win64\chrome.exe`;
-const debugPort = 19000 + Math.floor(Math.random() * 1000);
+const debugPort = await findAvailablePort();
 const appPort = 9449;
 const profile = await mkdtemp(join(tmpdir(), "chatshare-rescue-test-"));
 const bootstrap = await readFile(new URL("./callback-bootstrap.js", import.meta.url), "utf8");
 let receivedBody = null;
+let authenticated = false;
+let callbackAttempts = 0;
 
 const assets = {
   "/mock-route.js": `import{n as e}from"./mock-support.js";export default function(){return null}`,
@@ -21,8 +23,15 @@ const server = createServer(async (request, response) => {
   if (request.method === "POST" && request.url === "/aip/connectors/links/oauth/callback") {
     let body = "";
     for await (const chunk of request) body += chunk;
-    receivedBody = JSON.parse(body);
-    const redirectUrl = String(receivedBody.full_redirect_url ?? "");
+    const requestBody = JSON.parse(body);
+    const redirectUrl = String(requestBody.full_redirect_url ?? "");
+    callbackAttempts += 1;
+    if (redirectUrl.includes("dummy-logged-out-state") && !authenticated) {
+      response.writeHead(401, { "Content-Type": "application/json" });
+      response.end(JSON.stringify({ error: "unauthorized" }));
+      return;
+    }
+    receivedBody = requestBody;
     let payload = { post_auth_url: "/success" };
     if (redirectUrl.includes("dummy-work-state")) {
       payload = {
@@ -43,6 +52,13 @@ const server = createServer(async (request, response) => {
   if (assets[request.url]) {
     response.writeHead(200, { "Content-Type": "text/javascript; charset=utf-8" });
     response.end(assets[request.url]);
+    return;
+  }
+
+  if (request.method === "POST" && request.url === "/mock-login") {
+    authenticated = true;
+    response.writeHead(204);
+    response.end();
     return;
   }
 
@@ -145,6 +161,63 @@ try {
   }
 
   receivedBody = null;
+  authenticated = false;
+  callbackAttempts = 0;
+  await cdp.call("Runtime.evaluate", { expression: "sessionStorage.clear()", returnByValue: true });
+  const loggedOutCallback = `/connector/oauth/test-id?code=dummy-code&state=dummy-logged-out-state`;
+  await cdp.call("Page.navigate", {
+    url: `http://127.0.0.1:${appPort}/#cs_oauth_callback=${loggedOutCallback}`,
+  });
+
+  await waitFor(async () => {
+    const result = await cdp.call("Runtime.evaluate", {
+      expression:
+        "location.pathname.startsWith('/pastel') && location.hash.startsWith('#/login')",
+      returnByValue: true,
+    });
+    return result.result.value === true;
+  }, 8000, "logged-out callback redirected to login");
+
+  const pendingWhileLoggedOut = await cdp.call("Runtime.evaluate", {
+    expression: `({
+      pending: sessionStorage.getItem("chatshare-oauth-callback-rescue-pending"),
+      status: sessionStorage.getItem("chatshare-oauth-callback-rescue-status")
+    })`,
+    returnByValue: true,
+  });
+  if (pendingWhileLoggedOut.result.value?.pending !== loggedOutCallback) {
+    throw new Error(`Logged-out callback was not preserved: ${JSON.stringify(pendingWhileLoggedOut.result.value)}`);
+  }
+  if (pendingWhileLoggedOut.result.value?.status !== "redirecting-to-login") {
+    throw new Error(`Unexpected logged-out status: ${JSON.stringify(pendingWhileLoggedOut.result.value)}`);
+  }
+
+  await cdp.call("Runtime.evaluate", {
+    expression: `fetch("/mock-login", { method: "POST" }).then(() => { location.hash = "#/carlist"; })`,
+    awaitPromise: true,
+    returnByValue: true,
+  });
+
+  await waitFor(() => receivedBody !== null, 8000, "resumed callback POST after login");
+  await waitFor(async () => {
+    const result = await cdp.call("Runtime.evaluate", {
+      expression: "location.pathname === '/success'",
+      returnByValue: true,
+    });
+    return result.result.value === true;
+  }, 8000, "logged-out callback success redirect");
+
+  const loggedOutExpected = `http://127.0.0.1:${appPort}${loggedOutCallback}`;
+  if (receivedBody?.full_redirect_url !== loggedOutExpected) {
+    throw new Error(`Unexpected resumed callback body: ${JSON.stringify(receivedBody)}`);
+  }
+  if (callbackAttempts !== 2) {
+    throw new Error(`Expected one unauthorized callback attempt and one resumed success, got ${callbackAttempts}`);
+  }
+
+  receivedBody = null;
+  authenticated = true;
+  callbackAttempts = 0;
   await cdp.call("Runtime.evaluate", { expression: "sessionStorage.clear()", returnByValue: true });
   const workCallback = `/connector/oauth/test-id?code=dummy-code&state=dummy-work-state`;
   await cdp.call("Page.navigate", {
@@ -237,6 +310,9 @@ try {
     productionErrorPrevented: true,
     submittedThroughChatshareClient: true,
     postedFullRedirectUrlMatches: true,
+    loggedOutRedirectedToLogin: true,
+    loggedOutCallbackPreserved: true,
+    resumedCallbackAfterLogin: true,
     leftWorkSurfaceBeforeCallback: true,
     openedConnectorShellBeforeCallback: true,
     stayedOnPluginsInsteadOfMissingRoute: true,
@@ -263,6 +339,22 @@ try {
       await new Promise((resolve) => setTimeout(resolve, 200));
     }
   }
+}
+
+async function findAvailablePort() {
+  const probe = createServer();
+  await new Promise((resolve, reject) => {
+    probe.once("error", reject);
+    probe.listen(0, "127.0.0.1", resolve);
+  });
+  const address = probe.address();
+  if (!address || typeof address === "string") {
+    throw new Error("Could not allocate a local Chromium debugger port");
+  }
+  await new Promise((resolve, reject) => {
+    probe.close((error) => (error ? reject(error) : resolve()));
+  });
+  return address.port;
 }
 
 async function waitForDebugger() {

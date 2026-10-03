@@ -256,6 +256,111 @@ test("callback may arrive before launch acknowledgement and all identity fields 
   }
 });
 
+test("successful PRODUCT review deletes ChatShare history and retries transient busy state", async () => {
+  const deleteCalls: string[] = [];
+  let deleteAttempt = 0;
+  const review = new ReviewReturnController(
+    {
+      launchWebConversation: async () => launchAcknowledgement(),
+      deleteWebConversation: async (identity) => {
+        deleteCalls.push(identity);
+        deleteAttempt += 1;
+        return deleteAttempt === 1 ? "busy" : "deleted";
+      },
+    },
+    {
+      reviewIdFactory: () => REVIEW_ID,
+      challengeFactory: () => CHALLENGE,
+      executionSurface: "chatshare",
+      now: () => new Date(START_TIME),
+      timeoutMs: 1_000,
+      retentionMs: 1_000,
+      cleanupSucceededConversations: true,
+      cleanupDelayMs: 1,
+      cleanupRetryMs: 5,
+      cleanupWatchMs: 100,
+    },
+  );
+  try {
+    review.startReview(startInput());
+    await new Promise((resolve) => setTimeout(resolve, 15));
+    assert.deepEqual(deleteCalls, []);
+
+    review.submitReview(validCallback());
+    await waitFor(() => review.getReviewStatus(REVIEW_ID).status === "succeeded");
+    await waitFor(() => deleteCalls.length === 2, 500);
+    assert.deepEqual(deleteCalls, [CONVERSATION_HASH, CONVERSATION_HASH]);
+  } finally {
+    review.close();
+  }
+});
+
+test("failed and expired reviews preserve their ChatShare history for diagnosis", async () => {
+  const failedDeletes: string[] = [];
+  const failed = new ReviewReturnController(
+    {
+      launchWebConversation: async () => {
+        throw new Error("browser unavailable");
+      },
+      deleteWebConversation: async (identity) => {
+        failedDeletes.push(identity);
+        return "deleted";
+      },
+    },
+    {
+      reviewIdFactory: () => REVIEW_ID,
+      challengeFactory: () => CHALLENGE,
+      executionSurface: "chatshare",
+      now: () => new Date(START_TIME),
+      timeoutMs: 1_000,
+      retentionMs: 1_000,
+      cleanupSucceededConversations: true,
+      cleanupDelayMs: 1,
+      cleanupRetryMs: 5,
+      cleanupWatchMs: 50,
+    },
+  );
+  try {
+    failed.startReview(startInput());
+    await waitFor(() => failed.getReviewStatus(REVIEW_ID).status === "failed");
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    assert.deepEqual(failedDeletes, []);
+  } finally {
+    failed.close();
+  }
+
+  const expiredDeletes: string[] = [];
+  const expired = new ReviewReturnController(
+    {
+      launchWebConversation: async () => launchAcknowledgement(),
+      deleteWebConversation: async (identity) => {
+        expiredDeletes.push(identity);
+        return "deleted";
+      },
+    },
+    {
+      reviewIdFactory: () => REVIEW_ID,
+      challengeFactory: () => CHALLENGE,
+      executionSurface: "chatshare",
+      now: () => new Date(START_TIME),
+      timeoutMs: 25,
+      retentionMs: 1_000,
+      cleanupSucceededConversations: true,
+      cleanupDelayMs: 1,
+      cleanupRetryMs: 5,
+      cleanupWatchMs: 50,
+    },
+  );
+  try {
+    expired.startReview(startInput());
+    await waitFor(() => expired.getReviewStatus(REVIEW_ID).status === "expired", 500);
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    assert.deepEqual(expiredDeletes, []);
+  } finally {
+    expired.close();
+  }
+});
+
 test("launch may arrive before callback", async () => {
   let launched = false;
   const times = [new Date(START_TIME), new Date(CALLBACK_TIME)];
@@ -508,6 +613,7 @@ test("SAW A/B/C review set keeps independent roles, challenges, conversations, a
   const conversationHashes = ["7".repeat(64), "8".repeat(64), "9".repeat(64)];
   const prompts: string[] = [];
   const stopped: string[] = [];
+  const deleted: string[] = [];
   let launchIndex = 0;
 
   const review = new ReviewReturnController(
@@ -526,6 +632,10 @@ test("SAW A/B/C review set keeps independent roles, challenges, conversations, a
         stopped.push(identity);
         return true;
       },
+      deleteWebConversation: async (identity) => {
+        deleted.push(identity);
+        return "deleted";
+      },
     },
     {
       reviewIdFactory: () => {
@@ -543,6 +653,10 @@ test("SAW A/B/C review set keeps independent roles, challenges, conversations, a
       now: () => new Date(START_TIME),
       timeoutMs: 1_000,
       retentionMs: 1_000,
+      cleanupSucceededConversations: true,
+      cleanupDelayMs: 1,
+      cleanupRetryMs: 5,
+      cleanupWatchMs: 100,
     },
   );
 
@@ -609,6 +723,8 @@ test("SAW A/B/C review set keeps independent roles, challenges, conversations, a
       conversationHashes,
     );
     assert.deepEqual(stopped, conversationHashes);
+    await waitFor(() => deleted.length === 3, 500);
+    assert.deepEqual(deleted, conversationHashes);
   } finally {
     review.close();
   }

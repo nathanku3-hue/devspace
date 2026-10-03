@@ -35,20 +35,27 @@ assert.match(supervisor, /Stop-ScheduledTask -TaskName \$Config\.originTaskName/
 assert.match(supervisor, /remained Running after forced stop/);
 
 if (process.platform === "win32") {
-  for (const scriptPath of [installerPath, runnerPath, supervisorPath]) {
-    const parseCommand = [
+  const scriptPaths = [installerPath, runnerPath, supervisorPath];
+  const parseCommand = [
+    "$parseFailed = $false",
+    ...scriptPaths.flatMap((scriptPath) => [
       "$tokens = $null",
       "$errors = $null",
       `[System.Management.Automation.Language.Parser]::ParseFile(${JSON.stringify(scriptPath)}, [ref]$tokens, [ref]$errors) | Out-Null`,
-      "if ($errors.Count -gt 0) { $errors | ForEach-Object { Write-Error $_.Message }; exit 1 }",
-    ].join("; ");
-    const parsed = spawnSync(
-      "powershell.exe",
-      ["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", parseCommand],
-      { encoding: "utf8", timeout: 20_000, windowsHide: true },
-    );
-    assert.equal(parsed.status, 0, `PowerShell parse failed for ${scriptPath}:\n${parsed.stderr}`);
-  }
+      `if ($errors.Count -gt 0) { Write-Error ${JSON.stringify(`PowerShell parse failed for ${scriptPath}`)}; $errors | ForEach-Object { Write-Error $_.Message }; $parseFailed = $true }`,
+    ]),
+    "if ($parseFailed) { exit 1 }",
+  ].join("; ");
+  const parsed = spawnSync(
+    "powershell.exe",
+    ["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", parseCommand],
+    { encoding: "utf8", timeout: 60_000, windowsHide: true },
+  );
+  assert.equal(
+    parsed.status,
+    0,
+    `PowerShell parse validation failed: ${parsed.error?.message ?? ""}\n${parsed.stderr}`,
+  );
 
   const temp = await mkdtemp(join(tmpdir(), "devspace-origin-runner-test-"));
   try {
@@ -87,7 +94,7 @@ if (process.platform === "win32") {
         "-MaxOldSpaceMb",
         "128",
       ],
-      { encoding: "utf8", timeout: 20_000, windowsHide: true },
+      { encoding: "utf8", timeout: 60_000, windowsHide: true },
     );
     assert.equal(
       result.status,

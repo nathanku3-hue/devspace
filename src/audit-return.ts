@@ -153,9 +153,18 @@ export function buildAuditPrompt(input: {
 
 export class AuditReturnController {
   readonly #browser: Pick<WebLaunchBrowserController, "launchWebConversation"> &
-    Partial<Pick<WebLaunchBrowserController, "stopWebConversationRecovery">>;
+    Partial<
+      Pick<
+        WebLaunchBrowserController,
+        "deleteWebConversation" | "stopWebConversationRecovery"
+      >
+    >;
   readonly #now: () => Date;
   readonly #executionSurface: "chatgpt_web" | "chatshare";
+  readonly #cleanupSucceededConversations: boolean;
+  readonly #cleanupDelayMs: number;
+  readonly #cleanupRetryMs: number;
+  readonly #cleanupWatchMs: number;
   readonly #bindingsByAuditId = new Map<string, AuditBinding>();
   readonly #auditIdByChallenge = new Map<string, string>();
   readonly #challengeByAuditId = new Map<string, string>();
@@ -167,15 +176,29 @@ export class AuditReturnController {
 
   constructor(
     browser: Pick<WebLaunchBrowserController, "launchWebConversation"> &
-      Partial<Pick<WebLaunchBrowserController, "stopWebConversationRecovery">>,
+      Partial<
+        Pick<
+          WebLaunchBrowserController,
+          "deleteWebConversation" | "stopWebConversationRecovery"
+        >
+      >,
     options: {
       now?: () => Date;
       executionSurface?: "chatgpt_web" | "chatshare";
+      cleanupSucceededConversations?: boolean;
+      cleanupDelayMs?: number;
+      cleanupRetryMs?: number;
+      cleanupWatchMs?: number;
     } = {},
   ) {
     this.#browser = browser;
     this.#now = options.now ?? (() => new Date());
     this.#executionSurface = options.executionSurface ?? "chatgpt_web";
+    this.#cleanupSucceededConversations =
+      options.cleanupSucceededConversations ?? false;
+    this.#cleanupDelayMs = options.cleanupDelayMs ?? 3_000;
+    this.#cleanupRetryMs = options.cleanupRetryMs ?? 2_000;
+    this.#cleanupWatchMs = options.cleanupWatchMs ?? 2 * 60_000;
   }
 
   async startAudit(input: AuditStartInput): Promise<{
@@ -246,6 +269,45 @@ export class AuditReturnController {
     }
   }
 
+  #startSucceededConversationCleanup(auditId: string): void {
+    if (!this.#cleanupSucceededConversations) return;
+    const deleteWebConversation = this.#browser.deleteWebConversation?.bind(this.#browser);
+    const conversationIdentitySha256 =
+      this.#conversationIdentityByAuditId.get(auditId);
+    if (!deleteWebConversation || !conversationIdentitySha256 || this.#cleanupWatchMs <= 0) {
+      return;
+    }
+
+    const startedAtMs = Date.now();
+    const schedule = (delayMs: number): void => {
+      const timer = setTimeout(() => {
+        void tick();
+      }, Math.max(1, delayMs));
+      timer.unref?.();
+    };
+    const tick = async (): Promise<void> => {
+      if (!this.#retainedByAuditId.has(auditId)) return;
+      if (
+        this.#conversationIdentityByAuditId.get(auditId) !==
+        conversationIdentitySha256
+      ) {
+        return;
+      }
+      if (Date.now() - startedAtMs >= this.#cleanupWatchMs) return;
+      try {
+        const result = await deleteWebConversation(conversationIdentitySha256);
+        if (result === "deleted") {
+          this.#conversationIdentityByAuditId.delete(auditId);
+          return;
+        }
+      } catch {
+        // Sidebar/menu transitions are retried only for this succeeded audit.
+      }
+      schedule(this.#cleanupRetryMs);
+    };
+    schedule(this.#cleanupDelayMs);
+  }
+
   submitAudit(input: AuditSubmitInput): {
     auditId: string;
     status: "succeeded";
@@ -302,6 +364,7 @@ export class AuditReturnController {
 
     this.#retainedByAuditId.set(auditId, retained);
     this.#stopConversationRecovery(auditId);
+    this.#startSucceededConversationCleanup(auditId);
 
     // If part of an active batch orchestrator, notify batch
     const batchId = this.#batchIdByAuditId.get(auditId);

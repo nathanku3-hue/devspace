@@ -190,26 +190,20 @@
     }
 
     sessionStorage.setItem(rescueStatusKey, "submitting-callback");
-    const deadline = Date.now() + 15000;
-    let lastError;
-
-    while (Date.now() < deadline) {
-      try {
-        const result = await client.safePost(callbackApiPath, {
-          requestBody: { full_redirect_url: fullRedirectUrl },
-        });
-        if (!result || typeof result !== "object") {
-          throw new Error("Chatshare returned an empty callback response.");
-        }
-        return result;
-      } catch (error) {
-        lastError = error;
-        if (!isMissingAuthError(error)) throw error;
-        await sleep(200);
+    try {
+      const result = await client.safePost(callbackApiPath, {
+        requestBody: { full_redirect_url: fullRedirectUrl },
+      });
+      if (!result || typeof result !== "object") {
+        throw new Error("Chatshare returned an empty callback response.");
       }
+      return result;
+    } catch (error) {
+      if (!isMissingAuthError(error)) throw error;
+      sessionStorage.setItem(rescueStatusKey, "redirecting-to-login");
+      location.replace(loginPath);
+      return new Promise(() => {});
     }
-
-    throw lastError ?? new Error("Chatshare is not authenticated yet.");
   }
 
   async function resolveChatshareApiClient(manifest) {
@@ -440,10 +434,6 @@
   function isMissingAuthError(error) {
     const message = safeErrorMessage(error).toLowerCase();
     return message.includes("no access token") || message.includes("unauthorized") || message.includes("401");
-  }
-
-  function sleep(ms) {
-    return new Promise((resolve) => window.setTimeout(resolve, ms));
   }
 
   function readCallbackUrl() {

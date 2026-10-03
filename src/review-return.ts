@@ -200,6 +200,10 @@ export interface ReviewReturnOptions {
   now?: () => Date;
   timeoutMs?: number;
   retentionMs?: number;
+  cleanupSucceededConversations?: boolean;
+  cleanupDelayMs?: number;
+  cleanupRetryMs?: number;
+  cleanupWatchMs?: number;
 }
 
 interface FrozenReviewBindings {
@@ -241,7 +245,12 @@ export class ReviewReturnError extends Error {
 
 export class ReviewReturnController {
   readonly #browser: Pick<WebLaunchBrowserController, "launchWebConversation"> &
-    Partial<Pick<WebLaunchBrowserController, "stopWebConversationRecovery">>;
+    Partial<
+      Pick<
+        WebLaunchBrowserController,
+        "deleteWebConversation" | "stopWebConversationRecovery"
+      >
+    >;
   readonly #reviewIdFactory: () => string;
   readonly #challengeFactory: () => string;
   readonly #batchIdFactory: () => string;
@@ -249,6 +258,10 @@ export class ReviewReturnController {
   readonly #now: () => Date;
   readonly #timeoutMs: number;
   readonly #retentionMs: number;
+  readonly #cleanupSucceededConversations: boolean;
+  readonly #cleanupDelayMs: number;
+  readonly #cleanupRetryMs: number;
+  readonly #cleanupWatchMs: number;
   readonly #runs = new Map<string, ReviewRun>();
   readonly #bindingsByReviewId = new Map<string, FrozenReviewBindings>();
   readonly #submissionByReviewId = new Map<string, PendingSubmission>();
@@ -259,7 +272,12 @@ export class ReviewReturnController {
 
   constructor(
     browser: Pick<WebLaunchBrowserController, "launchWebConversation"> &
-      Partial<Pick<WebLaunchBrowserController, "stopWebConversationRecovery">>,
+      Partial<
+        Pick<
+          WebLaunchBrowserController,
+          "deleteWebConversation" | "stopWebConversationRecovery"
+        >
+      >,
     options: ReviewReturnOptions = {},
   ) {
     this.#browser = browser;
@@ -279,6 +297,11 @@ export class ReviewReturnController {
       options.retentionMs ?? DEFAULT_RUN_RETENTION_MS,
       "run retention",
     );
+    this.#cleanupSucceededConversations =
+      options.cleanupSucceededConversations ?? false;
+    this.#cleanupDelayMs = options.cleanupDelayMs ?? 3_000;
+    this.#cleanupRetryMs = options.cleanupRetryMs ?? 2_000;
+    this.#cleanupWatchMs = options.cleanupWatchMs ?? 2 * 60_000;
   }
 
   startReview(input: ReviewStartInput): ReviewStartAcknowledgement {
@@ -620,6 +643,44 @@ export class ReviewReturnController {
     };
     run.status = "succeeded";
     this.#finishTerminal(run);
+    this.#startSucceededConversationCleanup(run);
+  }
+
+  #startSucceededConversationCleanup(run: ReviewRun): void {
+    if (!this.#cleanupSucceededConversations || run.status !== "succeeded") return;
+    const deleteWebConversation = this.#browser.deleteWebConversation?.bind(this.#browser);
+    const conversationIdentitySha256 = run.launchIdentity;
+    if (!deleteWebConversation || !conversationIdentitySha256 || this.#cleanupWatchMs <= 0) {
+      return;
+    }
+
+    const startedAtMs = Date.now();
+    const reviewId = run.id;
+    const schedule = (delayMs: number): void => {
+      const timer = setTimeout(() => {
+        void tick();
+      }, Math.max(1, delayMs));
+      timer.unref?.();
+    };
+    const tick = async (): Promise<void> => {
+      const current = this.#runs.get(reviewId);
+      if (
+        !current ||
+        current.status !== "succeeded" ||
+        current.launchIdentity !== conversationIdentitySha256
+      ) {
+        return;
+      }
+      if (Date.now() - startedAtMs >= this.#cleanupWatchMs) return;
+      try {
+        const result = await deleteWebConversation(conversationIdentitySha256);
+        if (result === "deleted") return;
+      } catch {
+        // Sidebar/menu transitions are retried only for this succeeded review.
+      }
+      schedule(this.#cleanupRetryMs);
+    };
+    schedule(this.#cleanupDelayMs);
   }
 
   #fail(reviewId: string, failureCode: string): void {

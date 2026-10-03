@@ -2756,13 +2756,17 @@ export function createServer(
   });
   const executionSurface =
     config.chatSessionProvider === "chatshare" ? "chatshare" : "chatgpt_web";
-  const auditReturnController = new AuditReturnController(webLaunchBrowser, { executionSurface });
+  const auditReturnController = new AuditReturnController(webLaunchBrowser, {
+    executionSurface,
+    cleanupSucceededConversations: executionSurface === "chatshare",
+  });
   const sourceResolveController = new SourceResolveController(webLaunchBrowser, {
     executionSurface,
     cleanupSucceededConversations: executionSurface === "chatshare",
   });
   const reviewReturnController = new ReviewReturnController(webLaunchBrowser, {
     executionSurface,
+    cleanupSucceededConversations: executionSurface === "chatshare",
   });
   const mcpTransportMode =
     options?.mcpTransportMode ?? resolveMcpTransportMode(process.env.DEVSPACE_MCP_TRANSPORT_MODE);
