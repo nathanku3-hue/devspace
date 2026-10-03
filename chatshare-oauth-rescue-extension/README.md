@@ -29,13 +29,6 @@ After this one-time setup, a valid Chatshare OAuth authorization page obtains a
 one-time proof from `127.0.0.1:7677` and submits automatically. There is no
 password prompt or approval click while DevSpace is running normally.
 
-Version `1.13.0` also closes the logged-out callback edge case. If
-Chatshare's own callback API reports `401`, `unauthorized`, or a missing access
-token, the rescue keeps the pending callback in session storage and immediately
-opens Chatshare's native `/pastel/#/login` UI. After login leaves that route, the
-normal document shell resumes the preserved callback instead of retrying the
-unauthenticated POST for 15 seconds and failing.
-
 Version `1.12.0` also keeps Chatshare from white-screening with:
 
 ```text
