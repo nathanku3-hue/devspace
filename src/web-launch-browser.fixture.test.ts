@@ -2240,6 +2240,156 @@ test("aborted interruption rescue cannot submit resume after the page switches s
   }
 });
 
+test("aborted interruption rescue exits promptly while the stop transition is still stuck", async () => {
+  const browser = await launchInstalledChrome();
+  try {
+    const context = await browser.newContext();
+    const page = await context.newPage();
+    await page.setContent(`<!doctype html><html><body><main>
+<p>Stopped talking to devspace</p>
+<form>
+  <textarea id="prompt-textarea"></textarea>
+  <button id="turn-control" data-testid="stop-button" aria-label="Stop generating" type="button">■</button>
+</form>
+</main>
+<script>
+  document.querySelector('#turn-control').addEventListener('click', () => {
+    document.body.dataset.stopClicked = 'true';
+  });
+</script></body></html>`);
+
+    const abortController = new AbortController();
+    const watch = watchForDevSpaceChatShareRecovery(page, 5_000, {
+      signal: abortController.signal,
+      resumeCooldownMs: 20,
+      maxResumeAttempts: 1,
+      pollMs: 20,
+    });
+
+    await page.waitForFunction(
+      () => document.body.dataset.stopClicked === "true",
+      undefined,
+      { timeout: 1_500 },
+    );
+    const abortedAtMs = Date.now();
+    abortController.abort();
+
+    const completion = await Promise.race([
+      watch.then(() => "completed" as const),
+      page.waitForTimeout(1_000).then(() => "timeout" as const),
+    ]);
+    assert.equal(completion, "completed");
+    assert.ok(Date.now() - abortedAtMs < 1_000);
+    assert.equal(
+      await page.locator('[data-testid="stop-button"]').isVisible(),
+      true,
+    );
+
+    await context.close();
+  } finally {
+    await browser.close();
+  }
+});
+
+test("aborted interruption rescue cancels composer discovery promptly", async () => {
+  const browser = await launchInstalledChrome();
+  try {
+    const context = await browser.newContext();
+    const page = await context.newPage();
+    await page.setContent(`<!doctype html><html><body><main>
+<p>Stopped talking to devspace</p>
+<button id="turn-control" data-testid="stop-button" aria-label="Stop generating" type="button">■</button>
+</main>
+<script>
+  document.querySelector('#turn-control').addEventListener('click', (event) => {
+    document.body.dataset.stopClicked = 'true';
+    event.currentTarget.remove();
+  });
+</script></body></html>`);
+
+    const abortController = new AbortController();
+    const watch = watchForDevSpaceChatShareRecovery(page, 5_000, {
+      signal: abortController.signal,
+      resumeCooldownMs: 20,
+      maxResumeAttempts: 1,
+      pollMs: 20,
+    });
+
+    await page.waitForFunction(
+      () =>
+        document.body.dataset.stopClicked === "true" &&
+        !document.querySelector('[data-testid="stop-button"]'),
+      undefined,
+      { timeout: 1_500 },
+    );
+    await page.waitForTimeout(100);
+    const abortedAtMs = Date.now();
+    abortController.abort();
+
+    const completion = await Promise.race([
+      watch.then(() => "completed" as const),
+      page.waitForTimeout(1_000).then(() => "timeout" as const),
+    ]);
+    assert.equal(completion, "completed");
+    assert.ok(Date.now() - abortedAtMs < 1_000);
+
+    await context.close();
+  } finally {
+    await browser.close();
+  }
+});
+
+test("abort during send transition clears an owned synthetic resume", async () => {
+  const browser = await launchInstalledChrome();
+  try {
+    const context = await browser.newContext();
+    const page = await context.newPage();
+    await page.setContent(`<!doctype html><html><body><main>
+<p>Stopped talking to devspace</p>
+<form>
+  <textarea id="prompt-textarea"></textarea>
+  <button id="turn-control" data-testid="stop-button" aria-label="Stop generating" type="button">■</button>
+</form>
+</main>
+<script>
+  document.querySelector('#turn-control').addEventListener('click', (event) => {
+    document.body.dataset.stopClicked = 'true';
+    event.currentTarget.remove();
+  });
+</script></body></html>`);
+
+    const abortController = new AbortController();
+    const watch = watchForDevSpaceChatShareRecovery(page, 5_000, {
+      signal: abortController.signal,
+      resumeCooldownMs: 20,
+      maxResumeAttempts: 1,
+      pollMs: 20,
+    });
+
+    await page.waitForFunction(
+      () =>
+        document.body.dataset.stopClicked === "true" &&
+        document.querySelector("#prompt-textarea")?.value === "resume",
+      undefined,
+      { timeout: 1_500 },
+    );
+    const abortedAtMs = Date.now();
+    abortController.abort();
+
+    const completion = await Promise.race([
+      watch.then(() => "completed" as const),
+      page.waitForTimeout(1_000).then(() => "timeout" as const),
+    ]);
+    assert.equal(completion, "completed");
+    assert.ok(Date.now() - abortedAtMs < 1_000);
+    assert.equal(await page.locator("#prompt-textarea").inputValue(), "");
+
+    await context.close();
+  } finally {
+    await browser.close();
+  }
+});
+
 test("replacement recovery watcher can take ownership of the same page", async () => {
   const browser = await launchInstalledChrome();
   try {

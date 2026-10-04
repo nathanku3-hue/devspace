@@ -3747,14 +3747,12 @@ function devSpaceRecoveryPageIdentity(page: Page): string {
   return chatConversationIdentityFromUrl(page.url()) ?? `url:${page.url()}`;
 }
 
-async function devSpaceRecoveryFenceIsCurrent(
+async function devSpaceRecoveryFenceOwnsComposer(
   page: Page,
   fence: DevSpaceRecoveryFence,
-  signal?: AbortSignal,
 ): Promise<boolean> {
-  if (page.isClosed() || signal?.aborted) return false;
+  if (page.isClosed()) return false;
   if (devSpaceRecoveryPageIdentity(page) !== fence.pageIdentity) return false;
-  if (await hasDevSpaceManualStopLatch(page)) return false;
   if ((await readDevSpaceUserTurnGeneration(page)) !== fence.userTurnGeneration) {
     return false;
   }
@@ -3762,6 +3760,62 @@ async function devSpaceRecoveryFenceIsCurrent(
     (await readDevSpaceComposerInputGeneration(page)) ===
     fence.composerInputGeneration
   );
+}
+
+async function devSpaceRecoveryFenceIsCurrent(
+  page: Page,
+  fence: DevSpaceRecoveryFence,
+  signal?: AbortSignal,
+): Promise<boolean> {
+  if (signal?.aborted) return false;
+  if (!(await devSpaceRecoveryFenceOwnsComposer(page, fence))) return false;
+  return !(await hasDevSpaceManualStopLatch(page));
+}
+
+async function waitForAbortableDelay(
+  delayMs: number,
+  signal?: AbortSignal,
+): Promise<boolean> {
+  if (signal?.aborted) return false;
+  if (delayMs <= 0) return true;
+
+  return new Promise<boolean>((resolve) => {
+    let settled = false;
+    const finish = (value: boolean) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      signal?.removeEventListener("abort", onAbort);
+      resolve(value);
+    };
+    const onAbort = () => finish(false);
+    const timer = setTimeout(() => finish(true), delayMs);
+    signal?.addEventListener("abort", onAbort, { once: true });
+  });
+}
+
+async function waitForDevSpaceRecoveryCondition(
+  page: Page,
+  timeoutMs: number,
+  signal: AbortSignal | undefined,
+  predicate: () => Promise<boolean>,
+  fence?: DevSpaceRecoveryFence,
+): Promise<boolean> {
+  const deadline = Date.now() + Math.max(0, timeoutMs);
+  while (Date.now() < deadline) {
+    if (page.isClosed() || signal?.aborted) return false;
+    if (fence && !(await devSpaceRecoveryFenceIsCurrent(page, fence, signal))) {
+      return false;
+    }
+    if (await predicate().catch(() => false)) return true;
+
+    const remainingMs = deadline - Date.now();
+    if (remainingMs <= 0) break;
+    if (!(await waitForAbortableDelay(Math.min(100, remainingMs), signal))) {
+      return false;
+    }
+  }
+  return false;
 }
 
 async function withDevSpaceAutoRecoveryAction<T>(
@@ -3810,41 +3864,40 @@ async function resumeInterruptedDevSpaceConversationViaComposer(
   signal?: AbortSignal,
 ): Promise<boolean> {
   if (page.isClosed() || signal?.aborted) return false;
-  if (await hasDevSpaceManualStopLatch(page)) return false;
+  await installDevSpaceRecoveryIntentGuard(page);
+
+  const fence: DevSpaceRecoveryFence = {
+    pageIdentity: devSpaceRecoveryPageIdentity(page),
+    userTurnGeneration: await readDevSpaceUserTurnGeneration(page),
+    composerInputGeneration: await readDevSpaceComposerInputGeneration(page),
+  };
+  if (!(await devSpaceRecoveryFenceIsCurrent(page, fence, signal))) return false;
 
   let stopControls = await credibleLocators(page.locator(STOP_SELECTOR)).catch(
     () => [] as Locator[],
   );
   const stoppedActiveTurn = stopControls.length > 0;
   if (stoppedActiveTurn) {
-    if (await hasDevSpaceManualStopLatch(page)) return false;
+    if (!(await devSpaceRecoveryFenceIsCurrent(page, fence, signal))) return false;
     // UI-first interruption rescue: stop the wedged turn, then wait for the
-    // actual UI transition. This is deliberately state-driven rather than a
-    // fixed sleep because ChatGPT can take an unpredictable amount of time to
-    // replace the square stop control with an idle/send-capable composer.
-    await withDevSpaceAutoRecoveryAction(page, () =>
-      stopControls[stopControls.length - 1]!.click({ timeout: 5_000 }),
-    );
+    // actual UI transition. The wait itself is abort-aware so a conversation
+    // handoff does not leave a dead recovery task polling for up to two minutes.
+    await withDevSpaceAutoRecoveryAction(page, async () => {
+      if (!(await devSpaceRecoveryFenceIsCurrent(page, fence, signal))) return;
+      await stopControls[stopControls.length - 1]!.click({ timeout: 5_000 });
+    });
 
-    const stopCleared = await page
-      .waitForFunction(
-        (selector) =>
-          !Array.from(document.querySelectorAll(selector)).some((element) => {
-            if (!(element instanceof HTMLElement)) return false;
-            const style = getComputedStyle(element);
-            return (
-              style.visibility !== "hidden" &&
-              style.display !== "none" &&
-              element.getClientRects().length > 0
-            );
-          }),
-        STOP_SELECTOR,
-        { timeout: transitionTimeoutMs },
-      )
-      .then(() => true)
-      .catch(() => false);
-    if (!stopCleared || page.isClosed() || signal?.aborted) return false;
-    if (await hasDevSpaceManualStopLatch(page)) return false;
+    const stopCleared = await waitForDevSpaceRecoveryCondition(
+      page,
+      transitionTimeoutMs,
+      signal,
+      async () =>
+        (await credibleLocators(page.locator(STOP_SELECTOR)).catch(
+          () => [] as Locator[],
+        )).length === 0,
+      fence,
+    );
+    if (!stopCleared) return false;
   } else {
     stopControls = await credibleLocators(page.locator(STOP_SELECTOR)).catch(
       () => [] as Locator[],
@@ -3852,62 +3905,85 @@ async function resumeInterruptedDevSpaceConversationViaComposer(
     if (stopControls.length > 0) return false;
   }
 
-  if (signal?.aborted) return false;
+  if (!(await devSpaceRecoveryFenceIsCurrent(page, fence, signal))) return false;
   const recoveryButtons = await credibleLocators(
     page.getByRole("button", { name: DEVSPACE_NATIVE_RECOVERY_BUTTON_PATTERN }),
     true,
   ).catch(() => [] as Locator[]);
-  if (recoveryButtons.length > 0 || signal?.aborted) return false;
+  if (recoveryButtons.length > 0) return false;
 
   let composer: Locator;
   try {
-    composer = await findExactlyOneComposer(page, stoppedActiveTurn ? transitionTimeoutMs : 1_000);
+    composer = await findExactlyOneComposer(
+      page,
+      stoppedActiveTurn ? transitionTimeoutMs : 1_000,
+      signal,
+    );
   } catch {
     return false;
   }
 
-  if (signal?.aborted) return false;
-  await insertAndVerifyPrompt(composer, prompt);
-  if (signal?.aborted) return false;
+  const clearSyntheticPromptIfOwned = async (): Promise<void> => {
+    if (!(await devSpaceRecoveryFenceOwnsComposer(page, fence))) return;
+    if (
+      normalizeText(await readComposerText(composer).catch(() => "")) !==
+      normalizeText(prompt)
+    ) {
+      return;
+    }
+    await withDevSpaceAutoRecoveryAction(page, () =>
+      composer.fill("").catch(() => undefined),
+    );
+  };
 
-  // Typing may be what causes the send arrow to appear. Wait for exactly one
-  // visible, enabled send control, again by observing UI state rather than by
-  // assuming any particular render delay.
-  const sendReady = await page
-    .waitForFunction(
-      (selector) => {
-        const ready = Array.from(document.querySelectorAll(selector)).filter((element) => {
-          if (!(element instanceof HTMLElement)) return false;
-          if (element.getAttribute("aria-disabled") === "true") return false;
-          if (element instanceof HTMLButtonElement && element.disabled) return false;
-          const style = getComputedStyle(element);
-          return (
-            style.visibility !== "hidden" &&
-            style.display !== "none" &&
-            element.getClientRects().length > 0
-          );
-        });
-        return ready.length === 1;
-      },
-      SEND_SELECTOR,
-      { timeout: stoppedActiveTurn ? transitionTimeoutMs : 1_000 },
-    )
-    .then(() => true)
-    .catch(() => false);
-  if (!sendReady || page.isClosed() || signal?.aborted) return false;
+  if (!(await devSpaceRecoveryFenceIsCurrent(page, fence, signal))) return false;
+  await withDevSpaceAutoRecoveryAction(page, () =>
+    insertAndVerifyPrompt(composer, prompt),
+  );
+  if (!(await devSpaceRecoveryFenceIsCurrent(page, fence, signal))) {
+    await clearSyntheticPromptIfOwned();
+    return false;
+  }
+
+  // Typing may be what causes the send arrow to appear. Poll the actual UI
+  // state with an abort-aware fence rather than using Playwright's uncancellable
+  // waitForFunction timeout.
+  const sendReady = await waitForDevSpaceRecoveryCondition(
+    page,
+    stoppedActiveTurn ? transitionTimeoutMs : 1_000,
+    signal,
+    async () =>
+      (
+        await credibleLocators(page.locator(SEND_SELECTOR), true).catch(
+          () => [] as Locator[],
+        )
+      ).length === 1,
+    fence,
+  );
+  if (!sendReady) {
+    await clearSyntheticPromptIfOwned();
+    return false;
+  }
 
   const activeStops = await credibleLocators(page.locator(STOP_SELECTOR)).catch(
     () => [] as Locator[],
   );
-  if (activeStops.length > 0 || signal?.aborted) return false;
+  if (activeStops.length > 0) {
+    await clearSyntheticPromptIfOwned();
+    return false;
+  }
 
   let submitted = false;
   await withDevSpaceAutoRecoveryAction(page, async () => {
-    if (signal?.aborted) return;
+    if (!(await devSpaceRecoveryFenceIsCurrent(page, fence, signal))) return;
     await submitPrompt(page, composer, prompt);
     submitted = true;
   });
-  return submitted && !signal?.aborted;
+  if (!submitted) {
+    await clearSyntheticPromptIfOwned();
+    return false;
+  }
+  return !signal?.aborted;
 }
 
 async function resumeSilentDevSpaceConversationViaComposer(
@@ -5197,14 +5273,29 @@ function sha256(value: string): string {
   return createHash("sha256").update(value).digest("hex");
 }
 
-export async function findExactlyOneComposer(page: Page, timeoutMs = 20_000): Promise<Locator> {
+export async function findExactlyOneComposer(
+  page: Page,
+  timeoutMs = 20_000,
+  signal?: AbortSignal,
+): Promise<Locator> {
   const deadline = Date.now() + timeoutMs;
   let candidates: Locator[] = [];
   while (Date.now() < deadline) {
+    if (page.isClosed() || signal?.aborted) {
+      throw new WebLaunchBrowserError("composer wait was cancelled");
+    }
     await assertAuthenticated(page);
     candidates = await rankedComposerLocators(page);
     if (candidates.length === 1) return candidates[0]!;
-    await page.waitForTimeout(200);
+    const remainingMs = deadline - Date.now();
+    if (
+      !(await waitForAbortableDelay(
+        Math.min(200, Math.max(1, remainingMs)),
+        signal,
+      ))
+    ) {
+      throw new WebLaunchBrowserError("composer wait was cancelled");
+    }
   }
   if (candidates.length > 1) {
     throw new WebLaunchBrowserError(
