@@ -3586,12 +3586,16 @@ function installDevSpaceRecoveryIntentGuardInDocument({
       manualStop: boolean;
       autoActionDepth: number;
       userTurnGeneration: number;
+      composerInputGeneration: number;
     };
   };
   const existingState = globalState.__devspaceRecoveryIntentState;
   if (existingState?.installed) {
     if (!Number.isFinite(existingState.userTurnGeneration)) {
       existingState.userTurnGeneration = 0;
+    }
+    if (!Number.isFinite(existingState.composerInputGeneration)) {
+      existingState.composerInputGeneration = 0;
     }
     return;
   }
@@ -3601,6 +3605,7 @@ function installDevSpaceRecoveryIntentGuardInDocument({
     manualStop: false,
     autoActionDepth: 0,
     userTurnGeneration: 0,
+    composerInputGeneration: 0,
   };
   globalState.__devspaceRecoveryIntentState = state;
 
@@ -3662,6 +3667,19 @@ function installDevSpaceRecoveryIntentGuardInDocument({
     },
     true,
   );
+
+  document.addEventListener(
+    "input",
+    (event) => {
+      if (state.autoActionDepth !== 0) return;
+      const target =
+        event.target instanceof Element ? event.target : undefined;
+      if (target?.closest(composerSelector)) {
+        state.composerInputGeneration += 1;
+      }
+    },
+    true,
+  );
 }
 
 async function installDevSpaceRecoveryIntentGuard(page: Page): Promise<void> {
@@ -3702,6 +3720,48 @@ async function readDevSpaceUserTurnGeneration(page: Page): Promise<number> {
       return globalState.__devspaceRecoveryIntentState?.userTurnGeneration ?? 0;
     })
     .catch(() => 0);
+}
+
+async function readDevSpaceComposerInputGeneration(page: Page): Promise<number> {
+  if (page.isClosed()) return 0;
+  await installDevSpaceRecoveryIntentGuard(page);
+  return page
+    .evaluate(() => {
+      const globalState = window as typeof window & {
+        __devspaceRecoveryIntentState?: {
+          composerInputGeneration?: number;
+        };
+      };
+      return globalState.__devspaceRecoveryIntentState?.composerInputGeneration ?? 0;
+    })
+    .catch(() => 0);
+}
+
+interface DevSpaceRecoveryFence {
+  pageIdentity: string;
+  userTurnGeneration: number;
+  composerInputGeneration: number;
+}
+
+function devSpaceRecoveryPageIdentity(page: Page): string {
+  return chatConversationIdentityFromUrl(page.url()) ?? `url:${page.url()}`;
+}
+
+async function devSpaceRecoveryFenceIsCurrent(
+  page: Page,
+  fence: DevSpaceRecoveryFence,
+  signal?: AbortSignal,
+): Promise<boolean> {
+  if (page.isClosed() || signal?.aborted) return false;
+  if (devSpaceRecoveryPageIdentity(page) !== fence.pageIdentity) return false;
+  if (await hasDevSpaceManualStopLatch(page)) return false;
+  if ((await readDevSpaceUserTurnGeneration(page)) !== fence.userTurnGeneration) {
+    return false;
+  }
+  return (
+    (await readDevSpaceComposerInputGeneration(page)) ===
+    fence.composerInputGeneration
+  );
 }
 
 async function withDevSpaceAutoRecoveryAction<T>(
@@ -3848,6 +3908,112 @@ async function resumeInterruptedDevSpaceConversationViaComposer(
     submitted = true;
   });
   return submitted && !signal?.aborted;
+}
+
+async function resumeSilentDevSpaceConversationViaComposer(
+  page: Page,
+  fence: DevSpaceRecoveryFence,
+  prompt = "resume",
+  signal?: AbortSignal,
+): Promise<boolean> {
+  if (!(await devSpaceRecoveryFenceIsCurrent(page, fence, signal))) return false;
+  if (!(await isDevSpaceSilentStallCandidate(page))) return false;
+
+  const stopControls = await credibleLocators(page.locator(STOP_SELECTOR)).catch(
+    () => [] as Locator[],
+  );
+  if (stopControls.length > 0) return false;
+
+  const recoveryButtons = await credibleLocators(
+    page.getByRole("button", { name: DEVSPACE_NATIVE_RECOVERY_BUTTON_PATTERN }),
+    true,
+  ).catch(() => [] as Locator[]);
+  if (recoveryButtons.length > 0) return false;
+
+  let composer: Locator;
+  try {
+    composer = await findExactlyOneComposer(page, 1_000);
+  } catch {
+    return false;
+  }
+
+  const clearSyntheticPromptIfOwned = async (): Promise<void> => {
+    if (
+      normalizeText(await readComposerText(composer).catch(() => "")) !==
+      normalizeText(prompt)
+    ) {
+      return;
+    }
+    await withDevSpaceAutoRecoveryAction(page, () =>
+      composer.fill("").catch(() => undefined),
+    );
+  };
+
+  if (!(await devSpaceRecoveryFenceIsCurrent(page, fence, signal))) return false;
+  if (normalizeText(await readComposerText(composer).catch(() => "")) !== "") {
+    return false;
+  }
+
+  await withDevSpaceAutoRecoveryAction(page, () =>
+    insertAndVerifyPrompt(composer, prompt),
+  );
+
+  if (!(await devSpaceRecoveryFenceIsCurrent(page, fence, signal))) {
+    // The user may have typed or submitted while recovery was in flight. Once
+    // the fence is stale, do not mutate the composer even if it still happens
+    // to contain the literal recovery prompt.
+    return false;
+  }
+  if (!(await isDevSpaceSilentStallCandidate(page))) {
+    await clearSyntheticPromptIfOwned();
+    return false;
+  }
+
+  const activeStops = await credibleLocators(page.locator(STOP_SELECTOR)).catch(
+    () => [] as Locator[],
+  );
+  if (activeStops.length > 0) {
+    await clearSyntheticPromptIfOwned();
+    return false;
+  }
+
+  const sendControls = await credibleLocators(page.locator(SEND_SELECTOR), true).catch(
+    () => [] as Locator[],
+  );
+  if (sendControls.length !== 1) {
+    await clearSyntheticPromptIfOwned();
+    return false;
+  }
+  if (
+    normalizeText(await readComposerText(composer).catch(() => "")) !==
+    normalizeText(prompt)
+  ) {
+    return false;
+  }
+
+  let submissionAttempted = false;
+  await withDevSpaceAutoRecoveryAction(page, async () => {
+    if (!(await devSpaceRecoveryFenceIsCurrent(page, fence, signal))) return;
+    if (!(await isDevSpaceSilentStallCandidate(page))) return;
+    const finalStops = await credibleLocators(page.locator(STOP_SELECTOR)).catch(
+      () => [] as Locator[],
+    );
+    if (finalStops.length > 0) return;
+
+    // Once the click is attempted, consume this silent-stall episode even if
+    // the UI transition cannot be observed. Retrying an ambiguous send risks
+    // duplicating the user's tool work.
+    submissionAttempted = true;
+    await sendControls[0]!.click({ timeout: 5_000 }).catch(() => undefined);
+  });
+
+  if (!submissionAttempted) {
+    if (await devSpaceRecoveryFenceIsCurrent(page, fence, signal)) {
+      await clearSyntheticPromptIfOwned();
+    }
+    return false;
+  }
+  return true;
 }
 
 async function resumeDevSpaceConversation(
@@ -4094,8 +4260,10 @@ export async function watchForDevSpaceChatShareRecovery(
   let staleInterruptionSuppressedByUserTurn = false;
   let recoveryActionabilitySignature: string | undefined;
   let interruptionFingerprint: string | undefined;
+  let syntheticSilentContinuationFingerprint: string | undefined;
   await installDevSpaceRecoveryIntentGuard(page);
   let userTurnGeneration = await readDevSpaceUserTurnGeneration(page);
+  let composerInputGeneration = await readDevSpaceComposerInputGeneration(page);
   let activitySignature = await readChatShareActivitySignature(page);
   let lastActivityAtMs = Date.now();
 
@@ -4127,11 +4295,24 @@ export async function watchForDevSpaceChatShareRecovery(
         const userTurnChanged = nextUserTurnGeneration !== userTurnGeneration;
         if (userTurnChanged) {
           userTurnGeneration = nextUserTurnGeneration;
+          syntheticSilentContinuationFingerprint = undefined;
+          lastActivityAtMs = nowMs;
+        }
+
+        const nextComposerInputGeneration =
+          await readDevSpaceComposerInputGeneration(page);
+        const composerInputChanged =
+          nextComposerInputGeneration !== composerInputGeneration;
+        if (composerInputChanged) {
+          composerInputGeneration = nextComposerInputGeneration;
+          syntheticSilentContinuationFingerprint = undefined;
+          lastActivityAtMs = nowMs;
         }
 
         const nextSignature = await readChatShareActivitySignature(page);
         if (nextSignature !== activitySignature) {
           activitySignature = nextSignature;
+          syntheticSilentContinuationFingerprint = undefined;
           lastActivityAtMs = nowMs;
         }
 
@@ -4200,11 +4381,14 @@ export async function watchForDevSpaceChatShareRecovery(
           recoverySignal === "transient_gateway" ||
           recoverySignal === "generic_error";
         let silentStallAllowed = true;
+        let silentContinuationAllowed = false;
         if (recoverySignal === "none" && options.shouldRecoverSilentStall) {
           try {
             silentStallAllowed = await options.shouldRecoverSilentStall();
+            silentContinuationAllowed = silentStallAllowed;
           } catch {
             silentStallAllowed = false;
+            silentContinuationAllowed = false;
           }
         }
         const silentStall =
@@ -4274,13 +4458,35 @@ export async function watchForDevSpaceChatShareRecovery(
           recoveryActionabilitySignature = nextActionabilitySignature;
         }
 
+        const silentStallHasNativeRecoveryControl =
+          silentStall && (await hasDevSpaceNativeRecoveryControl(page));
+        const silentStallFingerprint =
+          silentStall && !silentStallHasNativeRecoveryControl
+            ? [
+                devSpaceRecoveryPageIdentity(page),
+                userTurnGeneration,
+                composerInputGeneration,
+                activitySignature,
+              ].join("\0")
+            : undefined;
         if (
           silentStall &&
-          !(await hasDevSpaceNativeRecoveryControl(page))
+          !silentStallHasNativeRecoveryControl &&
+          !silentContinuationAllowed
         ) {
-          // Silent stalls without a native recovery control remain detect-only,
-          // but the supervisor must stay alive so a later real interruption or
-          // recovery control can be handled without reopening the conversation.
+          // Synthetic continuation is opt-in through the managed-conversation
+          // ownership gate. Without that proof, keep the old detect-only
+          // behavior and continue watching for a later native interruption.
+          await page.waitForTimeout(Math.max(50, pollMs)).catch(() => undefined);
+          continue;
+        }
+        if (
+          silentStallFingerprint &&
+          syntheticSilentContinuationFingerprint === silentStallFingerprint
+        ) {
+          // Synthetic user-level continuation is one-shot for an unchanged
+          // silent tail. Observable conversation or composer activity changes
+          // the fingerprint and permits a fresh bounded recovery episode.
           await page.waitForTimeout(Math.max(50, pollMs)).catch(() => undefined);
           continue;
         }
@@ -4348,23 +4554,44 @@ export async function watchForDevSpaceChatShareRecovery(
               if (await hasDevSpaceManualStopLatch(page)) {
                 continue;
               }
+              const recoveryFence: DevSpaceRecoveryFence = {
+                pageIdentity: devSpaceRecoveryPageIdentity(page),
+                userTurnGeneration,
+                composerInputGeneration,
+              };
               await options.ensurePluginConnected?.();
               if (options.signal?.aborted) return acted;
+              if (silentStallHasNativeRecoveryControl) {
+                resumed = await resumeDevSpaceConversation(page, options.signal);
+              } else {
+                resumed = await resumeSilentDevSpaceConversationViaComposer(
+                  page,
+                  recoveryFence,
+                  "resume",
+                  options.signal,
+                );
+              }
+            } else {
+              resumed = await resumeDevSpaceConversation(page, options.signal);
             }
-            // Gateway/generic failures and silent stalls are retried only
-            // through a native UI control. Never synthesize a user-level
-            // "resume" instruction for those states.
-            resumed = await resumeDevSpaceConversation(page, options.signal);
           }
         }
         if (resumed) {
           acted = true;
-          // A successfully submitted interruption rescue must not be repeated
-          // merely because ChatShare leaves the old global interruption banner
-          // mounted. Preserve the existing bounded retry behavior for gateway,
-          // generic-error, and silent-stall native controls.
-          recoverySucceededForEpisode = interrupted;
-          recoverySucceededAtMs = interrupted ? Date.now() : 0;
+          if (
+            silentStall &&
+            !silentStallHasNativeRecoveryControl &&
+            silentStallFingerprint
+          ) {
+            syntheticSilentContinuationFingerprint = silentStallFingerprint;
+          }
+          // A successful interruption or silent-stall continuation is latched
+          // for the episode. Native recovery may re-arm after the confirmation
+          // window; synthetic continuation is additionally limited to one send
+          // per unchanged silent-tail fingerprint.
+          recoverySucceededForEpisode = interrupted || silentStall;
+          recoverySucceededAtMs =
+            interrupted || silentStall ? Date.now() : 0;
           staleInterruptionSuppressedByUserTurn = false;
           activitySignature = await readChatShareActivitySignature(page);
           lastActivityAtMs = Date.now();

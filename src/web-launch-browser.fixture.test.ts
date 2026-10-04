@@ -2952,6 +2952,312 @@ test("silent DevSpace tool tail resumes after idle but completed assistant tail 
   }
 });
 
+test("silent DevSpace tool tail without native recovery submits one bounded same-conversation resume", async () => {
+  const browser = await launchInstalledChrome();
+  try {
+    const context = await browser.newContext();
+    await context.route(
+      "https://chatshare.xyz/c/silent-fallback-12345678",
+      (route) =>
+        route.fulfill({
+          status: 200,
+          contentType: "text/html; charset=utf-8",
+          body: `<!doctype html><html><body><main>
+<div data-testid="conversation-turn-1"><p>User prompt</p></div>
+<div data-testid="conversation-turn-2"><p>Received an application response</p></div>
+<form>
+  <textarea id="prompt-textarea"></textarea>
+  <button data-testid="send-button" type="button">Send</button>
+</form>
+</main>
+<script>
+  document.querySelector('[data-testid="send-button"]').addEventListener('click', () => {
+    const composer = document.querySelector('#prompt-textarea');
+    document.body.dataset.resumeCount = String(Number(document.body.dataset.resumeCount || '0') + 1);
+    document.body.dataset.resumePrompt = composer.value;
+    composer.value = '';
+  });
+</script>
+</body></html>`,
+        }),
+    );
+    const page = await context.newPage();
+    await page.goto("https://chatshare.xyz/c/silent-fallback-12345678");
+
+    await watchForDevSpaceChatShareRecovery(page, 320, {
+      silentIdleMs: 40,
+      resumeCooldownMs: 40,
+      retryBudgetRearmMs: 60,
+      maxResumeAttempts: 1,
+      pollMs: 20,
+      shouldRecoverSilentStall: () => true,
+    });
+
+    assert.equal(await page.evaluate(() => document.body.dataset.resumeCount), "1");
+    assert.equal(await page.evaluate(() => document.body.dataset.resumePrompt), "resume");
+    await context.close();
+  } finally {
+    await browser.close();
+  }
+});
+
+test("parallel silent-stall recovery is isolated per conversation", async () => {
+  const browser = await launchInstalledChrome();
+  try {
+    const context = await browser.newContext();
+    const renderConversation = (label: string) => `<!doctype html><html><body><main>
+<div data-testid="conversation-turn-1"><p>User prompt ${label}</p></div>
+<div data-testid="conversation-turn-2"><p>Received an application response</p></div>
+<form>
+  <textarea id="prompt-textarea"></textarea>
+  <button data-testid="send-button" type="button">Send</button>
+</form>
+</main>
+<script>
+  document.querySelector('[data-testid="send-button"]').addEventListener('click', () => {
+    const composer = document.querySelector('#prompt-textarea');
+    document.body.dataset.resumeCount = String(Number(document.body.dataset.resumeCount || '0') + 1);
+    document.body.dataset.resumePrompt = composer.value;
+    composer.value = '';
+  });
+</script>
+</body></html>`;
+
+    await context.route(
+      "https://chatshare.xyz/c/parallel-silent-a-12345678",
+      (route) =>
+        route.fulfill({
+          status: 200,
+          contentType: "text/html; charset=utf-8",
+          body: renderConversation("A"),
+        }),
+    );
+    await context.route(
+      "https://chatshare.xyz/c/parallel-silent-b-12345678",
+      (route) =>
+        route.fulfill({
+          status: 200,
+          contentType: "text/html; charset=utf-8",
+          body: renderConversation("B"),
+        }),
+    );
+
+    const pageA = await context.newPage();
+    const pageB = await context.newPage();
+    await Promise.all([
+      pageA.goto("https://chatshare.xyz/c/parallel-silent-a-12345678"),
+      pageB.goto("https://chatshare.xyz/c/parallel-silent-b-12345678"),
+    ]);
+
+    let reconnectA = 0;
+    let reconnectB = 0;
+    await Promise.all([
+      watchForDevSpaceChatShareRecovery(pageA, 300, {
+        silentIdleMs: 40,
+        resumeCooldownMs: 40,
+        retryBudgetRearmMs: 1_000,
+        maxResumeAttempts: 1,
+        pollMs: 20,
+        shouldRecoverSilentStall: () => true,
+        ensurePluginConnected: async () => {
+          reconnectA += 1;
+          await pageA.waitForTimeout(10);
+        },
+      }),
+      watchForDevSpaceChatShareRecovery(pageB, 300, {
+        silentIdleMs: 40,
+        resumeCooldownMs: 40,
+        retryBudgetRearmMs: 1_000,
+        maxResumeAttempts: 1,
+        pollMs: 20,
+        shouldRecoverSilentStall: () => true,
+        ensurePluginConnected: async () => {
+          reconnectB += 1;
+          await pageB.waitForTimeout(25);
+        },
+      }),
+    ]);
+
+    assert.equal(reconnectA, 1);
+    assert.equal(reconnectB, 1);
+    assert.equal(await pageA.evaluate(() => document.body.dataset.resumeCount), "1");
+    assert.equal(await pageB.evaluate(() => document.body.dataset.resumeCount), "1");
+    assert.equal(await pageA.evaluate(() => document.body.dataset.resumePrompt), "resume");
+    assert.equal(await pageB.evaluate(() => document.body.dataset.resumePrompt), "resume");
+    await context.close();
+  } finally {
+    await browser.close();
+  }
+});
+
+test("silent synthetic resume is fenced by conversation identity and new user turns", async () => {
+  const browser = await launchInstalledChrome();
+  try {
+    const context = await browser.newContext();
+    const silentBody = `<!doctype html><html><body><main>
+<div data-testid="conversation-turn-1"><p>User prompt</p></div>
+<div data-testid="conversation-turn-2"><p>Received an application response</p></div>
+<form>
+  <textarea id="prompt-textarea"></textarea>
+  <button data-testid="send-button" type="button">Send</button>
+</form>
+</main>
+<script>
+  document.querySelector('[data-testid="send-button"]').addEventListener('click', () => {
+    const composer = document.querySelector('#prompt-textarea');
+    const value = composer.value;
+    document.body.dataset.submissionCount = String(Number(document.body.dataset.submissionCount || '0') + 1);
+    document.body.dataset.lastSubmission = value;
+    composer.value = '';
+    if (value !== 'resume') {
+      const stop = document.createElement('button');
+      stop.id = 'active-stop';
+      stop.setAttribute('data-testid', 'stop-button');
+      stop.setAttribute('aria-label', 'Stop generating');
+      stop.textContent = '■';
+      document.querySelector('main').appendChild(stop);
+    }
+  });
+</script>
+</body></html>`;
+
+    await context.route(
+      "https://chatshare.xyz/c/silent-fence-user-12345678",
+      (route) =>
+        route.fulfill({
+          status: 200,
+          contentType: "text/html; charset=utf-8",
+          body: silentBody,
+        }),
+    );
+    await context.route(
+      "https://chatshare.xyz/c/silent-fence-input-12345678",
+      (route) =>
+        route.fulfill({
+          status: 200,
+          contentType: "text/html; charset=utf-8",
+          body: silentBody,
+        }),
+    );
+    await context.route(
+      "https://chatshare.xyz/c/silent-fence-identity-12345678",
+      (route) =>
+        route.fulfill({
+          status: 200,
+          contentType: "text/html; charset=utf-8",
+          body: silentBody,
+        }),
+    );
+    await context.route(
+      "https://chatshare.xyz/c/silent-fence-switched-12345678",
+      (route) =>
+        route.fulfill({
+          status: 200,
+          contentType: "text/html; charset=utf-8",
+          body: "<!doctype html><html><body><main><p>Healthy switched conversation</p></main></body></html>",
+        }),
+    );
+
+    const userPage = await context.newPage();
+    await userPage.goto("https://chatshare.xyz/c/silent-fence-user-12345678");
+    let releaseUserRecovery!: () => void;
+    const userRecoveryGate = new Promise<void>((resolve) => {
+      releaseUserRecovery = resolve;
+    });
+    let userRecoveryStarted = false;
+    const userWatch = watchForDevSpaceChatShareRecovery(userPage, 320, {
+      silentIdleMs: 40,
+      resumeCooldownMs: 40,
+      retryBudgetRearmMs: 1_000,
+      maxResumeAttempts: 1,
+      pollMs: 20,
+      shouldRecoverSilentStall: () => true,
+      ensurePluginConnected: async () => {
+        userRecoveryStarted = true;
+        await userRecoveryGate;
+      },
+    });
+
+    const userDeadline = Date.now() + 1_000;
+    while (!userRecoveryStarted && Date.now() < userDeadline) {
+      await userPage.waitForTimeout(20);
+    }
+    assert.equal(userRecoveryStarted, true);
+    await userPage.locator("#prompt-textarea").fill("new user turn");
+    await userPage.locator('[data-testid="send-button"]').click();
+    releaseUserRecovery();
+    await userWatch;
+
+    assert.equal(await userPage.evaluate(() => document.body.dataset.submissionCount), "1");
+    assert.equal(await userPage.evaluate(() => document.body.dataset.lastSubmission), "new user turn");
+
+    const inputPage = await context.newPage();
+    await inputPage.goto("https://chatshare.xyz/c/silent-fence-input-12345678");
+    let releaseInputRecovery!: () => void;
+    const inputRecoveryGate = new Promise<void>((resolve) => {
+      releaseInputRecovery = resolve;
+    });
+    let inputRecoveryStarted = false;
+    const inputWatch = watchForDevSpaceChatShareRecovery(inputPage, 320, {
+      silentIdleMs: 40,
+      resumeCooldownMs: 40,
+      retryBudgetRearmMs: 1_000,
+      maxResumeAttempts: 1,
+      pollMs: 20,
+      shouldRecoverSilentStall: () => true,
+      ensurePluginConnected: async () => {
+        inputRecoveryStarted = true;
+        await inputRecoveryGate;
+      },
+    });
+
+    const inputDeadline = Date.now() + 1_000;
+    while (!inputRecoveryStarted && Date.now() < inputDeadline) {
+      await inputPage.waitForTimeout(20);
+    }
+    assert.equal(inputRecoveryStarted, true);
+    await inputPage.locator("#prompt-textarea").fill("draft user text");
+    releaseInputRecovery();
+    await inputWatch;
+
+    assert.equal(
+      await inputPage.evaluate(() => document.body.dataset.submissionCount),
+      undefined,
+    );
+    assert.equal(
+      await inputPage.locator("#prompt-textarea").inputValue(),
+      "draft user text",
+    );
+
+    const identityPage = await context.newPage();
+    await identityPage.goto("https://chatshare.xyz/c/silent-fence-identity-12345678");
+    let identityRecoveryStarted = false;
+    const identityWatch = watchForDevSpaceChatShareRecovery(identityPage, 320, {
+      silentIdleMs: 40,
+      resumeCooldownMs: 40,
+      retryBudgetRearmMs: 1_000,
+      maxResumeAttempts: 1,
+      pollMs: 20,
+      shouldRecoverSilentStall: () => true,
+      ensurePluginConnected: async () => {
+        identityRecoveryStarted = true;
+        await identityPage.goto("https://chatshare.xyz/c/silent-fence-switched-12345678");
+      },
+    });
+    await identityWatch;
+
+    assert.equal(identityRecoveryStarted, true);
+    assert.equal(
+      await identityPage.evaluate(() => document.body.dataset.submissionCount),
+      undefined,
+    );
+    assert.match(identityPage.url(), /silent-fence-switched-12345678$/);
+    await context.close();
+  } finally {
+    await browser.close();
+  }
+});
+
 test("Stopped talking to devspace is an immediate same-conversation resume trigger", async () => {
   const browser = await launchInstalledChrome();
   try {
