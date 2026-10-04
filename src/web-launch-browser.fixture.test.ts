@@ -30,6 +30,7 @@ import {
   prepareChatShareSession,
   refreshDevSpacePluginRegistration,
   readComposerText,
+  resolveDevSpacePluginId,
   resolveWebLaunchProfilePath,
   WebLaunchBrowserController,
   WebLaunchBrowserError,
@@ -131,6 +132,44 @@ test("DevSpace plugin identity is extracted only from bounded chat surface plugi
     undefined,
   );
   assert.equal(devSpacePluginIdFromUrl("https://chatgpt.com/plugins"), undefined);
+});
+
+test("multiple named DevSpace plugin registrations are rejected as ambiguous", async () => {
+  const browser = await launchInstalledChrome();
+  try {
+    const page = await browser.newPage();
+    await page.setContent(`<!doctype html><html><body>
+<a href="https://chatshare.xyz/plugins/plugin_asdk_app_duplicate11111111">DevSpace Local</a>
+<a href="https://chatshare.xyz/plugins/plugin_asdk_app_duplicate22222222">devspace</a>
+</body></html>`);
+
+    await assert.rejects(
+      resolveDevSpacePluginId(page, 300),
+      /found 2 DevSpace plugin registrations.*refusing an ambiguous connector state/i,
+    );
+    await page.close();
+  } finally {
+    await browser.close();
+  }
+});
+
+test("multiple named DevSpace plugin registrations are rejected as ambiguous", async () => {
+  const browser = await launchInstalledChrome();
+  try {
+    const page = await browser.newPage();
+    await page.setContent(`<!doctype html><html><body>
+<a href="https://chatshare.xyz/plugins/plugin_asdk_app_duplicate11111111">DevSpace Local</a>
+<a href="https://chatshare.xyz/plugins/plugin_asdk_app_duplicate22222222">devspace</a>
+</body></html>`);
+
+    await assert.rejects(
+      resolveDevSpacePluginId(page, 300),
+      /found 2 DevSpace plugin registrations.*refusing an ambiguous connector state/i,
+    );
+    await page.close();
+  } finally {
+    await browser.close();
+  }
 });
 
 test("process liveness distinguishes the current process from a dead PID", async () => {
@@ -759,7 +798,7 @@ test("ChatShare UI registration fallback enables developer settings before Brows
   }
 });
 
-test("ChatShare stale or disabled DevSpace plugin preflight re-registers OAuth and hands off to the final plugin tab", async () => {
+test("ChatShare stale DevSpace plugin preflight refuses to create a duplicate registration", async () => {
   const browser = await launchInstalledChrome();
   try {
     const context = await browser.newContext();
@@ -779,7 +818,6 @@ test("ChatShare stale or disabled DevSpace plugin preflight re-registers OAuth a
       <nav><button role="tab" id="general-nav" type="button">General</button><button role="tab" id="security-nav" type="button">Security and login</button><button role="tab" id="plugins-nav" type="button">Plugins</button></nav>
       <section>
         <a href="/#settings/Plugins/plugin_asdk_app_stale12345678">devspace stale</a>
-        <a href="/#settings/Plugins/plugin_asdk_app_disabled12345678">devspace disabled</a>
         <a id="browse-plugins" href="/plugins">Browse plugins</a>
         <div role="dialog" id="new-plugin" hidden>
           <h2>New Plugin</h2>
@@ -863,7 +901,6 @@ test("ChatShare stale or disabled DevSpace plugin preflight re-registers OAuth a
           body: `<!doctype html><html><body>
 <main>
   <a href="/plugins/plugin_asdk_app_stale12345678">devspace stale</a>
-  <a href="/plugins/plugin_asdk_app_disabled12345678">devspace disabled</a>
   <button id="browse-plugins" type="button">瀏覽插件</button>
   <section id="plugin-browser" hidden>
     <input placeholder="搜索插件" />
@@ -965,23 +1002,19 @@ test("ChatShare stale or disabled DevSpace plugin preflight re-registers OAuth a
 
     const page = await context.newPage();
     await page.goto("https://chatshare.xyz/");
-    const finalPage = await navigateToConnectedDevSpaceSurface(page, 3_000, {
-      refreshIfStale: true,
-      devSpacePublicBaseUrl: "https://devspace.fixture",
-      deviceProofProvider: async () => "C".repeat(43),
-    });
-
-    assert.equal(page.isClosed(), true);
-    assert.match(finalPage.url(), /surface=work/);
-    assert.equal(await finalPage.evaluate(() => localStorage.getItem("refresh-name")), "devspace");
-    assert.equal(
-      await finalPage.evaluate(() => localStorage.getItem("refresh-url")),
-      "https://devspace.fixture/mcp",
+    await assert.rejects(
+      navigateToConnectedDevSpaceSurface(page, 3_000, {
+        refreshIfStale: true,
+        devSpacePublicBaseUrl: "https://devspace.fixture",
+        deviceProofProvider: async () => "C".repeat(43),
+      }),
+      /stale schema.*refusing to create another registration/i,
     );
-    assert.equal(await finalPage.evaluate(() => localStorage.getItem("refresh-risk")), "true");
-    assert.equal(await finalPage.evaluate(() => document.body.dataset.settingsClosed), "true");
-    assert.equal(await finalPage.evaluate(() => document.body.dataset.tryInChatUsed), "true");
-    assert.equal(await findExactlyOneComposer(finalPage, 1_000).then(() => true), true);
+
+    assert.equal(page.isClosed(), false);
+    assert.equal(await page.evaluate(() => localStorage.getItem("refresh-name")), null);
+    assert.equal(await page.evaluate(() => localStorage.getItem("refresh-url")), null);
+    assert.equal(await page.evaluate(() => localStorage.getItem("refresh-risk")), null);
     await context.close();
   } finally {
     await browser.close();
@@ -1227,6 +1260,26 @@ test("ChatShare connected launch uses the already-connected fresh-chat fast path
 </body></html>`,
         });
       }
+      if (url.pathname === "/c/universal-switched-12345678") {
+        return route.fulfill({
+          status: 200,
+          contentType: "text/html; charset=utf-8",
+          body: `<!doctype html><html><body><main>
+<p>Stopped talking to devspace</p>
+<form>
+  <textarea id="prompt-textarea"></textarea>
+  <button data-testid="send-button" aria-label="Send prompt" type="button">↑</button>
+</form>
+</main>
+<script>
+  const composer = document.querySelector('#prompt-textarea');
+  document.querySelector('[data-testid="send-button"]').addEventListener('click', () => {
+    document.body.dataset.switchedResumeSubmitted = composer.value;
+  });
+</script>
+</body></html>`,
+        });
+      }
       if (url.pathname === "/plugins") {
         pluginPageRequests += 1;
         return route.fulfill({
@@ -1336,6 +1389,20 @@ test("ChatShare connected launch uses the already-connected fresh-chat fast path
     );
     assert.equal(
       await universalPage.evaluate(() => document.body.dataset.universalResumeSubmitted),
+      "resume",
+    );
+
+    // Reusing the same browser page for a different conversation must create a
+    // fresh recovery owner. The previous conversation's cooldown/attempt state
+    // must not delay or suppress recovery in the new identity.
+    await universalPage.goto("https://chatshare.xyz/c/universal-switched-12345678");
+    await universalPage.waitForFunction(
+      () => document.body.dataset.switchedResumeSubmitted === "resume",
+      undefined,
+      { timeout: 8_000 },
+    );
+    assert.equal(
+      await universalPage.evaluate(() => document.body.dataset.switchedResumeSubmitted),
       "resume",
     );
 
@@ -2116,6 +2183,304 @@ test("interruption rescue clicks stop, waits for the send arrow, then submits re
   }
 });
 
+test("aborted interruption rescue cannot submit resume after the page switches session", async () => {
+  const browser = await launchInstalledChrome();
+  try {
+    const context = await browser.newContext();
+    const page = await context.newPage();
+    await page.setContent(`<!doctype html><html><body><main>
+<p>Stopped talking to devspace</p>
+<form>
+  <textarea id="prompt-textarea"></textarea>
+  <button id="turn-control" data-testid="stop-button" aria-label="Stop generating" type="button">■</button>
+</form>
+</main>
+<script>
+  document.querySelector('#turn-control').addEventListener('click', () => {
+    document.body.dataset.oldSessionStopClicked = 'true';
+  });
+</script></body></html>`);
+
+    const abortController = new AbortController();
+    const watch = watchForDevSpaceChatShareRecovery(page, 2_000, {
+      signal: abortController.signal,
+      resumeCooldownMs: 20,
+      maxResumeAttempts: 1,
+      pollMs: 20,
+    });
+
+    await page.waitForFunction(
+      () => document.body.dataset.oldSessionStopClicked === "true",
+      undefined,
+      { timeout: 1_500 },
+    );
+    abortController.abort();
+
+    await page.setContent(`<!doctype html><html><body><main>
+<p>New session</p>
+<form>
+  <textarea id="prompt-textarea"></textarea>
+  <button data-testid="send-button" aria-label="Send prompt" type="button">↑</button>
+</form>
+</main>
+<script>
+  const composer = document.querySelector('#prompt-textarea');
+  document.querySelector('[data-testid="send-button"]').addEventListener('click', () => {
+    document.body.dataset.leakedResume = composer.value;
+  });
+</script></body></html>`);
+
+    await watch;
+    await page.waitForTimeout(80);
+    assert.equal(await page.evaluate(() => document.body.dataset.leakedResume), undefined);
+    assert.equal(await page.locator("#prompt-textarea").inputValue(), "");
+    await context.close();
+  } finally {
+    await browser.close();
+  }
+});
+
+test("replacement recovery watcher can take ownership of the same page", async () => {
+  const browser = await launchInstalledChrome();
+  try {
+    const context = await browser.newContext();
+    const page = await context.newPage();
+    await page.setContent(`<!doctype html><html><body><main>
+<p>Stopped talking to devspace</p>
+<button id="resume" type="button">resume</button>
+</main>
+<script>
+  document.querySelector('#resume').addEventListener('click', () => {
+    document.body.dataset.replacementWatcherResumed = 'true';
+  });
+</script></body></html>`);
+
+    const firstAbort = new AbortController();
+    const firstWatch = watchForDevSpaceChatShareRecovery(page, 1_000, {
+      signal: firstAbort.signal,
+      pollMs: 20,
+      shouldRecover: () => false,
+    });
+    await page.waitForTimeout(80);
+
+    firstAbort.abort();
+    const replacementWatch = watchForDevSpaceChatShareRecovery(page, 300, {
+      replaceActiveWatch: true,
+      resumeCooldownMs: 20,
+      maxResumeAttempts: 1,
+      pollMs: 20,
+    });
+
+    await replacementWatch;
+    await firstWatch;
+    assert.equal(
+      await page.evaluate(() => document.body.dataset.replacementWatcherResumed),
+      "true",
+    );
+    await context.close();
+  } finally {
+    await browser.close();
+  }
+});
+
+test("recovery retry budget re-arms when interruption controls become actionable", async () => {
+  const browser = await launchInstalledChrome();
+  try {
+    const context = await browser.newContext();
+    const page = await context.newPage();
+    await page.setContent(`<!doctype html><html><body><main>
+<p>Stopped talking to devspace</p>
+</main></body></html>`);
+
+    const watch = watchForDevSpaceChatShareRecovery(page, 800, {
+      resumeCooldownMs: 20,
+      maxResumeAttempts: 1,
+      pollMs: 20,
+      ensurePluginConnected: async () => undefined,
+    });
+
+    await page.waitForTimeout(100);
+    await page.evaluate(() => {
+      const button = document.createElement("button");
+      button.id = "late-resume";
+      button.type = "button";
+      button.textContent = "resume";
+      button.addEventListener("click", () => {
+        const count = Number(document.body.dataset.lateResumeClicks ?? "0") + 1;
+        document.body.dataset.lateResumeClicks = String(count);
+      });
+      document.querySelector("main")?.appendChild(button);
+    });
+
+    await watch;
+    assert.equal(await page.evaluate(() => document.body.dataset.lateResumeClicks), "1");
+    await context.close();
+  } finally {
+    await browser.close();
+  }
+});
+
+test("successful recovery suppresses duplicate resumes while the same interruption persists", async () => {
+  const browser = await launchInstalledChrome();
+  try {
+    const context = await browser.newContext();
+    const page = await context.newPage();
+    await page.setContent(`<!doctype html><html><body><main>
+<p>Stopped talking to devspace</p>
+<button id="resume" type="button">resume</button>
+</main>
+<script>
+  document.querySelector('#resume').addEventListener('click', () => {
+    const count = Number(document.body.dataset.resumeClicks ?? '0') + 1;
+    document.body.dataset.resumeClicks = String(count);
+  });
+</script></body></html>`);
+
+    await watchForDevSpaceChatShareRecovery(page, 220, {
+      resumeCooldownMs: 20,
+      retryBudgetRearmMs: 500,
+      maxResumeAttempts: 3,
+      pollMs: 20,
+    });
+
+    assert.equal(await page.evaluate(() => document.body.dataset.resumeClicks), "1");
+    await context.close();
+  } finally {
+    await browser.close();
+  }
+});
+
+test("successful recovery re-arms if the same interruption never clears", async () => {
+  const browser = await launchInstalledChrome();
+  try {
+    const context = await browser.newContext();
+    const page = await context.newPage();
+    await page.setContent(`<!doctype html><html><body><main>
+<p>Stopped talking to devspace</p>
+<button id="resume" type="button">resume</button>
+</main>
+<script>
+  document.querySelector('#resume').addEventListener('click', () => {
+    const count = Number(document.body.dataset.resumeClicks ?? '0') + 1;
+    document.body.dataset.resumeClicks = String(count);
+  });
+</script></body></html>`);
+
+    await watchForDevSpaceChatShareRecovery(page, 260, {
+      resumeCooldownMs: 20,
+      retryBudgetRearmMs: 80,
+      maxResumeAttempts: 1,
+      pollMs: 20,
+    });
+
+    const resumeClicks = Number(
+      await page.evaluate(() => document.body.dataset.resumeClicks ?? "0"),
+    );
+    assert.ok(resumeClicks >= 2);
+    assert.ok(resumeClicks <= 4);
+    await context.close();
+  } finally {
+    await browser.close();
+  }
+});
+
+test("stale global interruption does not re-fire until the interruption marker is freshly rendered", async () => {
+  const browser = await launchInstalledChrome();
+  try {
+    const context = await browser.newContext();
+    const page = await context.newPage();
+    await page.setContent(`<!doctype html><html><body><main>
+<p id="interruption">Stopped talking to devspace</p>
+<form>
+  <textarea id="prompt-textarea"></textarea>
+  <button id="send" data-testid="send-button" aria-label="Send prompt" type="button">send</button>
+</form>
+<button id="resume" type="button">resume</button>
+</main>
+<script>
+  document.querySelector('#resume').addEventListener('click', () => {
+    const count = Number(document.body.dataset.resumeClicks ?? '0') + 1;
+    document.body.dataset.resumeClicks = String(count);
+    if (count >= 2) document.querySelector('#interruption')?.remove();
+  });
+</script></body></html>`);
+
+    const watch = watchForDevSpaceChatShareRecovery(page, 700, {
+      resumeCooldownMs: 20,
+      retryBudgetRearmMs: 80,
+      maxResumeAttempts: 1,
+      pollMs: 20,
+    });
+
+    await page.waitForFunction(
+      () => document.body.dataset.resumeClicks === "1",
+      undefined,
+      { timeout: 1_000 },
+    );
+
+    // A normal user submission must not make an already-handled global banner
+    // look like a fresh interruption and trigger another automatic resume.
+    await page.locator("#send").click();
+    await page.waitForTimeout(100);
+    assert.equal(await page.evaluate(() => document.body.dataset.resumeClicks), "1");
+
+    // ChatShare may reuse the same banner element for the next failure.
+    // Re-rendering its text subtree, even with identical text, must advance the
+    // interruption generation and arm a new recovery episode.
+    await page.locator("#interruption").evaluate((element) => {
+      element.textContent = element.textContent;
+    });
+    await page.waitForFunction(
+      () => document.body.dataset.resumeClicks === "2",
+      undefined,
+      { timeout: 1_000 },
+    );
+
+    await watch;
+    assert.equal(await page.evaluate(() => document.body.dataset.resumeClicks), "2");
+    await context.close();
+  } finally {
+    await browser.close();
+  }
+});
+
+test("user submission suppresses the same stale interruption after a failed auto-resume", async () => {
+  const browser = await launchInstalledChrome();
+  try {
+    const context = await browser.newContext();
+    const page = await context.newPage();
+    await page.setContent(`<!doctype html><html><body><main>
+<p id="interruption">Stopped talking to devspace</p>
+<button id="send" data-testid="send-button" aria-label="Send prompt" type="button">send</button>
+</main></body></html>`);
+
+    let reconnectAttempts = 0;
+    const watch = watchForDevSpaceChatShareRecovery(page, 1_600, {
+      resumeCooldownMs: 20,
+      retryBudgetRearmMs: 80,
+      maxResumeAttempts: 1,
+      pollMs: 20,
+      ensurePluginConnected: async () => {
+        reconnectAttempts += 1;
+      },
+    });
+
+    const reconnectDeadline = Date.now() + 1_000;
+    while (reconnectAttempts < 1 && Date.now() < reconnectDeadline) {
+      await page.waitForTimeout(20);
+    }
+    assert.equal(reconnectAttempts, 1);
+
+    await page.locator("#send").click();
+    await watch;
+
+    assert.equal(reconnectAttempts, 1);
+    await context.close();
+  } finally {
+    await browser.close();
+  }
+});
+
 test("failed recovery attempts consume the retry budget and cannot thrash plugin reconnect", async () => {
   const browser = await launchInstalledChrome();
   try {
@@ -2134,6 +2499,71 @@ test("failed recovery attempts consume the retry budget and cannot thrash plugin
     });
 
     assert.equal(reconnectAttempts, 1);
+    await context.close();
+  } finally {
+    await browser.close();
+  }
+});
+
+test("exhausted retry budget re-arms later without requiring UI shape changes", async () => {
+  const browser = await launchInstalledChrome();
+  try {
+    const context = await browser.newContext();
+    const page = await context.newPage();
+    await page.setContent("<main><p>Stopped talking to devspace</p></main>");
+
+    let reconnectAttempts = 0;
+    await watchForDevSpaceChatShareRecovery(page, 2_400, {
+      resumeCooldownMs: 20,
+      retryBudgetRearmMs: 80,
+      maxResumeAttempts: 1,
+      pollMs: 20,
+      ensurePluginConnected: async () => {
+        reconnectAttempts += 1;
+      },
+    });
+
+    assert.ok(reconnectAttempts >= 2);
+    assert.ok(reconnectAttempts <= 3);
+    await context.close();
+  } finally {
+    await browser.close();
+  }
+});
+
+test("silent detect-only recovery keeps watching for a later actionable interruption", async () => {
+  const browser = await launchInstalledChrome();
+  try {
+    const context = await browser.newContext();
+    const page = await context.newPage();
+    await page.setContent(`<!doctype html><html><body><main>
+<div data-testid="conversation-turn-1"><p>Received an application response</p></div>
+</main></body></html>`);
+
+    const watch = watchForDevSpaceChatShareRecovery(page, 700, {
+      silentIdleMs: 40,
+      resumeCooldownMs: 20,
+      maxResumeAttempts: 1,
+      pollMs: 20,
+      shouldRecoverSilentStall: () => true,
+    });
+
+    await page.waitForTimeout(120);
+    await page.setContent(`<!doctype html><html><body><main>
+<p>Connection interrupted</p>
+<button id="resume" type="button">resume</button>
+</main>
+<script>
+  document.querySelector('#resume').addEventListener('click', () => {
+    document.body.dataset.resumedAfterSilentStall = 'true';
+  });
+</script></body></html>`);
+
+    await watch;
+    assert.equal(
+      await page.evaluate(() => document.body.dataset.resumedAfterSilentStall),
+      "true",
+    );
     await context.close();
   } finally {
     await browser.close();
@@ -2255,7 +2685,7 @@ test("manual Stop suppresses auto-resume until the user sends again", async () =
 </body></html>`);
 
     let reconnectAttempts = 0;
-    const watch = watchForDevSpaceChatShareRecovery(page, 15_000, {
+    const watch = watchForDevSpaceChatShareRecovery(page, 1_200, {
       resumeCooldownMs: 20,
       maxResumeAttempts: 1,
       pollMs: 20,
