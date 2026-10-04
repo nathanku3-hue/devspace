@@ -5,24 +5,39 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 const chromePath = String.raw`C:\Users\Lenovo\AppData\Local\ms-playwright\chromium-1208\chrome-win64\chrome.exe`;
-const debugPort = 19000 + Math.floor(Math.random() * 1000);
+const debugPort = await findAvailablePort();
 const appPort = 9449;
 const profile = await mkdtemp(join(tmpdir(), "chatshare-rescue-test-"));
 const bootstrap = await readFile(new URL("./callback-bootstrap.js", import.meta.url), "utf8");
 let receivedBody = null;
+let authenticated = false;
+let callbackAttempts = 0;
 
 const assets = {
   "/mock-route.js": `import{n as e}from"./mock-support.js";export default function(){return null}`,
   "/mock-support.js": `import{Xkt as w}from"./mock-api-client.js";export function n(){return w.safePost(\`/aip/connectors/links/oauth/callback\`,{requestBody:{}})}`,
-  "/mock-api-client.js": `export const Xkt={async safePost(path,options){const response=await fetch(path,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(options.requestBody)});if(!response.ok)throw new Error("callback "+response.status);return response.json()}};`,
+  "/mock-api-client.js": `export const Xkt={async safePost(path,options){const response=await fetch(path,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(options.requestBody)});const body=await response.json().catch(()=>null);if(!response.ok)throw new Error(body?.error||("callback "+response.status));return body}};`,
 };
 
 const server = createServer(async (request, response) => {
   if (request.method === "POST" && request.url === "/aip/connectors/links/oauth/callback") {
     let body = "";
     for await (const chunk of request) body += chunk;
-    receivedBody = JSON.parse(body);
-    const redirectUrl = String(receivedBody.full_redirect_url ?? "");
+    const requestBody = JSON.parse(body);
+    const redirectUrl = String(requestBody.full_redirect_url ?? "");
+    callbackAttempts += 1;
+    if (redirectUrl.includes("dummy-logged-out-state") && !authenticated) {
+      response.writeHead(401, { "Content-Type": "application/json" });
+      response.end(JSON.stringify({ error: "unauthorized" }));
+      return;
+    }
+    if (redirectUrl.includes("dummy-owner-mismatch-state")) {
+      receivedBody = requestBody;
+      response.writeHead(403, { "Content-Type": "application/json" });
+      response.end(JSON.stringify({ error: "OAuth link is not owned by the user" }));
+      return;
+    }
+    receivedBody = requestBody;
     let payload = { post_auth_url: "/success" };
     if (redirectUrl.includes("dummy-work-state")) {
       payload = {
@@ -43,6 +58,13 @@ const server = createServer(async (request, response) => {
   if (assets[request.url]) {
     response.writeHead(200, { "Content-Type": "text/javascript; charset=utf-8" });
     response.end(assets[request.url]);
+    return;
+  }
+
+  if (request.method === "POST" && request.url === "/mock-login") {
+    authenticated = true;
+    response.writeHead(204);
+    response.end();
     return;
   }
 
@@ -145,6 +167,128 @@ try {
   }
 
   receivedBody = null;
+  authenticated = false;
+  callbackAttempts = 0;
+  await cdp.call("Runtime.evaluate", { expression: "sessionStorage.clear()", returnByValue: true });
+  const loggedOutCallback = `/connector/oauth/test-id?code=dummy-code&state=dummy-logged-out-state`;
+  await cdp.call("Page.navigate", {
+    url: `http://127.0.0.1:${appPort}/#cs_oauth_callback=${loggedOutCallback}`,
+  });
+
+  await waitFor(async () => {
+    const result = await cdp.call("Runtime.evaluate", {
+      expression:
+        "location.pathname.startsWith('/pastel') && location.hash.startsWith('#/login')",
+      returnByValue: true,
+    });
+    return result.result.value === true;
+  }, 8000, "logged-out callback redirected to login");
+
+  const pendingWhileLoggedOut = await cdp.call("Runtime.evaluate", {
+    expression: `({
+      pending: sessionStorage.getItem("chatshare-oauth-callback-rescue-pending"),
+      status: sessionStorage.getItem("chatshare-oauth-callback-rescue-status")
+    })`,
+    returnByValue: true,
+  });
+  if (pendingWhileLoggedOut.result.value?.pending !== loggedOutCallback) {
+    throw new Error(`Logged-out callback was not preserved: ${JSON.stringify(pendingWhileLoggedOut.result.value)}`);
+  }
+  if (pendingWhileLoggedOut.result.value?.status !== "redirecting-to-login") {
+    throw new Error(`Unexpected logged-out status: ${JSON.stringify(pendingWhileLoggedOut.result.value)}`);
+  }
+
+  await cdp.call("Runtime.evaluate", {
+    expression: `fetch("/mock-login", { method: "POST" }).then(() => { location.hash = "#/carlist"; })`,
+    awaitPromise: true,
+    returnByValue: true,
+  });
+
+  await waitFor(() => receivedBody !== null, 8000, "resumed callback POST after login");
+  await waitFor(async () => {
+    const result = await cdp.call("Runtime.evaluate", {
+      expression: "location.pathname === '/success'",
+      returnByValue: true,
+    });
+    return result.result.value === true;
+  }, 8000, "logged-out callback success redirect");
+
+  const loggedOutExpected = `http://127.0.0.1:${appPort}${loggedOutCallback}`;
+  if (receivedBody?.full_redirect_url !== loggedOutExpected) {
+    throw new Error(`Unexpected resumed callback body: ${JSON.stringify(receivedBody)}`);
+  }
+  if (callbackAttempts !== 2) {
+    throw new Error(`Expected one unauthorized callback attempt and one resumed success, got ${callbackAttempts}`);
+  }
+
+  receivedBody = null;
+  authenticated = true;
+  callbackAttempts = 0;
+  await cdp.call("Runtime.evaluate", { expression: "sessionStorage.clear()", returnByValue: true });
+  const ownerMismatchCallback = `/connector/oauth/test-id?code=dummy-code&state=dummy-owner-mismatch-state`;
+  await cdp.call("Page.navigate", {
+    url: `http://127.0.0.1:${appPort}/#cs_oauth_callback=${ownerMismatchCallback}`,
+  });
+
+  await waitFor(async () => {
+    const result = await cdp.call("Runtime.evaluate", {
+      expression:
+        "document.body?.innerText.includes('OAuth link is not owned by the user') && document.body?.innerText.includes('will not be replayed')",
+      returnByValue: true,
+    });
+    return result.result.value === true;
+  }, 8000, "ownership mismatch recovery page");
+
+  const ownerMismatchState = await cdp.call("Runtime.evaluate", {
+    expression: `({
+      status: sessionStorage.getItem("chatshare-oauth-callback-rescue-status"),
+      pending: sessionStorage.getItem("chatshare-oauth-callback-rescue-pending"),
+      attempt: sessionStorage.getItem("chatshare-oauth-callback-rescue:dummy-owner-mismatch-state"),
+      action: document.querySelector("a")?.getAttribute("href")
+    })`,
+    returnByValue: true,
+  });
+  const ownerMismatchValue = ownerMismatchState.result.value;
+  if (ownerMismatchValue?.status !== "ownership-mismatch") {
+    throw new Error(`Unexpected ownership mismatch status: ${JSON.stringify(ownerMismatchValue)}`);
+  }
+  if (ownerMismatchValue?.pending !== null) {
+    throw new Error(`Ownership mismatch callback remained pending: ${JSON.stringify(ownerMismatchValue)}`);
+  }
+  if (ownerMismatchValue?.attempt !== "ownership-rejected") {
+    throw new Error(`Ownership mismatch callback was not marked rejected: ${JSON.stringify(ownerMismatchValue)}`);
+  }
+  if (ownerMismatchValue?.action !== "/plugins") {
+    throw new Error(`Ownership mismatch recovery did not point to connector settings: ${JSON.stringify(ownerMismatchValue)}`);
+  }
+  if (callbackAttempts !== 1) {
+    throw new Error(`Expected exactly one ownership-mismatch callback attempt, got ${callbackAttempts}`);
+  }
+
+  await cdp.call("Page.navigate", {
+    url: `http://127.0.0.1:${appPort}/?replay=1#cs_oauth_callback=${ownerMismatchCallback}`,
+  });
+  await waitFor(async () => {
+    const result = await cdp.call("Runtime.evaluate", {
+      expression: "document.body?.innerText.includes('no longer eligible for rescue')",
+      returnByValue: true,
+    });
+    return result.result.value === true;
+  }, 8000, "ownership mismatch replay guard");
+  if (callbackAttempts !== 1) {
+    throw new Error(`Rejected ownership callback was replayed; attempts=${callbackAttempts}`);
+  }
+  const replayPending = await cdp.call("Runtime.evaluate", {
+    expression: `sessionStorage.getItem("chatshare-oauth-callback-rescue-pending")`,
+    returnByValue: true,
+  });
+  if (replayPending.result.value !== null) {
+    throw new Error(`Rejected ownership callback was restored as pending: ${JSON.stringify(replayPending.result.value)}`);
+  }
+
+  receivedBody = null;
+  authenticated = true;
+  callbackAttempts = 0;
   await cdp.call("Runtime.evaluate", { expression: "sessionStorage.clear()", returnByValue: true });
   const workCallback = `/connector/oauth/test-id?code=dummy-code&state=dummy-work-state`;
   await cdp.call("Page.navigate", {
@@ -237,6 +381,11 @@ try {
     productionErrorPrevented: true,
     submittedThroughChatshareClient: true,
     postedFullRedirectUrlMatches: true,
+    loggedOutRedirectedToLogin: true,
+    loggedOutCallbackPreserved: true,
+    resumedCallbackAfterLogin: true,
+    ownershipMismatchStopsReplay: true,
+    ownershipMismatchReturnsToConnectorSettings: true,
     leftWorkSurfaceBeforeCallback: true,
     openedConnectorShellBeforeCallback: true,
     stayedOnPluginsInsteadOfMissingRoute: true,
@@ -263,6 +412,22 @@ try {
       await new Promise((resolve) => setTimeout(resolve, 200));
     }
   }
+}
+
+async function findAvailablePort() {
+  const probe = createServer();
+  await new Promise((resolve, reject) => {
+    probe.once("error", reject);
+    probe.listen(0, "127.0.0.1", resolve);
+  });
+  const address = probe.address();
+  if (!address || typeof address === "string") {
+    throw new Error("Could not allocate a local Chromium debugger port");
+  }
+  await new Promise((resolve, reject) => {
+    probe.close((error) => (error ? reject(error) : resolve()));
+  });
+  return address.port;
 }
 
 async function waitForDebugger() {

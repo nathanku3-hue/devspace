@@ -67,9 +67,16 @@
   }
 
   const attemptKey = `chatshare-oauth-callback-rescue:${state}`;
-  if (sessionStorage.getItem(attemptKey) === "navigated") {
+  const previousAttempt = sessionStorage.getItem(attemptKey);
+  if (previousAttempt === "navigated" || previousAttempt === "ownership-rejected") {
+    sessionStorage.removeItem(pendingKey);
+    sessionStorage.removeItem(returnKey);
     renderFailure(
-      "This OAuth callback has already been processed once. Return to connector settings and start a fresh authorization.",
+      "This OAuth callback is no longer eligible for rescue. Return to connector settings and start a fresh authorization.",
+      {
+        actionHref: connectorShellPath,
+        actionLabel: "Return to connector settings",
+      },
     );
     return;
   }
@@ -140,6 +147,10 @@
           .then(() => submitRescuedCallback(manifestPatch.manifest()))
           .then((result) => finishWithPostAuth(result))
           .catch((error) => {
+            if (isOwnershipError(error)) {
+              handleOwnershipMismatch(error);
+              return;
+            }
             renderFailure(
               `Chatshare rejected the rescued callback: ${safeErrorMessage(error)}`,
             );
@@ -190,26 +201,20 @@
     }
 
     sessionStorage.setItem(rescueStatusKey, "submitting-callback");
-    const deadline = Date.now() + 15000;
-    let lastError;
-
-    while (Date.now() < deadline) {
-      try {
-        const result = await client.safePost(callbackApiPath, {
-          requestBody: { full_redirect_url: fullRedirectUrl },
-        });
-        if (!result || typeof result !== "object") {
-          throw new Error("Chatshare returned an empty callback response.");
-        }
-        return result;
-      } catch (error) {
-        lastError = error;
-        if (!isMissingAuthError(error)) throw error;
-        await sleep(200);
+    try {
+      const result = await client.safePost(callbackApiPath, {
+        requestBody: { full_redirect_url: fullRedirectUrl },
+      });
+      if (!result || typeof result !== "object") {
+        throw new Error("Chatshare returned an empty callback response.");
       }
+      return result;
+    } catch (error) {
+      if (!isMissingAuthError(error)) throw error;
+      sessionStorage.setItem(rescueStatusKey, "redirecting-to-login");
+      location.replace(loginPath);
+      return new Promise(() => {});
     }
-
-    throw lastError ?? new Error("Chatshare is not authenticated yet.");
   }
 
   async function resolveChatshareApiClient(manifest) {
@@ -442,8 +447,22 @@
     return message.includes("no access token") || message.includes("unauthorized") || message.includes("401");
   }
 
-  function sleep(ms) {
-    return new Promise((resolve) => window.setTimeout(resolve, ms));
+  function isOwnershipError(error) {
+    return /oauth link is not owned by the user/i.test(safeErrorMessage(error));
+  }
+
+  function handleOwnershipMismatch(error) {
+    sessionStorage.setItem(attemptKey, "ownership-rejected");
+    sessionStorage.setItem(rescueStatusKey, "ownership-mismatch");
+    sessionStorage.removeItem(pendingKey);
+    sessionStorage.removeItem(returnKey);
+    renderFailure(
+      `Chatshare rejected this OAuth link for the current user: ${safeErrorMessage(error)}. The rejected callback will not be replayed. Sign in to the intended Chatshare account, then start a fresh authorization from connector settings.`,
+      {
+        actionHref: connectorShellPath,
+        actionLabel: "Return to connector settings",
+      },
+    );
   }
 
   function readCallbackUrl() {
@@ -555,8 +574,10 @@
     }, 200);
   }
 
-  function renderFailure(message) {
+  function renderFailure(message, options = {}) {
     const safeMessage = escapeHtml(message);
+    const actionHref = escapeHtml(options.actionHref ?? "/pastel/");
+    const actionLabel = escapeHtml(options.actionLabel ?? "Open Chatshare login");
     document.open();
     document.write(`<!doctype html>
 <html lang="en">
@@ -578,7 +599,7 @@
     <h1>OAuth callback rescue stopped</h1>
     <p>${safeMessage}</p>
     <p>Status: <code>${escapeHtml(sessionStorage.getItem(rescueStatusKey) ?? "unknown")}</code></p>
-    <p><a href="/pastel/">Open Chatshare login</a></p>
+    <p><a href="${actionHref}">${actionLabel}</a></p>
     <p>No authorization code, access token, or refresh token was logged or copied by this extension.</p>
   </main>
 </body>
