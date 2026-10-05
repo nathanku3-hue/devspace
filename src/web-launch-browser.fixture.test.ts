@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -1184,6 +1184,11 @@ test("ChatShare connected launch uses the already-connected fresh-chat fast path
   let controller: WebLaunchBrowserController | undefined;
   try {
     const context = await browser.newContext();
+    const recoveryMonitorSource = await readFile(
+      new URL("../chatshare-oauth-rescue-extension/recovery-monitor.js", import.meta.url),
+      "utf8",
+    );
+    await context.addInitScript(recoveryMonitorSource);
     let pluginPageRequests = 0;
     await context.route("https://chatshare.xyz/**", async (route) => {
       const url = new URL(route.request().url());
@@ -1235,46 +1240,6 @@ test("ChatShare connected launch uses the already-connected fresh-chat fast path
       return;
     }
     document.body.dataset.universalResumeSubmitted = composer.value;
-  });
-</script>
-</body></html>`,
-        });
-      }
-      if (url.pathname === "/c/universal-generic-12345678") {
-        return route.fulfill({
-          status: 200,
-          contentType: "text/html; charset=utf-8",
-          body: `<!doctype html><html><body><main>
-<p>Connection interrupted</p>
-<form>
-  <textarea id="prompt-textarea"></textarea>
-  <button data-testid="send-button" aria-label="Send prompt" type="button">↑</button>
-</form>
-</main>
-<script>
-  const composer = document.querySelector('#prompt-textarea');
-  document.querySelector('[data-testid="send-button"]').addEventListener('click', () => {
-    document.body.dataset.genericResumeSubmitted = composer.value;
-  });
-</script>
-</body></html>`,
-        });
-      }
-      if (url.pathname === "/c/universal-switched-12345678") {
-        return route.fulfill({
-          status: 200,
-          contentType: "text/html; charset=utf-8",
-          body: `<!doctype html><html><body><main>
-<p>Stopped talking to devspace</p>
-<form>
-  <textarea id="prompt-textarea"></textarea>
-  <button data-testid="send-button" aria-label="Send prompt" type="button">↑</button>
-</form>
-</main>
-<script>
-  const composer = document.querySelector('#prompt-textarea');
-  document.querySelector('[data-testid="send-button"]').addEventListener('click', () => {
-    document.body.dataset.switchedResumeSubmitted = composer.value;
   });
 </script>
 </body></html>`,
@@ -1378,53 +1343,87 @@ test("ChatShare connected launch uses the already-connected fresh-chat fast path
     assert.equal(await conversationPage.evaluate(() => document.body.dataset.submitted), prompt);
     assert.equal(acknowledgement.launchSuccess, true);
 
-    await universalPage.waitForFunction(
-      () => document.body.dataset.universalResumeSubmitted === "resume",
-      undefined,
-      { timeout: 8_000 },
-    );
+    await universalPage.waitForTimeout(700);
     assert.equal(
       await universalPage.evaluate(() => document.body.dataset.universalStopClicked),
-      "true",
+      undefined,
     );
     assert.equal(
       await universalPage.evaluate(() => document.body.dataset.universalResumeSubmitted),
-      "resume",
-    );
-
-    // Reusing the same browser page for a different conversation must create a
-    // fresh recovery owner. The previous conversation's cooldown/attempt state
-    // must not delay or suppress recovery in the new identity.
-    await universalPage.goto("https://chatshare.xyz/c/universal-switched-12345678");
-    await universalPage.waitForFunction(
-      () => document.body.dataset.switchedResumeSubmitted === "resume",
       undefined,
-      { timeout: 8_000 },
     );
     assert.equal(
-      await universalPage.evaluate(() => document.body.dataset.switchedResumeSubmitted),
-      "resume",
+      await universalPage.getAttribute("html", "data-devspace-recovery-lease"),
+      null,
     );
 
-    const pluginRequestsBeforeGenericRecovery = pluginPageRequests;
-    const genericPage = await context.newPage();
-    await genericPage.goto("https://chatshare.xyz/c/universal-generic-12345678");
-    await genericPage.waitForFunction(
-      () => document.body.dataset.genericResumeSubmitted === "resume",
+    await conversationPage.waitForFunction(
+      (expectedLease) =>
+        document.documentElement.getAttribute("data-devspace-recovery-lease") ===
+        expectedLease,
+      acknowledgement.conversationIdentitySha256,
+      { timeout: 1_000 },
+    );
+
+    const pluginRequestsBeforeEventRecovery = pluginPageRequests;
+    const eventRecoveryStartedAt = Date.now();
+    await conversationPage.evaluate(() => {
+      const interruption = document.createElement("p");
+      interruption.textContent = "Stopped talking to devspace";
+      document.querySelector("main")?.appendChild(interruption);
+
+      const stop = document.createElement("button");
+      stop.type = "button";
+      stop.dataset.testid = "stop-button";
+      stop.setAttribute("aria-label", "Stop generating");
+      stop.textContent = "■";
+      stop.addEventListener("click", () => stop.remove());
+      document.querySelector("main")?.appendChild(stop);
+    });
+    await conversationPage.waitForFunction(
+      () => document.body.dataset.submitted === "resume",
       undefined,
-      { timeout: 8_000 },
+      { timeout: 4_000 },
     );
+    assert.ok(
+      Date.now() - eventRecoveryStartedAt < 4_000,
+      "leased ChatShare recovery should be event-driven before the 5s fallback poll",
+    );
+    assert.equal(pluginPageRequests, pluginRequestsBeforeEventRecovery);
     assert.equal(
-      await genericPage.evaluate(() => document.body.dataset.genericResumeSubmitted),
-      "resume",
+      await conversationPage.getAttribute("html", "data-devspace-recovery-pending"),
+      null,
+      "controller should consume the extension wake latch",
     );
-    assert.equal(pluginPageRequests, pluginRequestsBeforeGenericRecovery);
 
-    assert.equal(
-      controller.stopWebConversationRecovery(
-        acknowledgement.conversationIdentitySha256,
-      ),
-      true,
+    await conversationPage.evaluate(() => {
+      const resumedStop = document.createElement("button");
+      resumedStop.id = "resumed-turn-stop";
+      resumedStop.type = "button";
+      resumedStop.dataset.testid = "stop-button";
+      resumedStop.setAttribute("aria-label", "Stop generating");
+      resumedStop.textContent = "■";
+      document.querySelector("main")?.appendChild(resumedStop);
+    });
+    await conversationPage.waitForFunction(
+      () =>
+        document.documentElement.getAttribute("data-devspace-recovery-state") ===
+        "active",
+      undefined,
+      { timeout: 1_000 },
+    );
+    await conversationPage.evaluate(() => {
+      document.querySelector("#resumed-turn-stop")?.remove();
+      for (const paragraph of document.querySelectorAll("p")) {
+        if (/Stopped talking to devspace/i.test(paragraph.textContent ?? "")) {
+          paragraph.remove();
+        }
+      }
+    });
+    await conversationPage.waitForFunction(
+      () => !document.documentElement.hasAttribute("data-devspace-recovery-lease"),
+      undefined,
+      { timeout: 4_000 },
     );
     assert.equal(
       controller.stopWebConversationRecovery(
@@ -2369,7 +2368,7 @@ test("abort during send transition clears an owned synthetic resume", async () =
     await page.waitForFunction(
       () =>
         document.body.dataset.stopClicked === "true" &&
-        document.querySelector("#prompt-textarea")?.value === "resume",
+        document.querySelector<HTMLTextAreaElement>("#prompt-textarea")?.value === "resume",
       undefined,
       { timeout: 1_500 },
     );
@@ -2905,7 +2904,7 @@ test("connection interrupted and message timeout are immediate DevSpace resume t
   }
 });
 
-test("universal ChatShare recovery adopts DevSpace-evidenced sessions but rejects unrelated chats", async () => {
+test("ChatShare DevSpace evidence classifier distinguishes owned and unrelated chats", async () => {
   const browser = await launchInstalledChrome();
   try {
     const context = await browser.newContext();

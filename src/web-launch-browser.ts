@@ -73,6 +73,11 @@ const DEVSPACE_NATIVE_RECOVERY_BUTTON_PATTERN =
   /^(?:resume|retry|try again|重試|重试|再試一次|再试一次)$/i;
 const DEFAULT_CHATSHARE_SILENT_IDLE_MS = 45_000;
 const DEFAULT_AUTO_RESUME_COOLDOWN_MS = 60_000;
+const DEFAULT_CHATSHARE_RECOVERY_FALLBACK_POLL_MS = 5_000;
+const CHATSHARE_RECOVERY_LEASE_ATTRIBUTE = "data-devspace-recovery-lease";
+const CHATSHARE_RECOVERY_STATE_ATTRIBUTE = "data-devspace-recovery-state";
+const CHATSHARE_RECOVERY_PENDING_ATTRIBUTE = "data-devspace-recovery-pending";
+const CHATSHARE_RECOVERY_WAKE_EVENT = "devspace:recovery-signal";
 const ACTIVE_DEVSPACE_RECOVERY_WATCHES = new WeakMap<
   Page,
   { token: symbol; signal?: AbortSignal }
@@ -138,6 +143,7 @@ export interface DevSpaceChatShareRecoveryOptions {
   maxResumeAttempts?: number;
   retryBudgetRearmMs?: number;
   pollMs?: number;
+  wakeEventName?: string;
   signal?: AbortSignal;
   replaceActiveWatch?: boolean;
   ensurePluginConnected?: () => Promise<void>;
@@ -261,12 +267,6 @@ export class WebLaunchBrowserController {
       } else {
         await injectAndSubmitPrompt(page, prompt);
       }
-      if (useDevSpaceSession) {
-        await activateDevSpaceForConversation(page, 8_000, {
-          deviceProofProvider: this.#deviceProofProvider,
-          devSpacePublicBaseUrl: this.#devSpacePublicBaseUrl,
-        });
-      }
 
       const conversationIdentity = await waitForChatConversationIdentity(page);
       if (existingIdentities.has(conversationIdentity)) {
@@ -283,7 +283,15 @@ export class WebLaunchBrowserController {
         this.#devSpaceManagedConversationIdentitySha256.add(
           conversationIdentitySha256,
         );
+        await this.#setChatShareRecoveryLease(
+          page,
+          conversationIdentitySha256,
+        );
         this.#trackManagedConversationPage(page);
+        await activateDevSpaceForConversation(page, 8_000, {
+          deviceProofProvider: this.#deviceProofProvider,
+          devSpacePublicBaseUrl: this.#devSpacePublicBaseUrl,
+        });
       }
 
       await page.bringToFront().catch(() => undefined);
@@ -431,6 +439,10 @@ export class WebLaunchBrowserController {
     this.#recoveryDisabledConversationIdentitySha256.add(
       conversationIdentitySha256,
     );
+    void this.#clearChatShareRecoveryLease(
+      page,
+      conversationIdentitySha256,
+    );
 
     const abortController = this.#recoveryWatchAbortByPage.get(page);
     if (!abortController || abortController.signal.aborted) return false;
@@ -487,49 +499,97 @@ export class WebLaunchBrowserController {
     const identity = chatConversationIdentityFromUrl(page.url());
     if (!identity) return false;
     const identitySha256 = sha256(identity);
-    if (this.#recoveryDisabledConversationIdentitySha256.has(identitySha256)) {
-      return false;
-    }
-    if (
-      this.#sessionProvider === "chatshare" &&
-      identity.startsWith("chatshare.xyz:c:")
-    ) {
-      return true;
-    }
-    return this.#devSpaceManagedConversationIdentitySha256.has(identitySha256);
+    return (
+      !this.#recoveryDisabledConversationIdentitySha256.has(identitySha256) &&
+      this.#devSpaceManagedConversationIdentitySha256.has(identitySha256)
+    );
   }
 
   async #shouldReconnectDevSpaceForPage(page: Page): Promise<boolean> {
-    if (page.isClosed()) return false;
-    const identity = chatConversationIdentityFromUrl(page.url());
-    if (!identity) return false;
-    const identitySha256 = sha256(identity);
-    if (this.#devSpaceManagedConversationIdentitySha256.has(identitySha256)) {
-      return true;
-    }
-    if (
-      this.#sessionProvider !== "chatshare" ||
-      !identity.startsWith("chatshare.xyz:c:")
-    ) {
-      return false;
-    }
-    if (!(await hasDevSpaceConversationEvidence(page))) return false;
+    return this.#shouldRecoverPage(page);
+  }
 
-    // Adopt a DevSpace-evidenced universal ChatShare conversation without
-    // forcing a full plugin reconnect on the same recovery pass. The first
-    // interruption can then use the already-actionable conversation UI. If
-    // that turn fails again, the identity is now managed and the next episode
-    // is eligible for connector recovery.
-    this.#devSpaceManagedConversationIdentitySha256.add(identitySha256);
-    return false;
+  async #shouldKeepChatShareRecoveryLease(page: Page): Promise<boolean> {
+    if (this.#sessionProvider !== "chatshare" || page.isClosed()) return true;
+    const extensionReportedSettled = await page
+      .evaluate(
+        (attribute) =>
+          document.documentElement?.getAttribute(attribute) === "settled",
+        CHATSHARE_RECOVERY_STATE_ATTRIBUTE,
+      )
+      .catch(() => false);
+    if (!extensionReportedSettled) return true;
+    if ((await detectDevSpaceRecoverySignal(page)) !== "none") return true;
+    if ((await findDevSpaceAlwaysPermissionControls(page)).length > 0) return true;
+    if (await hasDevSpaceActiveTurn(page)) return true;
+    return isDevSpaceSilentStallCandidate(page);
+  }
+
+  async #setChatShareRecoveryLease(
+    page: Page,
+    conversationIdentitySha256: string,
+  ): Promise<void> {
+    if (this.#sessionProvider !== "chatshare" || page.isClosed()) return;
+    await page
+      .evaluate(
+        ({ leaseAttribute, stateAttribute, pendingAttribute, value }) => {
+          const root = document.documentElement;
+          if (!root) return;
+          root.setAttribute(leaseAttribute, value);
+          root.removeAttribute(stateAttribute);
+          root.removeAttribute(pendingAttribute);
+        },
+        {
+          leaseAttribute: CHATSHARE_RECOVERY_LEASE_ATTRIBUTE,
+          stateAttribute: CHATSHARE_RECOVERY_STATE_ATTRIBUTE,
+          pendingAttribute: CHATSHARE_RECOVERY_PENDING_ATTRIBUTE,
+          value: conversationIdentitySha256,
+        },
+      )
+      .catch(() => undefined);
+  }
+
+  async #clearChatShareRecoveryLease(
+    page: Page,
+    expectedConversationIdentitySha256?: string,
+  ): Promise<void> {
+    if (this.#sessionProvider !== "chatshare" || page.isClosed()) return;
+    await page
+      .evaluate(
+        ({ leaseAttribute, stateAttribute, pendingAttribute, expected }) => {
+          const root = document.documentElement;
+          if (!root) return;
+          if (expected && root.getAttribute(leaseAttribute) !== expected) return;
+          root.removeAttribute(leaseAttribute);
+          root.removeAttribute(stateAttribute);
+          root.removeAttribute(pendingAttribute);
+        },
+        {
+          leaseAttribute: CHATSHARE_RECOVERY_LEASE_ATTRIBUTE,
+          stateAttribute: CHATSHARE_RECOVERY_STATE_ATTRIBUTE,
+          pendingAttribute: CHATSHARE_RECOVERY_PENDING_ATTRIBUTE,
+          expected: expectedConversationIdentitySha256,
+        },
+      )
+      .catch(() => undefined);
   }
 
   #trackManagedConversationPage(page: Page): void {
     if (page.isClosed()) return;
     this.#bindManagedConversationPageLifecycle(page);
 
+    const currentIdentitySha256 =
+      this.#recoveryWatchIdentitySha256ByPage.get(page);
     const identity = chatConversationIdentityFromUrl(page.url());
-    if (!identity) return;
+    if (!identity) {
+      if (currentIdentitySha256) {
+        const current = this.#recoveryWatchAbortByPage.get(page);
+        if (current && !current.signal.aborted) current.abort();
+        if (current) this.#recoveryWatchControllers.delete(current);
+        void this.#clearChatShareRecoveryLease(page, currentIdentitySha256);
+      }
+      return;
+    }
     const identitySha256 = sha256(identity);
 
     for (const [trackedIdentitySha256, trackedPage] of this
@@ -541,8 +601,6 @@ export class WebLaunchBrowserController {
       }
     }
 
-    const currentIdentitySha256 =
-      this.#recoveryWatchIdentitySha256ByPage.get(page);
     if (
       currentIdentitySha256 &&
       currentIdentitySha256 !== identitySha256
@@ -550,20 +608,24 @@ export class WebLaunchBrowserController {
       const current = this.#recoveryWatchAbortByPage.get(page);
       if (current && !current.signal.aborted) current.abort();
       if (current) this.#recoveryWatchControllers.delete(current);
+      this.#devSpaceManagedConversationIdentitySha256.delete(
+        currentIdentitySha256,
+      );
+      void this.#clearChatShareRecoveryLease(page, currentIdentitySha256);
     }
 
-    if (this.#recoveryDisabledConversationIdentitySha256.has(identitySha256)) {
-      return;
-    }
-    const isUniversalChatShareConversation =
-      this.#sessionProvider === "chatshare" &&
-      identity.startsWith("chatshare.xyz:c:");
     if (
-      !isUniversalChatShareConversation &&
+      this.#recoveryDisabledConversationIdentitySha256.has(identitySha256) ||
       !this.#devSpaceManagedConversationIdentitySha256.has(identitySha256)
     ) {
+      if (currentIdentitySha256) {
+        void this.#clearChatShareRecoveryLease(page, currentIdentitySha256);
+      } else {
+        void this.#clearChatShareRecoveryLease(page);
+      }
       return;
     }
+    void this.#setChatShareRecoveryLease(page, identitySha256);
     this.#recoveryWatchPageByConversationIdentitySha256.set(
       identitySha256,
       page,
@@ -631,8 +693,24 @@ export class WebLaunchBrowserController {
     void watchForDevSpaceChatShareRecovery(page, 0, {
       signal: abortController.signal,
       replaceActiveWatch: replacingActiveWatch,
-      shouldRecover: () =>
-        stillOwnsConversation() && this.#shouldRecoverPage(page),
+      ...(this.#sessionProvider === "chatshare"
+        ? {
+            pollMs: DEFAULT_CHATSHARE_RECOVERY_FALLBACK_POLL_MS,
+            wakeEventName: CHATSHARE_RECOVERY_WAKE_EVENT,
+          }
+        : {}),
+      shouldRecover: async () => {
+        if (!stillOwnsConversation()) {
+          abortController.abort();
+          return false;
+        }
+        if (!this.#shouldRecoverPage(page)) return false;
+        if (!(await this.#shouldKeepChatShareRecoveryLease(page))) {
+          abortController.abort();
+          return false;
+        }
+        return true;
+      },
       shouldRecoverSilentStall: () =>
         stillOwnsConversation() && this.#shouldReconnectDevSpaceForPage(page),
       ensurePluginConnected: async () => {
@@ -654,6 +732,8 @@ export class WebLaunchBrowserController {
 
         this.#recoveryWatchAbortByPage.delete(page);
         this.#recoveryWatchIdentitySha256ByPage.delete(page);
+        this.#devSpaceManagedConversationIdentitySha256.delete(identitySha256);
+        void this.#clearChatShareRecoveryLease(page, identitySha256);
         for (const [trackedIdentitySha256, watchedPage] of this
           .#recoveryWatchPageByConversationIdentitySha256) {
           if (watchedPage === page) {
@@ -669,8 +749,14 @@ export class WebLaunchBrowserController {
     for (const abortController of this.#recoveryWatchControllers) {
       abortController.abort();
     }
+    for (const [identitySha256, page] of this
+      .#recoveryWatchPageByConversationIdentitySha256) {
+      void this.#clearChatShareRecoveryLease(page, identitySha256);
+    }
     this.#recoveryWatchControllers.clear();
     this.#recoveryWatchPageByConversationIdentitySha256.clear();
+    this.#devSpaceManagedConversationIdentitySha256.clear();
+    this.#recoveryDisabledConversationIdentitySha256.clear();
   }
 
   async #ensureContext(): Promise<BrowserContext> {
@@ -752,6 +838,9 @@ export class WebLaunchBrowserController {
     const pages = context.pages();
 
     if (this.#sessionProvider === "chatshare") {
+      await Promise.all(
+        pages.map((page) => this.#clearChatShareRecoveryLease(page)),
+      );
       const conversationPages = new Set(
         pages.filter((page) => {
           const identity = chatConversationIdentityFromUrl(page.url());
@@ -3453,12 +3542,17 @@ export async function hasDevSpaceInterruptionMessage(page: Page): Promise<boolea
   return (await detectDevSpaceRecoverySignal(page)) === "retryable_interruption";
 }
 
-export async function isDevSpaceSilentStallCandidate(page: Page): Promise<boolean> {
+async function hasDevSpaceActiveTurn(page: Page): Promise<boolean> {
   if (page.isClosed()) return false;
   const stopControls = await credibleLocators(page.locator(STOP_SELECTOR)).catch(
     () => [] as Locator[],
   );
-  if (stopControls.length > 0) return false;
+  return stopControls.length > 0;
+}
+
+export async function isDevSpaceSilentStallCandidate(page: Page): Promise<boolean> {
+  if (page.isClosed()) return false;
+  if (await hasDevSpaceActiveTurn(page)) return false;
 
   const markers = await page.getByText(DEVSPACE_TOOL_RESPONSE_PATTERN).all().catch(() => [] as Locator[]);
   const visibleMarkers: Locator[] = [];
@@ -4223,9 +4317,9 @@ export async function deleteConversationHistoryFromSidebar(
   return true;
 }
 
-export async function approveDevSpaceAlwaysPermissionIfPresent(
+async function findDevSpaceAlwaysPermissionControls(
   page: Page,
-): Promise<boolean> {
+): Promise<Locator[]> {
   const allowPattern =
     /^(?:Allow always|Always allow|一律允許|總是允許|始終允許|永遠允許|一律允许|总是允许|始终允许|永远允许)$/i;
   const buttons = await page.locator("button").all().catch(() => [] as Locator[]);
@@ -4285,7 +4379,13 @@ export async function approveDevSpaceAlwaysPermissionIfPresent(
     );
     if (belongsToDevSpace) scoped.push(button);
   }
+  return scoped;
+}
 
+export async function approveDevSpaceAlwaysPermissionIfPresent(
+  page: Page,
+): Promise<boolean> {
+  const scoped = await findDevSpaceAlwaysPermissionControls(page);
   if (scoped.length === 0) return false;
   if (scoped.length > 1) {
     throw new WebLaunchBrowserError(
@@ -4356,13 +4456,31 @@ export async function watchForDevSpaceChatShareRecovery(
           }
         }
         if (!recoveryAllowed) {
-          await page.waitForTimeout(Math.max(50, pollMs)).catch(() => undefined);
+          if (options.wakeEventName) {
+            await waitForDevSpaceRecoveryWake(
+              page,
+              pollMs,
+              options.wakeEventName,
+              options.signal,
+            );
+          } else {
+            await page.waitForTimeout(Math.max(50, pollMs)).catch(() => undefined);
+          }
           continue;
         }
 
         await installDevSpaceRecoveryIntentGuard(page);
         if (await hasDevSpaceManualStopLatch(page)) {
-          await page.waitForTimeout(Math.max(50, pollMs)).catch(() => undefined);
+          if (options.wakeEventName) {
+            await waitForDevSpaceRecoveryWake(
+              page,
+              pollMs,
+              options.wakeEventName,
+              options.signal,
+            );
+          } else {
+            await page.waitForTimeout(Math.max(50, pollMs)).catch(() => undefined);
+          }
           continue;
         }
 
@@ -4409,7 +4527,6 @@ export async function watchForDevSpaceChatShareRecovery(
         ) {
           return acted;
         }
-
         const interrupted = recoverySignal === "retryable_interruption";
         if (interrupted) {
           const nextInterruptionFingerprint =
@@ -4553,7 +4670,16 @@ export async function watchForDevSpaceChatShareRecovery(
           // Synthetic continuation is opt-in through the managed-conversation
           // ownership gate. Without that proof, keep the old detect-only
           // behavior and continue watching for a later native interruption.
-          await page.waitForTimeout(Math.max(50, pollMs)).catch(() => undefined);
+          if (options.wakeEventName) {
+            await waitForDevSpaceRecoveryWake(
+              page,
+              pollMs,
+              options.wakeEventName,
+              options.signal,
+            );
+          } else {
+            await page.waitForTimeout(Math.max(50, pollMs)).catch(() => undefined);
+          }
           continue;
         }
         if (
@@ -4563,7 +4689,16 @@ export async function watchForDevSpaceChatShareRecovery(
           // Synthetic user-level continuation is one-shot for an unchanged
           // silent tail. Observable conversation or composer activity changes
           // the fingerprint and permits a fresh bounded recovery episode.
-          await page.waitForTimeout(Math.max(50, pollMs)).catch(() => undefined);
+          if (options.wakeEventName) {
+            await waitForDevSpaceRecoveryWake(
+              page,
+              pollMs,
+              options.wakeEventName,
+              options.signal,
+            );
+          } else {
+            await page.waitForTimeout(Math.max(50, pollMs)).catch(() => undefined);
+          }
           continue;
         }
 
@@ -4675,7 +4810,16 @@ export async function watchForDevSpaceChatShareRecovery(
       } catch {
         // Navigation and DOM transitions can detach recovery controls; retry from a fresh snapshot.
       }
-      await page.waitForTimeout(Math.max(50, pollMs)).catch(() => undefined);
+      if (options.wakeEventName) {
+        await waitForDevSpaceRecoveryWake(
+          page,
+          pollMs,
+          options.wakeEventName,
+          options.signal,
+        );
+      } else {
+        await page.waitForTimeout(Math.max(50, pollMs)).catch(() => undefined);
+      }
     }
     return acted;
   } finally {
@@ -4683,6 +4827,68 @@ export async function watchForDevSpaceChatShareRecovery(
       ACTIVE_DEVSPACE_RECOVERY_WATCHES.delete(page);
     }
   }
+}
+
+async function waitForDevSpaceRecoveryWake(
+  page: Page,
+  pollMs: number,
+  wakeEventName?: string,
+  signal?: AbortSignal,
+): Promise<void> {
+  const timeoutMs = Math.max(50, pollMs);
+  if (!wakeEventName) {
+    await page.waitForTimeout(timeoutMs).catch(() => undefined);
+    return;
+  }
+  if (page.isClosed() || signal?.aborted) return;
+
+  const pendingAttribute =
+    wakeEventName === CHATSHARE_RECOVERY_WAKE_EVENT
+      ? CHATSHARE_RECOVERY_PENDING_ATTRIBUTE
+      : undefined;
+  const pageWait = page
+    .evaluate(
+      ({ eventName, timeout, pendingAttribute }) =>
+        new Promise<void>((resolve) => {
+          let timer = 0;
+          const finish = () => {
+            document.removeEventListener(eventName, finish);
+            if (timer) window.clearTimeout(timer);
+            if (pendingAttribute) {
+              document.documentElement?.removeAttribute(pendingAttribute);
+            }
+            resolve();
+          };
+          document.addEventListener(eventName, finish, { once: true });
+          if (
+            pendingAttribute &&
+            document.documentElement?.hasAttribute(pendingAttribute)
+          ) {
+            finish();
+            return;
+          }
+          timer = window.setTimeout(finish, timeout);
+        }),
+      {
+        eventName: wakeEventName,
+        timeout: timeoutMs,
+        pendingAttribute,
+      },
+    )
+    .catch(() => undefined);
+
+  if (!signal) {
+    await pageWait;
+    return;
+  }
+
+  let abortHandler: (() => void) | undefined;
+  const abortWait = new Promise<void>((resolve) => {
+    abortHandler = () => resolve();
+    signal.addEventListener("abort", abortHandler, { once: true });
+  });
+  await Promise.race([pageWait, abortWait]);
+  if (abortHandler) signal.removeEventListener("abort", abortHandler);
 }
 
 export async function watchForDevSpaceAlwaysPermission(

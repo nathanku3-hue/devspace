@@ -1,9 +1,10 @@
 # Chatshare OAuth Callback Rescue
 
-This unpacked Chrome extension has two jobs:
+This unpacked Chrome extension has three jobs:
 
 - repair Chatshare OAuth callback routing;
-- silently prove that a DevSpace OAuth request is being authorized from the PC currently running DevSpace.
+- silently prove that a DevSpace OAuth request is being authorized from the PC currently running DevSpace;
+- act as a low-cost recovery sensor for Chatshare conversations that currently hold a DevSpace recovery lease.
 
 ## One-Time Setup
 
@@ -28,6 +29,20 @@ aaoelopmdnhifffjefciagfmhjanbaoc
 After this one-time setup, a valid Chatshare OAuth authorization page obtains a
 one-time proof from `127.0.0.1:7677` and submits automatically. There is no
 password prompt or approval click while DevSpace is running normally.
+
+Version `1.15.0` adds lease-scoped, event-driven Chatshare recovery sensing.
+The content script stays dormant on ordinary or stale conversations. DevSpace arms it
+only by placing a controller-owned recovery lease marker on a managed `/c/...` page;
+while armed, DOM recovery signals wake the controller immediately and a 45-second idle
+timer covers silent tool-tail stalls. DevSpace still owns all resume/reconnect decisions
+and keeps a 5-second Playwright fallback, so extension reloads or missed events do not
+become a recovery single point of failure. After the extension has observed an active
+turn finish, it marks the page settled so the controller can revoke its lease; stale
+unleased tabs remain dormant.
+
+Run `npm run test:chatshare-recovery-monitor` from `devspace-src` for the focused
+sensor fixture. It proves unleased tabs stay dormant, leased recovery mutations wake the
+controller channel, and revoking the lease disables the sensor again.
 
 Version `1.14.0` treats Chatshare's `OAuth link is not owned by the user`
 response as a terminal callback-ownership mismatch. The rejected callback is
