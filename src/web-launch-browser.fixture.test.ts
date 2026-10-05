@@ -1217,7 +1217,7 @@ test("ChatShare connected launch uses the already-connected fresh-chat fast path
         assert.equal(url.searchParams.get("carid"), "pro-connected");
         return route.fulfill({ status: 200, contentType: "application/json", body: "{\"code\":1}" });
       }
-      if (url.pathname === "/c/universal-recovery-12345678") {
+      if (url.pathname === "/c/active-recovery-12345678") {
         return route.fulfill({
           status: 200,
           contentType: "text/html; charset=utf-8",
@@ -1233,13 +1233,36 @@ test("ChatShare connected launch uses the already-connected fresh-chat fast path
   const composer = document.querySelector('#prompt-textarea');
   control.addEventListener('click', () => {
     if (control.getAttribute('data-testid') === 'stop-button') {
-      document.body.dataset.universalStopClicked = 'true';
+      document.body.dataset.activeStopClicked = 'true';
       control.setAttribute('data-testid', 'send-button');
       control.setAttribute('aria-label', 'Send prompt');
       control.textContent = '↑';
       return;
     }
-    document.body.dataset.universalResumeSubmitted = composer.value;
+    document.body.dataset.activeResumeSubmitted = composer.value;
+  });
+</script>
+</body></html>`,
+        });
+      }
+      if (url.pathname === "/c/stale-recovery-12345678") {
+        return route.fulfill({
+          status: 200,
+          contentType: "text/html; charset=utf-8",
+          body: `<!doctype html><html><body><main>
+<p>Connection interrupted</p>
+<form>
+  <textarea id="prompt-textarea"></textarea>
+  <button data-testid="send-button" aria-label="Send prompt" type="button">↑</button>
+</form>
+<button id="stale-resume" type="button">resume</button>
+</main>
+<script>
+  document.querySelector('#stale-resume').addEventListener('click', () => {
+    document.body.dataset.staleResumeClicked = 'true';
+  });
+  document.querySelector('[data-testid="send-button"]').addEventListener('click', () => {
+    document.body.dataset.staleResumeSubmitted = document.querySelector('#prompt-textarea').value;
   });
 </script>
 </body></html>`,
@@ -1320,8 +1343,10 @@ test("ChatShare connected launch uses the already-connected fresh-chat fast path
       return route.fulfill({ status: 404, body: "unexpected route" });
     });
 
-    const universalPage = await context.newPage();
-    await universalPage.goto("https://chatshare.xyz/c/universal-recovery-12345678");
+    const activePage = await context.newPage();
+    await activePage.goto("https://chatshare.xyz/c/active-recovery-12345678");
+    const stalePage = await context.newPage();
+    await stalePage.goto("https://chatshare.xyz/c/stale-recovery-12345678");
 
     controller = new WebLaunchBrowserController([parent], {
       contextFactory: async () => context,
@@ -1334,7 +1359,8 @@ test("ChatShare connected launch uses the already-connected fresh-chat fast path
       .pages()
       .find(
         (page) =>
-          page !== universalPage &&
+          page !== activePage &&
+          page !== stalePage &&
           chatConversationIdentityFromUrl(page.url()) !== undefined,
       );
 
@@ -1343,17 +1369,31 @@ test("ChatShare connected launch uses the already-connected fresh-chat fast path
     assert.equal(await conversationPage.evaluate(() => document.body.dataset.submitted), prompt);
     assert.equal(acknowledgement.launchSuccess, true);
 
-    await universalPage.waitForTimeout(700);
+    await activePage.waitForFunction(
+      () => document.body.dataset.activeResumeSubmitted === "resume",
+      undefined,
+      { timeout: 8_000 },
+    );
     assert.equal(
-      await universalPage.evaluate(() => document.body.dataset.universalStopClicked),
+      await activePage.evaluate(() => document.body.dataset.activeStopClicked),
+      "true",
+    );
+    assert.equal(
+      await activePage.evaluate(() => document.body.dataset.activeResumeSubmitted),
+      "resume",
+    );
+
+    await stalePage.waitForTimeout(700);
+    assert.equal(
+      await stalePage.evaluate(() => document.body.dataset.staleResumeClicked),
       undefined,
     );
     assert.equal(
-      await universalPage.evaluate(() => document.body.dataset.universalResumeSubmitted),
+      await stalePage.evaluate(() => document.body.dataset.staleResumeSubmitted),
       undefined,
     );
     assert.equal(
-      await universalPage.getAttribute("html", "data-devspace-recovery-lease"),
+      await stalePage.getAttribute("html", "data-devspace-recovery-lease"),
       null,
     );
 

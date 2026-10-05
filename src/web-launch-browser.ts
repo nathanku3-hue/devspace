@@ -174,6 +174,8 @@ export class WebLaunchBrowserController {
   readonly #recoveryWatchControllers = new Set<AbortController>();
   readonly #recoveryWatchPageByConversationIdentitySha256 = new Map<string, Page>();
   readonly #devSpaceManagedConversationIdentitySha256 = new Set<string>();
+  readonly #activeRecoverySessionIdentitySha256 = new Set<string>();
+  readonly #observedUserTurnGenerationByIdentitySha256 = new Map<string, number>();
   readonly #recoveryDisabledConversationIdentitySha256 = new Set<string>();
   readonly #recoveryLifecycleBoundPages = new WeakSet<Page>();
 
@@ -283,6 +285,9 @@ export class WebLaunchBrowserController {
         this.#devSpaceManagedConversationIdentitySha256.add(
           conversationIdentitySha256,
         );
+        this.#activeRecoverySessionIdentitySha256.add(
+          conversationIdentitySha256,
+        );
         await this.#setChatShareRecoveryLease(
           page,
           conversationIdentitySha256,
@@ -369,6 +374,9 @@ export class WebLaunchBrowserController {
         const rescued = await resumeInterruptedDevSpaceConversationViaComposer(page, prompt);
         if (rescued) {
           if (isManagedDevSpaceConversation) {
+            this.#activeRecoverySessionIdentitySha256.add(
+              conversationIdentitySha256,
+            );
             this.#trackManagedConversationPage(page);
           }
           await page.bringToFront().catch(() => undefined);
@@ -388,6 +396,9 @@ export class WebLaunchBrowserController {
       const rescued = await resumeInterruptedDevSpaceConversationViaComposer(page, prompt);
       if (rescued) {
         if (isManagedDevSpaceConversation) {
+          this.#activeRecoverySessionIdentitySha256.add(
+            conversationIdentitySha256,
+          );
           this.#trackManagedConversationPage(page);
         }
         await page.bringToFront().catch(() => undefined);
@@ -406,6 +417,9 @@ export class WebLaunchBrowserController {
     await insertAndVerifyPrompt(composers[0]!, prompt);
     await submitPrompt(page, composers[0]!, prompt);
     if (isManagedDevSpaceConversation) {
+      this.#activeRecoverySessionIdentitySha256.add(
+        conversationIdentitySha256,
+      );
       this.#trackManagedConversationPage(page);
     }
     await page.bringToFront().catch(() => undefined);
@@ -433,6 +447,12 @@ export class WebLaunchBrowserController {
       conversationIdentitySha256,
     );
     this.#devSpaceManagedConversationIdentitySha256.delete(
+      conversationIdentitySha256,
+    );
+    this.#activeRecoverySessionIdentitySha256.delete(
+      conversationIdentitySha256,
+    );
+    this.#observedUserTurnGenerationByIdentitySha256.delete(
       conversationIdentitySha256,
     );
     if (!page || page.isClosed()) return false;
@@ -494,35 +514,90 @@ export class WebLaunchBrowserController {
     if (lease) await lease.release().catch(() => undefined);
   }
 
-  #shouldRecoverPage(page: Page): boolean {
+  async #shouldRecoverPage(page: Page): Promise<boolean> {
     if (page.isClosed()) return false;
     const identity = chatConversationIdentityFromUrl(page.url());
     if (!identity) return false;
     const identitySha256 = sha256(identity);
-    return (
-      !this.#recoveryDisabledConversationIdentitySha256.has(identitySha256) &&
-      this.#devSpaceManagedConversationIdentitySha256.has(identitySha256)
+    if (this.#recoveryDisabledConversationIdentitySha256.has(identitySha256)) {
+      return false;
+    }
+
+    const isManagedConversation =
+      this.#devSpaceManagedConversationIdentitySha256.has(identitySha256);
+    if (
+      !isManagedConversation &&
+      (this.#sessionProvider !== "chatshare" ||
+        !identity.startsWith("chatshare.xyz:c:"))
+    ) {
+      return false;
+    }
+
+    const userTurnGeneration = await readDevSpaceUserTurnGeneration(page);
+    const previousUserTurnGeneration =
+      this.#observedUserTurnGenerationByIdentitySha256.get(identitySha256);
+    this.#observedUserTurnGenerationByIdentitySha256.set(
+      identitySha256,
+      userTurnGeneration,
     );
+
+    let activeSession =
+      this.#activeRecoverySessionIdentitySha256.has(identitySha256);
+    const newlyActiveSession =
+      userTurnGeneration > (previousUserTurnGeneration ?? 0) ||
+      (await hasDevSpaceActiveTurn(page));
+
+    if (!activeSession && newlyActiveSession) {
+      activeSession = true;
+      this.#activeRecoverySessionIdentitySha256.add(identitySha256);
+      await this.#setChatShareRecoveryLease(page, identitySha256);
+      return true;
+    }
+    if (!activeSession) return false;
+
+    if (!(await this.#shouldKeepChatShareRecoveryLease(page))) {
+      this.#activeRecoverySessionIdentitySha256.delete(identitySha256);
+      await this.#clearChatShareRecoveryLease(page, identitySha256);
+      return false;
+    }
+    return true;
   }
 
   async #shouldReconnectDevSpaceForPage(page: Page): Promise<boolean> {
-    return this.#shouldRecoverPage(page);
+    if (page.isClosed()) return false;
+    const identity = chatConversationIdentityFromUrl(page.url());
+    if (!identity) return false;
+    const identitySha256 = sha256(identity);
+    if (this.#recoveryDisabledConversationIdentitySha256.has(identitySha256)) {
+      return false;
+    }
+    if (this.#devSpaceManagedConversationIdentitySha256.has(identitySha256)) {
+      return true;
+    }
+    if (
+      this.#sessionProvider !== "chatshare" ||
+      !this.#activeRecoverySessionIdentitySha256.has(identitySha256)
+    ) {
+      return false;
+    }
+    return hasDevSpaceConversationEvidence(page);
   }
 
   async #shouldKeepChatShareRecoveryLease(page: Page): Promise<boolean> {
     if (this.#sessionProvider !== "chatshare" || page.isClosed()) return true;
-    const extensionReportedSettled = await page
+    const extensionState = await page
       .evaluate(
         (attribute) =>
-          document.documentElement?.getAttribute(attribute) === "settled",
+          document.documentElement?.getAttribute(attribute) ?? "",
         CHATSHARE_RECOVERY_STATE_ATTRIBUTE,
       )
-      .catch(() => false);
-    if (!extensionReportedSettled) return true;
+      .catch(() => "");
+    if (extensionState === "active" || extensionState === "pending") return true;
     if ((await detectDevSpaceRecoverySignal(page)) !== "none") return true;
     if ((await findDevSpaceAlwaysPermissionControls(page)).length > 0) return true;
     if (await hasDevSpaceActiveTurn(page)) return true;
-    return isDevSpaceSilentStallCandidate(page);
+    if (await isDevSpaceSilentStallCandidate(page)) return true;
+    return extensionState !== "settled";
   }
 
   async #setChatShareRecoveryLease(
@@ -611,12 +686,23 @@ export class WebLaunchBrowserController {
       this.#devSpaceManagedConversationIdentitySha256.delete(
         currentIdentitySha256,
       );
+      this.#activeRecoverySessionIdentitySha256.delete(
+        currentIdentitySha256,
+      );
+      this.#observedUserTurnGenerationByIdentitySha256.delete(
+        currentIdentitySha256,
+      );
       void this.#clearChatShareRecoveryLease(page, currentIdentitySha256);
     }
 
+    const isManagedConversation =
+      this.#devSpaceManagedConversationIdentitySha256.has(identitySha256);
+    const isChatShareConversation =
+      this.#sessionProvider === "chatshare" &&
+      identity.startsWith("chatshare.xyz:c:");
     if (
       this.#recoveryDisabledConversationIdentitySha256.has(identitySha256) ||
-      !this.#devSpaceManagedConversationIdentitySha256.has(identitySha256)
+      (!isManagedConversation && !isChatShareConversation)
     ) {
       if (currentIdentitySha256) {
         void this.#clearChatShareRecoveryLease(page, currentIdentitySha256);
@@ -625,7 +711,22 @@ export class WebLaunchBrowserController {
       }
       return;
     }
-    void this.#setChatShareRecoveryLease(page, identitySha256);
+
+    if (
+      isManagedConversation &&
+      this.#activeRecoverySessionIdentitySha256.has(identitySha256)
+    ) {
+      void this.#setChatShareRecoveryLease(page, identitySha256);
+    } else {
+      // A known conversation identity is not enough to prove the current page
+      // belongs to a live turn. Reopened/stale pages start as scouts unless the
+      // active-session state was explicitly carried by an in-flight handoff.
+      if (!isManagedConversation) {
+        this.#activeRecoverySessionIdentitySha256.delete(identitySha256);
+        this.#observedUserTurnGenerationByIdentitySha256.delete(identitySha256);
+      }
+      void this.#clearChatShareRecoveryLease(page, identitySha256);
+    }
     this.#recoveryWatchPageByConversationIdentitySha256.set(
       identitySha256,
       page,
@@ -704,12 +805,19 @@ export class WebLaunchBrowserController {
           abortController.abort();
           return false;
         }
-        if (!this.#shouldRecoverPage(page)) return false;
-        if (!(await this.#shouldKeepChatShareRecoveryLease(page))) {
+        const recoveryAllowed = await this.#shouldRecoverPage(page);
+        if (
+          !recoveryAllowed &&
+          this.#devSpaceManagedConversationIdentitySha256.has(identitySha256) &&
+          !this.#activeRecoverySessionIdentitySha256.has(identitySha256)
+        ) {
+          // Managed worker conversations retain their original finite lifecycle:
+          // once the leased turn settles, retire the watcher. Non-managed
+          // ChatShare pages keep only the lightweight scout so a later live
+          // user turn can opt the session back into recovery.
           abortController.abort();
-          return false;
         }
-        return true;
+        return recoveryAllowed;
       },
       shouldRecoverSilentStall: () =>
         stillOwnsConversation() && this.#shouldReconnectDevSpaceForPage(page),
@@ -732,7 +840,8 @@ export class WebLaunchBrowserController {
 
         this.#recoveryWatchAbortByPage.delete(page);
         this.#recoveryWatchIdentitySha256ByPage.delete(page);
-        this.#devSpaceManagedConversationIdentitySha256.delete(identitySha256);
+        this.#activeRecoverySessionIdentitySha256.delete(identitySha256);
+        this.#observedUserTurnGenerationByIdentitySha256.delete(identitySha256);
         void this.#clearChatShareRecoveryLease(page, identitySha256);
         for (const [trackedIdentitySha256, watchedPage] of this
           .#recoveryWatchPageByConversationIdentitySha256) {
@@ -756,6 +865,8 @@ export class WebLaunchBrowserController {
     this.#recoveryWatchControllers.clear();
     this.#recoveryWatchPageByConversationIdentitySha256.clear();
     this.#devSpaceManagedConversationIdentitySha256.clear();
+    this.#activeRecoverySessionIdentitySha256.clear();
+    this.#observedUserTurnGenerationByIdentitySha256.clear();
     this.#recoveryDisabledConversationIdentitySha256.clear();
   }
 
