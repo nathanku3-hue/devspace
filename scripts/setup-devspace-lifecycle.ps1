@@ -11,6 +11,62 @@ function ConvertTo-NormalizedDevSpacePath {
     return $full.TrimEnd('\', '/').ToLowerInvariant()
 }
 
+function Resolve-DevSpaceChatSessionProvider {
+    param(
+        $ExistingConfig,
+        [string]$EnvironmentValue
+    )
+
+    $candidate = $EnvironmentValue
+    if ([string]::IsNullOrWhiteSpace($candidate) -and $null -ne $ExistingConfig) {
+        $property = $ExistingConfig.PSObject.Properties['chatSessionProvider']
+        if ($null -ne $property) {
+            $candidate = [string]$property.Value
+        }
+    }
+    if ([string]::IsNullOrWhiteSpace($candidate)) {
+        $candidate = "chatgpt"
+    }
+    $candidate = $candidate.Trim().ToLowerInvariant()
+    if ($candidate -notin @("chatgpt", "chatshare")) {
+        throw "Invalid DevSpace chat session provider '$candidate'. Expected chatgpt or chatshare."
+    }
+    return $candidate
+}
+
+function New-DevSpaceServerConfig {
+    param(
+        $ExistingConfig,
+        [Parameter(Mandatory = $true)][string]$HostName,
+        [Parameter(Mandatory = $true)][int]$Port,
+        [Parameter(Mandatory = $true)][string[]]$AllowedRoots,
+        [Parameter(Mandatory = $true)][string]$PublicBaseUrl,
+        [Parameter(Mandatory = $true)][string[]]$AllowedHosts,
+        [Parameter(Mandatory = $true)][string]$ChatSessionProvider
+    )
+
+    $merged = [ordered]@{}
+    if ($null -ne $ExistingConfig) {
+        if ($ExistingConfig -is [System.Collections.IDictionary]) {
+            foreach ($key in $ExistingConfig.Keys) {
+                $merged[[string]$key] = $ExistingConfig[$key]
+            }
+        } else {
+            foreach ($property in $ExistingConfig.PSObject.Properties) {
+                $merged[$property.Name] = $property.Value
+            }
+        }
+    }
+
+    $merged["host"] = $HostName
+    $merged["port"] = $Port
+    $merged["allowedRoots"] = @($AllowedRoots)
+    $merged["publicBaseUrl"] = $PublicBaseUrl
+    $merged["allowedHosts"] = @($AllowedHosts)
+    $merged["chatSessionProvider"] = $ChatSessionProvider
+    return $merged
+}
+
 function Test-DevSpaceHealthzJson {
     param([string]$Body)
 

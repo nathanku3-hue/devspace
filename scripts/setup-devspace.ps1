@@ -1063,18 +1063,35 @@ function Start-DevSpaceServer([string]$devspaceCli, [string]$tunnelHost) {
     $proxyHost = ([System.Uri]$PublicProxyBase).Host
 
     $configDir = Join-Path $env:USERPROFILE ".devspace"
-    $config = @{
-        host          = $LocalHost
-        port          = $LocalPort
-        allowedRoots  = @($AllowedRoots)
-        publicBaseUrl = $PublicProxyBase
-        allowedHosts  = @($proxyHost, "*.trycloudflare.com", $tunnelHost, "localhost", "127.0.0.1")
+    $configPath = Join-Path $configDir "config.json"
+    $existingConfig = $null
+    if (Test-Path -LiteralPath $configPath -PathType Leaf) {
+        try {
+            $existingConfig = Get-Content -LiteralPath $configPath -Raw | ConvertFrom-Json
+        } catch {
+            throw "Existing DevSpace config is unreadable: $configPath"
+        }
     }
+
+    $chatSessionProvider = Resolve-DevSpaceChatSessionProvider `
+        -ExistingConfig $existingConfig `
+        -EnvironmentValue $env:DEVSPACE_CHAT_SESSION_PROVIDER
+    $managedAllowedHosts = @($proxyHost, "*.trycloudflare.com", $tunnelHost, "localhost", "127.0.0.1")
+    $config = New-DevSpaceServerConfig `
+        -ExistingConfig $existingConfig `
+        -HostName $LocalHost `
+        -Port $LocalPort `
+        -AllowedRoots @($AllowedRoots) `
+        -PublicBaseUrl $PublicProxyBase `
+        -AllowedHosts $managedAllowedHosts `
+        -ChatSessionProvider $chatSessionProvider
     $configJson = $config | ConvertTo-Json -Depth 5
-    [System.IO.File]::WriteAllText((Join-Path $configDir "config.json"), $configJson + "`n")
-    Write-Host "Updated $(Join-Path $configDir 'config.json')"
+    [System.IO.File]::WriteAllText($configPath, $configJson + "`n")
+    Write-Host "Updated $configPath"
+    Write-SetupLog "Chat session provider: $chatSessionProvider"
 
     $env:DEVSPACE_PUBLIC_BASE_URL = $PublicProxyBase
+    $env:DEVSPACE_CHAT_SESSION_PROVIDER = $chatSessionProvider
     # No space after commas; parser trims, but keep the value clean.
     $env:DEVSPACE_ALLOWED_HOSTS = "$proxyHost,*.trycloudflare.com,$tunnelHost,localhost,127.0.0.1"
     $env:DEVSPACE_ALLOWED_ROOTS = $AllowedRootsEnv
@@ -1112,6 +1129,7 @@ function Start-DevSpaceServer([string]$devspaceCli, [string]$tunnelHost) {
         "setlocal"
         "cd /d `"$PSScriptRoot`""
         "set DEVSPACE_PUBLIC_BASE_URL=$($env:DEVSPACE_PUBLIC_BASE_URL)"
+        "set DEVSPACE_CHAT_SESSION_PROVIDER=$($env:DEVSPACE_CHAT_SESSION_PROVIDER)"
         "set DEVSPACE_ALLOWED_HOSTS=$($env:DEVSPACE_ALLOWED_HOSTS)"
         "set DEVSPACE_ALLOWED_ROOTS=$($env:DEVSPACE_ALLOWED_ROOTS)"
         "set DEVSPACE_TRUST_PROXY=$($env:DEVSPACE_TRUST_PROXY)"

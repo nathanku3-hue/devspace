@@ -14,6 +14,55 @@ Describe "DevSpace setup script syntax" {
     }
 }
 
+Describe "DevSpace setup server config preservation" {
+    It "preserves chatshare and unrelated config while replacing setup-managed fields" {
+        $existing = [pscustomobject]@{
+            host                = "old-host"
+            port                = 9999
+            stateDir            = "C:\custom-state"
+            chatSessionProvider = "chatshare"
+        }
+
+        $provider = Resolve-DevSpaceChatSessionProvider -ExistingConfig $existing
+        $merged = New-DevSpaceServerConfig `
+            -ExistingConfig $existing `
+            -HostName "127.0.0.1" `
+            -Port 7676 `
+            -AllowedRoots @("E:\Code") `
+            -PublicBaseUrl "https://proxy.example.test" `
+            -AllowedHosts @("proxy.example.test", "localhost") `
+            -ChatSessionProvider $provider
+
+        $provider | Should Be "chatshare"
+        $merged.chatSessionProvider | Should Be "chatshare"
+        $merged.stateDir | Should Be "C:\custom-state"
+        $merged.host | Should Be "127.0.0.1"
+        $merged.port | Should Be 7676
+        @($merged.allowedRoots).Count | Should Be 1
+        $merged.allowedRoots[0] | Should Be "E:\Code"
+        $merged.publicBaseUrl | Should Be "https://proxy.example.test"
+    }
+
+    It "lets an explicit environment provider override persisted config" {
+        $existing = [pscustomobject]@{ chatSessionProvider = "chatgpt" }
+        (Resolve-DevSpaceChatSessionProvider -ExistingConfig $existing -EnvironmentValue "chatshare") | Should Be "chatshare"
+    }
+
+    It "defaults to chatgpt only when neither config nor environment selects a provider" {
+        (Resolve-DevSpaceChatSessionProvider -ExistingConfig ([pscustomobject]@{})) | Should Be "chatgpt"
+    }
+
+    It "rejects an invalid persisted provider instead of silently changing modes" {
+        $existing = [pscustomobject]@{ chatSessionProvider = "invalid" }
+        { Resolve-DevSpaceChatSessionProvider -ExistingConfig $existing } | Should Throw
+    }
+
+    It "passes the resolved provider into the detached production launcher" {
+        $setupScript = Get-Content -LiteralPath (Join-Path $here "setup-devspace.ps1") -Raw
+        $setupScript | Should Match 'set DEVSPACE_CHAT_SESSION_PROVIDER=\$\(\$env:DEVSPACE_CHAT_SESSION_PROVIDER\)'
+    }
+}
+
 Describe "DevSpace setup tool inventory assertion" {
     $exactTools = @(
         "bash",
@@ -148,6 +197,7 @@ Describe "DevSpace setup probe client persistence" {
         $loaded | Should Be $null
     }
 }
+
 
 Describe "DevSpace healthz JSON schema" {
     It "accepts explicit ok=true and name=devspace" {
