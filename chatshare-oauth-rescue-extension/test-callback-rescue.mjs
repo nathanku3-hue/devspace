@@ -31,6 +31,12 @@ const server = createServer(async (request, response) => {
       response.end(JSON.stringify({ error: "unauthorized" }));
       return;
     }
+    if (redirectUrl.includes("dummy-action-discovery-state")) {
+      receivedBody = requestBody;
+      response.writeHead(424, { "Content-Type": "application/json" });
+      response.end(JSON.stringify({ error: "Authentication succeeded, action discovery failed" }));
+      return;
+    }
     if (redirectUrl.includes("dummy-owner-mismatch-state")) {
       receivedBody = requestBody;
       response.writeHead(403, { "Content-Type": "application/json" });
@@ -289,6 +295,73 @@ try {
   receivedBody = null;
   authenticated = true;
   callbackAttempts = 0;
+  // Return to a real app document before testing a new OAuth attempt; the
+  // previous failure page was rendered with document.open().
+  await cdp.call("Page.navigate", { url: `http://127.0.0.1:${appPort}/success` });
+  await waitFor(async () => {
+    const result = await cdp.call("Runtime.evaluate", {
+      expression: "location.pathname === '/success'", returnByValue: true,
+    });
+    return result.result.value === true;
+  }, 8000, "restored app document after ownership failure");
+  await cdp.call("Runtime.evaluate", { expression: "sessionStorage.clear()", returnByValue: true });
+  const discoveryCallback = `/connector/oauth/test-id?code=dummy-code&state=dummy-action-discovery-state`;
+  await cdp.call("Page.navigate", {
+    url: `http://127.0.0.1:${appPort}/#cs_oauth_callback=${discoveryCallback}`,
+  });
+  await waitFor(async () => {
+    const result = await cdp.call("Runtime.evaluate", {
+      expression:
+        "document.body?.innerText.includes('MCP action discovery failed') && document.body?.innerText.includes('This callback cannot be replayed')",
+      returnByValue: true,
+    });
+    return result.result.value === true;
+  }, 8000, "action-discovery recovery page").catch(async (error) => {
+    const diagnostic = await cdp.call("Runtime.evaluate", {
+      expression: "({href: location.href, body: document.body?.innerText, status: sessionStorage.getItem(\"chatshare-oauth-callback-rescue-status\")})",
+      returnByValue: true,
+    });
+    throw new Error(`${error.message}; status=${JSON.stringify(diagnostic.result.value)}; attempts=${callbackAttempts}`);
+  });
+  const discoveryState = await cdp.call("Runtime.evaluate", {
+    expression: `({
+      status: sessionStorage.getItem("chatshare-oauth-callback-rescue-status"),
+      pending: sessionStorage.getItem("chatshare-oauth-callback-rescue-pending"),
+      attempt: sessionStorage.getItem("chatshare-oauth-callback-rescue:dummy-action-discovery-state"),
+      action: document.querySelector("a")?.getAttribute("href")
+    })`,
+    returnByValue: true,
+  });
+  const discoveryValue = discoveryState.result.value;
+  if (
+    discoveryValue?.status !== "action-discovery-failed" ||
+    discoveryValue?.pending !== null ||
+    discoveryValue?.attempt !== "discovery-rejected" ||
+    discoveryValue?.action !== "/plugins"
+  ) {
+    throw new Error(`Unexpected action discovery state: ${JSON.stringify(discoveryValue)}`);
+  }
+  if (callbackAttempts !== 1) {
+    throw new Error(`Expected exactly one discovery callback attempt, got ${callbackAttempts}`);
+  }
+
+  await cdp.call("Page.navigate", {
+    url: `http://127.0.0.1:${appPort}/?replay=1#cs_oauth_callback=${discoveryCallback}`,
+  });
+  await waitFor(async () => {
+    const result = await cdp.call("Runtime.evaluate", {
+      expression: "document.body?.innerText.includes('no longer eligible for rescue')",
+      returnByValue: true,
+    });
+    return result.result.value === true;
+  }, 8000, "action discovery replay guard");
+  if (callbackAttempts !== 1) {
+    throw new Error(`Action discovery callback was replayed; attempts=${callbackAttempts}`);
+  }
+
+  receivedBody = null;
+  authenticated = true;
+  callbackAttempts = 0;
   await cdp.call("Runtime.evaluate", { expression: "sessionStorage.clear()", returnByValue: true });
   const workCallback = `/connector/oauth/test-id?code=dummy-code&state=dummy-work-state`;
   await cdp.call("Page.navigate", {
@@ -385,6 +458,7 @@ try {
     loggedOutCallbackPreserved: true,
     resumedCallbackAfterLogin: true,
     ownershipMismatchStopsReplay: true,
+    actionDiscoveryStopsReplay: true,
     ownershipMismatchReturnsToConnectorSettings: true,
     leftWorkSurfaceBeforeCallback: true,
     openedConnectorShellBeforeCallback: true,

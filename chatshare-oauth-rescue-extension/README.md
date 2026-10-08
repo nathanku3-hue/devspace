@@ -30,6 +30,15 @@ After this one-time setup, a valid Chatshare OAuth authorization page obtains a
 one-time proof from `127.0.0.1:7677` and submits automatically. There is no
 password prompt or approval click while DevSpace is running normally.
 
+Version `1.15.1` recognizes the distinct `Authentication succeeded, action discovery failed`
+callback failure. OAuth credentials may have been issued but Chatshare could not
+load MCP actions; this is not a login failure. The extension now stops the spent
+callback without replay, labels the failure `action-discovery-failed`, and links
+to connector settings instead of suggesting login. Diagnose authenticated MCP
+`server/discover` (2026-era clients) and/or `initialize` + `tools/list` (legacy
+clients), including the upstream error cause. This does not implement the newer
+MCP protocol or repair server-side discovery.
+
 Version `1.15.0` adds lease-scoped, event-driven Chatshare recovery sensing.
 The content script stays dormant on ordinary or stale conversations. DevSpace arms it
 only by placing a controller-owned recovery lease marker on a managed `/c/...` page;

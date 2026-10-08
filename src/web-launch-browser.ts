@@ -20,6 +20,7 @@ const execFileAsync = promisify(execFile);
 const CHATGPT_URL = "https://chatgpt.com/";
 const CHATSHARE_URL = "https://chatshare.xyz/";
 const CHATSHARE_CARLIST_URL = "https://chatshare.xyz/pastel/#/carlist";
+const CHATSHARE_PINNED_CAR_ID_KEY = "devspace:chatshare:pinned-car-id";
 const CHAT_SURFACE_HOSTS = new Set(["chatgpt.com", "chatshare.xyz"]);
 const DEVSPACE_PLUGIN_DISPLAY_PATTERN = /(?:DevSpace Local|\bdevspace\b)/i;
 const DEVSPACE_SCHEMA_SENTINELS = [
@@ -1080,7 +1081,7 @@ export async function prepareChatShareSession(page: Page, timeoutMs = 20_000): P
     }
 
     const result = await page
-      .evaluate(async () => {
+      .evaluate(async (pinKey) => {
         const response = await fetch("/frontend-api/carpage", {
           method: "POST",
           headers: {
@@ -1130,9 +1131,10 @@ export async function prepareChatShareSession(page: Page, timeoutMs = 20_000): P
           status: response.status,
           cars: payload.list as unknown[],
           preferredCarId: localStorage.getItem("crtUse"),
+          pinnedCarId: localStorage.getItem(pinKey),
           apiCode,
         };
-      })
+      }, CHATSHARE_PINNED_CAR_ID_KEY)
       .catch(() => undefined);
 
     if (result?.ok) {
@@ -1149,8 +1151,49 @@ export async function prepareChatShareSession(page: Page, timeoutMs = 20_000): P
           return Number(left.count ?? 0) - Number(right.count ?? 0);
         });
 
-      const carId = candidates[0]?.carID;
+      // An existing DevSpace connection belongs to the selected ChatShare-backed
+      // account. Never silently migrate it to the next eligible Pro account.
+      // crtUse alone is mutable by ChatShare, so retain a separate DevSpace pin.
+      if (
+        result.pinnedCarId &&
+        result.preferredCarId &&
+        result.pinnedCarId !== result.preferredCarId
+      ) {
+        throw new WebLaunchBrowserError(
+          "ChatShare selected a different account than the DevSpace-pinned session; refusing automatic account switch or OAuth reconnect. Restore the original ChatShare session before retrying.",
+        );
+      }
+      const selectedCarId = result.pinnedCarId || result.preferredCarId;
+      const carId = selectedCarId ?? candidates[0]?.carID;
+      if (selectedCarId && !candidates.some((candidate) => candidate.carID === selectedCarId)) {
+        throw new WebLaunchBrowserError(
+          "The selected ChatShare account is no longer an available ChatGPT Pro session; refusing automatic account switch or OAuth reconnect. Restore the original session before retrying.",
+        );
+      }
       if (typeof carId === "string") {
+        // Fail closed if another tab changes the selection during inventory
+        // resolution. Pin before either reusing or authorizing a session.
+        const pinned = await page.evaluate(
+          ({ pinKey, expectedPin, expectedPreferred, carId }) => {
+            if (
+              localStorage.getItem(pinKey) !== expectedPin ||
+              localStorage.getItem("crtUse") !== expectedPreferred
+            ) return false;
+            localStorage.setItem(pinKey, carId);
+            return true;
+          },
+          {
+            pinKey: CHATSHARE_PINNED_CAR_ID_KEY,
+            expectedPin: result.pinnedCarId,
+            expectedPreferred: result.preferredCarId,
+            carId,
+          },
+        );
+        if (!pinned) {
+          throw new WebLaunchBrowserError(
+            "ChatShare account selection changed during session preparation; refusing automatic account switch or OAuth reconnect.",
+          );
+        }
         if (carId === result.preferredCarId) {
           await page.goto(CHATSHARE_URL, { waitUntil: "domcontentloaded", timeout: 30_000 });
           const reused = new URL(page.url());

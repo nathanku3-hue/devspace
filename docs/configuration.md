@@ -68,6 +68,26 @@ password or a silent proof from the enrolled PC.
 | `DEVSPACE_OAUTH_SCOPES` | `devspace` |
 | `DEVSPACE_OAUTH_ALLOWED_REDIRECT_HOSTS` | `chatgpt.com,chatshare.xyz,localhost,127.0.0.1` |
 
+### ChatShare browser account pinning
+
+The DevSpace ChatShare browser runner stores its selected ChatGPT Pro `carID` in
+`localStorage` under `devspace:chatshare:pinned-car-id`, separately from ChatShare\'s
+mutable `crtUse` preference. On the first run it pins the existing preference
+(or selects the first eligible Pro account if none is selected). Subsequent
+launches refuse to silently fall back to a different account if the pinned
+account becomes unavailable, or if another tab switches `crtUse`. This avoids
+starting a connector OAuth flow under a different underlying account while the
+outer ChatShare login remains active.
+
+To intentionally change accounts, first disconnect the existing DevSpace link
+under its original ChatShare-backed account and complete any pending OAuth
+attempts. In the **dedicated DevSpace ChatShare browser profile**, clear only
+`localStorage.removeItem("devspace:chatshare:pinned-car-id")`, select the intended
+account, then create a fresh authorization. Do not replay a rejected callback.
+This protects the DevSpace-controlled browser path; it cannot repair a ChatShare
+server-side ownership mismatch or an OAuth callback initiated in an unrelated
+Chrome profile.
+
 ### Silent Enrolled-PC Authorization
 
 | Variable | Default |

@@ -68,7 +68,7 @@
 
   const attemptKey = `chatshare-oauth-callback-rescue:${state}`;
   const previousAttempt = sessionStorage.getItem(attemptKey);
-  if (previousAttempt === "navigated" || previousAttempt === "ownership-rejected") {
+  if (["navigated", "ownership-rejected", "discovery-rejected"].includes(previousAttempt)) {
     sessionStorage.removeItem(pendingKey);
     sessionStorage.removeItem(returnKey);
     renderFailure(
@@ -149,6 +149,10 @@
           .catch((error) => {
             if (isOwnershipError(error)) {
               handleOwnershipMismatch(error);
+              return;
+            }
+            if (isActionDiscoveryError(error)) {
+              handleActionDiscoveryFailure(error);
               return;
             }
             renderFailure(
@@ -449,6 +453,24 @@
 
   function isOwnershipError(error) {
     return /oauth link is not owned by the user/i.test(safeErrorMessage(error));
+  }
+
+  function isActionDiscoveryError(error) {
+    return /authentication succeeded, action discovery failed/i.test(safeErrorMessage(error));
+  }
+
+  function handleActionDiscoveryFailure(error) {
+    sessionStorage.setItem(attemptKey, "discovery-rejected");
+    sessionStorage.setItem(rescueStatusKey, "action-discovery-failed");
+    sessionStorage.removeItem(pendingKey);
+    sessionStorage.removeItem(returnKey);
+    renderFailure(
+      `Chatshare accepted OAuth authentication, but MCP action discovery failed: ${safeErrorMessage(error)}. This callback cannot be replayed. Check the existing connector and refresh its actions from settings; investigate the authenticated MCP discovery response before authorizing again.`,
+      {
+        actionHref: connectorShellPath,
+        actionLabel: "Return to connector settings",
+      },
+    );
   }
 
   function handleOwnershipMismatch(error) {

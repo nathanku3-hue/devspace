@@ -1518,6 +1518,130 @@ test("ChatShare provider refuses PLUS-only inventory instead of bypassing the Pr
   }
 });
 
+test("ChatShare pins the first Pro session and refuses to switch when it disappears", async () => {
+  const browser = await launchInstalledChrome();
+  try {
+    const context = await browser.newContext();
+    let availableIds = ["pro-original"];
+    const loginSessionCalls: string[] = [];
+    await context.route("https://chatshare.xyz/**", (route) => {
+      const url = new URL(route.request().url());
+      if (url.pathname === "/frontend-api/carpage") {
+        return route.fulfill({
+          status: 200,
+          contentType: "application/json",
+          body: JSON.stringify({
+            code: 1,
+            data: {
+              list: availableIds.map((carID) => ({
+                carID, isPro: true, status: 1, count: 1, clears_in: 0, team_clears_in: 0,
+              })),
+            },
+          }),
+        });
+      }
+      if (url.pathname === "/auth/loginSession") {
+        loginSessionCalls.push(url.searchParams.get("carid") ?? "");
+        return route.fulfill({
+          status: 200,
+          contentType: "application/json",
+          body: '{"code":1}',
+        });
+      }
+      return route.fulfill({
+        status: 200,
+        contentType: "text/html",
+        body: "<!doctype html><html><body>ChatShare ready</body></html>",
+      });
+    });
+
+    const page = await context.newPage();
+    await prepareChatShareSession(page, 2_000);
+    assert.deepEqual(loginSessionCalls, ["pro-original"]);
+    assert.deepEqual(await page.evaluate(() => ({
+      preferred: localStorage.getItem("crtUse"),
+      pinned: localStorage.getItem("devspace:chatshare:pinned-car-id"),
+    })), { preferred: "pro-original", pinned: "pro-original" });
+
+    // The other Pro account must not become the new OAuth owner automatically.
+    availableIds = ["pro-other"];
+    await assert.rejects(
+      prepareChatShareSession(page, 1_000),
+      /selected ChatShare account is no longer an available ChatGPT Pro session.*refusing automatic account switch/i,
+    );
+    assert.deepEqual(loginSessionCalls, ["pro-original"]);
+    assert.deepEqual(await page.evaluate(() => ({
+      preferred: localStorage.getItem("crtUse"),
+      pinned: localStorage.getItem("devspace:chatshare:pinned-car-id"),
+    })), { preferred: "pro-original", pinned: "pro-original" });
+
+    // Once the original account returns, reuse it without a new loginSession.
+    availableIds = ["pro-other", "pro-original"];
+    await prepareChatShareSession(page, 2_000);
+    assert.deepEqual(loginSessionCalls, ["pro-original"]);
+    await context.close();
+  } finally {
+    await browser.close();
+  }
+});
+
+test("ChatShare rejects an external account change instead of overwriting the DevSpace pin", async () => {
+  const browser = await launchInstalledChrome();
+  try {
+    const context = await browser.newContext();
+    let loginSessionCalls = 0;
+    await context.route("https://chatshare.xyz/**", (route) => {
+      const url = new URL(route.request().url());
+      if (url.pathname === "/frontend-api/carpage") {
+        return route.fulfill({
+          status: 200,
+          contentType: "application/json",
+          body: JSON.stringify({
+            code: 1,
+            data: {
+              list: ["pro-original", "pro-other"].map((carID) => ({
+                carID, isPro: true, status: 1, count: 1, clears_in: 0, team_clears_in: 0,
+              })),
+            },
+          }),
+        });
+      }
+      if (url.pathname === "/auth/loginSession") {
+        loginSessionCalls += 1;
+      }
+      return route.fulfill({
+        status: 200,
+        contentType: "text/html",
+        body: "<!doctype html><html><body>ChatShare ready</body></html>",
+      });
+    });
+    const page = await context.newPage();
+    await page.goto("https://chatshare.xyz/");
+    await page.evaluate(() => localStorage.setItem("crtUse", "pro-original"));
+    // A preexisting, connected preference is reused and pinned without loginSession.
+    await prepareChatShareSession(page, 1_000);
+    assert.equal(loginSessionCalls, 0);
+    assert.equal(
+      await page.evaluate(() => localStorage.getItem("devspace:chatshare:pinned-car-id")),
+      "pro-original",
+    );
+    // Another ChatShare tab can change crtUse without changing the outer login.
+    await page.evaluate(() => localStorage.setItem("crtUse", "pro-other"));
+    await assert.rejects(
+      prepareChatShareSession(page, 1_000),
+      /different account than the DevSpace-pinned session.*refusing automatic account switch/i,
+    );
+    assert.equal(loginSessionCalls, 0);
+    assert.deepEqual(await page.evaluate(() => ({
+      preferred: localStorage.getItem("crtUse"),
+      pinned: localStorage.getItem("devspace:chatshare:pinned-car-id"),
+    })), { preferred: "pro-other", pinned: "pro-original" });
+    await context.close();
+  } finally {
+    await browser.close();
+  }
+});
+
 test("connected prompt preserves an explicit external DevSpace app selection chip", async () => {
   const browser = await launchInstalledChrome();
   try {
