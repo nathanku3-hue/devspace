@@ -769,6 +769,149 @@ function Get-DevSpaceCloudflaredLaunchCommand {
     return '"{0}" tunnel --url http://{1}:{2} --protocol http2 --edge-ip-version 4 --no-autoupdate --loglevel info --logfile "{3}"' -f $Executable, $LocalHost, $LocalPort, $LogFile
 }
 
+# Get-NetTCPConnection relies on CIM and can hang forever when WMI is unhealthy.
+# Run the native Windows netstat executable with a hard deadline instead.
+function Invoke-DevSpaceBoundedCommand {
+    param(
+        [Parameter(Mandatory = $true)][string]$FilePath,
+        [string]$Arguments = "",
+        [ValidateRange(100, 60000)][int]$TimeoutMs = 3000
+    )
+
+    $startInfo = New-Object System.Diagnostics.ProcessStartInfo
+    $startInfo.FileName = $FilePath
+    $startInfo.Arguments = $Arguments
+    $startInfo.UseShellExecute = $false
+    $startInfo.CreateNoWindow = $true
+    $startInfo.RedirectStandardOutput = $true
+    $process = New-Object System.Diagnostics.Process
+    $process.StartInfo = $startInfo
+    try {
+        if (-not $process.Start()) {
+            throw "Unable to start '$FilePath'."
+        }
+        # Drain stdout concurrently so a full pipe cannot block the child.
+        $outputTask = $process.StandardOutput.ReadToEndAsync()
+        if (-not $process.WaitForExit($TimeoutMs)) {
+            try { $process.Kill() } catch {}
+            throw "Command '$FilePath $Arguments' exceeded ${TimeoutMs}ms; refusing to assume any ports are free."
+        }
+        $output = $outputTask.GetAwaiter().GetResult()
+        if ($process.ExitCode -ne 0) {
+            throw "Command '$FilePath $Arguments' exited with code $($process.ExitCode)."
+        }
+        return $output
+    } finally {
+        $process.Dispose()
+    }
+}
+
+# WMI process creation is intentionally detached from the setup job object, but
+# must not be invoked in the setup PowerShell process: a broken WMI provider can
+# block it indefinitely. Only a bounded child is allowed to call Invoke-CimMethod.
+function Invoke-DevSpaceDetachedWmiLauncher {
+    param(
+        [Parameter(Mandatory = $true)][string]$LauncherCmd,
+        [Parameter(Mandatory = $true)][string]$CurrentDirectory,
+        [ValidateRange(100, 60000)][int]$TimeoutMs = 12000,
+        [switch]$DirectProcess
+    )
+
+    $commandLine = if ($DirectProcess) { $LauncherCmd } else { "cmd.exe /c `"$LauncherCmd`"" }
+    $cmd64 = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($commandLine))
+    $dir64 = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($CurrentDirectory))
+    $scriptText = @'
+$ErrorActionPreference = "Stop"
+$cmd = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String("CMD64"))
+$dir = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String("DIR64"))
+$created = Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{
+    CommandLine = $cmd
+    CurrentDirectory = $dir
+} -ErrorAction Stop
+if ($created.ReturnValue -ne 0 -or -not $created.ProcessId) {
+    throw "WMI Create failed: $($created.ReturnValue)"
+}
+[Console]::Out.Write([int]$created.ProcessId)
+'@
+    $scriptText = $scriptText.Replace("CMD64", $cmd64).Replace("DIR64", $dir64)
+    $encodedScript = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($scriptText))
+    $powershellPath = Join-Path $env:WINDIR "System32\WindowsPowerShell\v1.0\powershell.exe"
+    $result = Invoke-DevSpaceBoundedCommand -FilePath $powershellPath -Arguments "-NoProfile -NonInteractive -EncodedCommand $encodedScript" -TimeoutMs $TimeoutMs
+    $pidText = $result.Trim()
+    if ($pidText -notmatch '^\d+$' -or [int]$pidText -le 0) {
+        throw "Detached WMI launch returned no valid PID; refusing to assume that an origin was started."
+    }
+    return [int]$pidText
+}
+
+function ConvertFrom-DevSpaceNetstatListeners {
+    param([AllowEmptyString()][string]$Text)
+
+    foreach ($line in ($Text -split "\r?\n")) {
+        if ($line -notmatch '^\s*TCP\s+(\S+)\s+(\S+)\s+(\S+)\s+(\d+)\s*$') {
+            continue
+        }
+        $localEndpoint = $Matches[1]
+        $remoteEndpoint = $Matches[2]
+        $state = $Matches[3]
+        $ownerPid = [int]$Matches[4]
+        # Windows netstat state labels may be localized. A zero remote port
+        # identifies a TCP listener even when LISTENING is translated.
+        if ($state -ne "LISTENING" -and $remoteEndpoint -notmatch ':0$') {
+            continue
+        }
+        if ($localEndpoint -notmatch ':(\d+)$' -or $ownerPid -le 0) {
+            continue
+        }
+        [pscustomobject]@{
+            LocalPort     = [int]$Matches[1]
+            LocalEndpoint = $localEndpoint
+            OwningProcess = $ownerPid
+        }
+    }
+}
+
+function Get-DevSpaceTcpListeners {
+    param(
+        [Parameter(Mandatory = $true)][int[]]$Ports,
+        [int]$TimeoutMs = 3000
+    )
+
+    $netstat = Join-Path ([Environment]::SystemDirectory) "netstat.exe"
+    $output = Invoke-DevSpaceBoundedCommand -FilePath $netstat -Arguments "-ano -p tcp" -TimeoutMs $TimeoutMs
+    $wanted = New-Object 'System.Collections.Generic.HashSet[int]'
+    foreach ($port in $Ports) { [void]$wanted.Add($port) }
+    foreach ($listener in @(ConvertFrom-DevSpaceNetstatListeners -Text $output)) {
+        if ($wanted.Contains([int]$listener.LocalPort)) {
+            $listener
+        }
+    }
+}
+
+function Assert-DevSpaceVerifiedListenerOwners {
+    param(
+        [Parameter(Mandatory = $true)][object[]]$Listeners,
+        [Parameter(Mandatory = $true)][int[]]$KnownNodePids
+    )
+    foreach ($listener in $Listeners) {
+        $ownerPid = [int]$listener.OwningProcess
+        if ($KnownNodePids -notcontains $ownerPid -or
+            -not (Get-DevSpaceProcessRecordByPid -ProcessId $ownerPid -ExpectedName "node.exe")) {
+            throw "Port $($listener.LocalPort) is held by unverified PID $ownerPid. Refusing to terminate an unrelated process."
+        }
+    }
+}
+
+function Assert-DevSpaceRecycleSafe {
+    param(
+        [Parameter(Mandatory = $true)][bool]$LocalHealthy,
+        [switch]$ForceRecycle
+    )
+    if ($LocalHealthy -and -not $ForceRecycle) {
+        throw "DevSpace origin recovered before recycle; refusing to stop a healthy origin. Rerun setup to select a non-destructive heal path."
+    }
+}
+
 function Get-DevSpaceProcessRecordByPid {
     param(
         [Parameter(Mandatory = $true)][int]$ProcessId,

@@ -3,6 +3,7 @@ $supportScript = Join-Path $here "setup-devspace-support.ps1"
 $lifecycleScript = Join-Path $here "setup-devspace-lifecycle.ps1"
 . $supportScript
 . $lifecycleScript
+. (Join-Path $here "devspace-supervisor.ps1") -LibraryOnly
 
 Describe "DevSpace setup script syntax" {
     It "parses the production setup script without PowerShell syntax errors" {
@@ -11,6 +12,135 @@ Describe "DevSpace setup script syntax" {
         $errors = $null
         [void][System.Management.Automation.Language.Parser]::ParseFile($setupScript, [ref]$tokens, [ref]$errors)
         @($errors).Count | Should Be 0
+    }
+}
+
+Describe "DevSpace supervisor WMI hardening" {
+    It "parses the supervisor source without syntax errors" {
+        $tokens = $null
+        $errors = $null
+        [void][System.Management.Automation.Language.Parser]::ParseFile((Join-Path $here "devspace-supervisor.ps1"), [ref]$tokens, [ref]$errors)
+        @($errors).Count | Should Be 0
+    }
+
+    It "fails closed when the supervisor WMI child times out" {
+        Mock Invoke-DevSpaceSupervisorBoundedPowerShell { throw "CIM timed out" }
+        { Get-DevSpaceSupervisorProcessRecords -Name "node.exe" } | Should Throw
+    }
+
+    It "distinguishes a valid empty process table from a failed query" {
+        Mock Invoke-DevSpaceSupervisorBoundedPowerShell { return "[]" }
+        @(Get-DevSpaceSupervisorProcessRecords -Name "cloudflared.exe").Count | Should Be 0
+        Assert-MockCalled Invoke-DevSpaceSupervisorBoundedPowerShell -Times 1
+    }
+
+    It "rejects an empty WMI response rather than assuming no process exists" {
+        Mock Invoke-DevSpaceSupervisorBoundedPowerShell { return "" }
+        { Get-DevSpaceSupervisorProcessRecords -Name "cloudflared.exe" } | Should Throw
+        Assert-MockCalled Invoke-DevSpaceSupervisorBoundedPowerShell -Times 1
+    }
+}
+
+Describe "DevSpace bounded native port lookup" {
+    $netstatText = @'
+  Proto  Local Address          Foreign Address        State           PID
+  TCP    127.0.0.1:7676         0.0.0.0:0              LISTENING       756
+  TCP    [::1]:7677             [::]:0                 LISTENING       756
+  TCP    127.0.0.1:76760        0.0.0.0:0              LISTENING       999
+  TCP    127.0.0.1:7676         127.0.0.1:12345        ESTABLISHED     999
+'@
+
+    It "parses IPv4 and IPv6 listeners but not nearby ports or established sockets" {
+        $result = @(ConvertFrom-DevSpaceNetstatListeners -Text $netstatText)
+        $result.Count | Should Be 3
+        $result[0].LocalPort | Should Be 7676
+        $result[0].OwningProcess | Should Be 756
+        $result[1].LocalPort | Should Be 7677
+        $result[1].OwningProcess | Should Be 756
+    }
+
+    It "recognizes a localized listener state from its zero remote port" {
+        $localized = '  TCP    127.0.0.1:7676     0.0.0.0:0      ABHOREN    314'
+        $result = @(ConvertFrom-DevSpaceNetstatListeners -Text $localized)
+        $result.Count | Should Be 1
+        $result[0].OwningProcess | Should Be 314
+    }
+
+    It "limits the result to the requested DevSpace port" {
+        Mock Invoke-DevSpaceBoundedCommand { return $netstatText }
+        $result = @(Get-DevSpaceTcpListeners -Ports @(7676))
+        $result.Count | Should Be 1
+        $result[0].OwningProcess | Should Be 756
+        Assert-MockCalled Invoke-DevSpaceBoundedCommand -Times 1
+    }
+
+    It "fails closed rather than treating netstat timeout as an empty port" {
+        Mock Invoke-DevSpaceBoundedCommand { throw "netstat timed out" }
+        { Get-DevSpaceTcpListeners -Ports @(7676, 7677) } | Should Throw
+    }
+
+    It "enforces a hard deadline on an unresponsive native child" {
+        $exe = Join-Path $env:WINDIR "System32\WindowsPowerShell\v1.0\powershell.exe"
+        $clock = [System.Diagnostics.Stopwatch]::StartNew()
+        { Invoke-DevSpaceBoundedCommand -FilePath $exe -Arguments '-NoProfile -NonInteractive -Command "Start-Sleep -Seconds 10"' -TimeoutMs 200 } | Should Throw
+        $clock.Stop()
+        ($clock.Elapsed.TotalSeconds -lt 5) | Should Be $true
+    }
+}
+
+Describe "DevSpace bounded WMI launcher" {
+    It "uses a bounded child PowerShell rather than calling CIM in the setup process" {
+        Mock Invoke-DevSpaceBoundedCommand { return "4321" }
+        $id = Invoke-DevSpaceDetachedWmiLauncher -LauncherCmd "C:\temp\origin-launch.cmd" -CurrentDirectory "C:\temp"
+        $id | Should Be 4321
+        Assert-MockCalled Invoke-DevSpaceBoundedCommand -Times 1 -ParameterFilter {
+            $TimeoutMs -eq 12000 -and $Arguments -match '^-NoProfile -NonInteractive -EncodedCommand '
+        }
+    }
+
+    It "supports directly launching cloudflared without a cmd.exe wrapper" {
+        Mock Invoke-DevSpaceBoundedCommand { return "1234" }
+        $id = Invoke-DevSpaceDetachedWmiLauncher -LauncherCmd '"C:\cloudflared.exe" tunnel --url http://127.0.0.1:7676' -CurrentDirectory "C:\temp" -DirectProcess
+        $id | Should Be 1234
+        Assert-MockCalled Invoke-DevSpaceBoundedCommand -Times 1
+    }
+
+    It "fails closed if the detached launcher returns no PID" {
+        Mock Invoke-DevSpaceBoundedCommand { return "" }
+        { Invoke-DevSpaceDetachedWmiLauncher -LauncherCmd "test.cmd" -CurrentDirectory "C:\temp" } | Should Throw
+    }
+}
+
+Describe "DevSpace recycle custody guards" {
+    It "refuses recovered origins unless explicitly force-recycled" {
+        { Assert-DevSpaceRecycleSafe -LocalHealthy $true } | Should Throw
+        { Assert-DevSpaceRecycleSafe -LocalHealthy $true -ForceRecycle } | Should Not Throw
+        { Assert-DevSpaceRecycleSafe -LocalHealthy $false } | Should Not Throw
+    }
+
+    It "rejects an unknown listener PID without attempting process termination" {
+        $listeners = @([pscustomobject]@{ LocalPort = 7676; OwningProcess = 321 })
+        { Assert-DevSpaceVerifiedListenerOwners -Listeners $listeners -KnownNodePids @(123) } | Should Throw
+    }
+
+    It "rejects a remembered PID if the executable is not Node" {
+        Mock Get-DevSpaceProcessRecordByPid { return $null }
+        $listeners = @([pscustomobject]@{ LocalPort = 7676; OwningProcess = 321 })
+        { Assert-DevSpaceVerifiedListenerOwners -Listeners $listeners -KnownNodePids @(321) } | Should Throw
+    }
+
+    It "accepts the remembered Node process that owns the port" {
+        Mock Get-DevSpaceProcessRecordByPid { return [pscustomobject]@{ Name = "node.exe"; ProcessId = 321 } }
+        $listeners = @([pscustomobject]@{ LocalPort = 7676; OwningProcess = 321 })
+        { Assert-DevSpaceVerifiedListenerOwners -Listeners $listeners -KnownNodePids @(321) } | Should Not Throw
+    }
+
+    It "accepts HashSet custody PIDs passed by the recycle workflow" {
+        Mock Get-DevSpaceProcessRecordByPid { return [pscustomobject]@{ Name = "node.exe"; ProcessId = 321 } }
+        $known = New-Object 'System.Collections.Generic.HashSet[int]'
+        [void]$known.Add(321)
+        $listeners = @([pscustomobject]@{ LocalPort = 7676; OwningProcess = 321 })
+        { Assert-DevSpaceVerifiedListenerOwners -Listeners $listeners -KnownNodePids @($known) } | Should Not Throw
     }
 }
 

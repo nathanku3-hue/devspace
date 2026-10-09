@@ -191,12 +191,30 @@ function Get-DevSpaceSupervisorConfig {
     return $config
 }
 
+function Get-DevSpaceSupervisorProcessRecords {
+    param([Parameter(Mandatory = $true)][ValidateSet("node.exe", "cloudflared.exe")][string]$Name)
+
+    $scriptText = @'
+$ErrorActionPreference = "Stop"
+$records = @(Get-CimInstance Win32_Process -Filter "Name='PROCESSNAME'" -ErrorAction Stop |
+    Select-Object Name, ProcessId, CommandLine)
+[Console]::Out.Write((ConvertTo-Json -InputObject $records -Compress -Depth 3))
+'@
+    $output = Invoke-DevSpaceSupervisorBoundedPowerShell -ScriptText ($scriptText.Replace("PROCESSNAME", $Name))
+    if ([string]::IsNullOrWhiteSpace($output)) {
+        throw "WMI query for $Name returned no process inventory; refusing an unsafe recovery decision."
+    }
+    $records = ConvertFrom-Json -InputObject $output
+    if ($null -eq $records) { return @() }
+    return @($records)
+}
+
 function Get-DevSpaceSupervisorOriginProcesses {
     param([Parameter(Mandatory = $true)][pscustomobject]$Config)
 
     $cli = ([string]$Config.cliPath).ToLowerInvariant()
     return @(
-        Get-CimInstance Win32_Process -Filter "Name='node.exe'" -ErrorAction SilentlyContinue |
+        Get-DevSpaceSupervisorProcessRecords -Name "node.exe" |
             Where-Object {
                 $line = [string]$_.CommandLine
                 -not [string]::IsNullOrWhiteSpace($line) -and
@@ -216,7 +234,7 @@ function Get-DevSpaceSupervisorTunnelProcesses {
     }
 
     return @(
-        Get-CimInstance Win32_Process -Filter "Name='cloudflared.exe'" -ErrorAction SilentlyContinue |
+        Get-DevSpaceSupervisorProcessRecords -Name "cloudflared.exe" |
             Where-Object {
                 $line = [string]$_.CommandLine
                 # cloudflared often scrubs its command line after connecting.
@@ -398,6 +416,67 @@ function Get-DevSpaceSupervisorQuickTunnelUrlFromLogs {
     return $matches[$matches.Count - 1].Value
 }
 
+# The elevated supervisor is copied to ProgramData as a standalone file, so it
+# cannot import the setup helpers. Keep WMI Create inside a bounded child here.
+# All supervisor CIM work runs in a disposable PowerShell child with a hard
+# timeout. A stalled WMI provider must never stall the SYSTEM scheduled task.
+function Invoke-DevSpaceSupervisorBoundedPowerShell {
+    param(
+        [Parameter(Mandatory = $true)][string]$ScriptText,
+        [ValidateRange(100, 60000)][int]$TimeoutMs = 12000
+    )
+    $encoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($ScriptText))
+    $info = New-Object System.Diagnostics.ProcessStartInfo
+    $info.FileName = Join-Path $env:WINDIR "System32\WindowsPowerShell\v1.0\powershell.exe"
+    $info.Arguments = "-NoProfile -NonInteractive -EncodedCommand $encoded"
+    $info.UseShellExecute = $false
+    $info.CreateNoWindow = $true
+    $info.RedirectStandardOutput = $true
+    $child = New-Object System.Diagnostics.Process
+    $child.StartInfo = $info
+    try {
+        if (-not $child.Start()) { throw "Unable to start bounded supervisor WMI child." }
+        $outputTask = $child.StandardOutput.ReadToEndAsync()
+        if (-not $child.WaitForExit($TimeoutMs)) {
+            try { $child.Kill() } catch {}
+            throw "Supervisor WMI command timed out after ${TimeoutMs}ms; refusing to infer an empty process table."
+        }
+        $output = $outputTask.GetAwaiter().GetResult().Trim()
+        if ($child.ExitCode -ne 0) {
+            throw "Supervisor WMI command failed (exit=$($child.ExitCode)); process state is unknown."
+        }
+        return $output
+    } finally {
+        $child.Dispose()
+    }
+}
+
+function Invoke-DevSpaceSupervisorBoundedWmiCreate {
+    param(
+        [Parameter(Mandatory = $true)][string]$CommandLine,
+        [ValidateRange(100, 60000)][int]$TimeoutMs = 12000
+    )
+
+    $command64 = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($CommandLine))
+    $scriptText = @'
+$ErrorActionPreference = "Stop"
+$commandLine = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String("COMMAND64"))
+$result = Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{
+    CommandLine = $commandLine
+} -ErrorAction Stop
+if ($result.ReturnValue -ne 0 -or -not $result.ProcessId) {
+    throw "WMI Create failed: $($result.ReturnValue)"
+}
+[Console]::Out.Write([int]$result.ProcessId)
+'@
+    $scriptText = $scriptText.Replace("COMMAND64", $command64)
+    $output = Invoke-DevSpaceSupervisorBoundedPowerShell -ScriptText $scriptText -TimeoutMs $TimeoutMs
+    if ($output -notmatch '^\d+$' -or [int]$output -le 0) {
+        throw "WMI process creation returned no trusted child PID."
+    }
+    return [int]$output
+}
+
 function Start-DevSpaceSupervisorQuickTunnel {
     param([Parameter(Mandatory = $true)][pscustomobject]$Config)
 
@@ -410,15 +489,11 @@ function Start-DevSpaceSupervisorQuickTunnel {
         "--logfile", $Config.quickTunnelStderrLog
     )
     $commandLine = '"{0}" {1}' -f $Config.cloudflaredExe, ($arguments -join " ")
-    $created = Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{
-        CommandLine = $commandLine
-    }
-    if ($created.ReturnValue -ne 0 -or -not $created.ProcessId) {
-        throw "Supervisor failed to start cloudflared via WMI (ReturnValue=$($created.ReturnValue))."
-    }
-    $process = Get-Process -Id $created.ProcessId -ErrorAction SilentlyContinue
+    Write-DevSpaceSupervisorLog "Requesting detached cloudflared via bounded WMI child (12s deadline)."
+    $createdPid = Invoke-DevSpaceSupervisorBoundedWmiCreate -CommandLine $commandLine
+    $process = Get-Process -Id $createdPid -ErrorAction SilentlyContinue
     if ($null -eq $process) {
-        throw "Supervisor started cloudflared PID $($created.ProcessId) but the process handle was missing."
+        throw "Supervisor started cloudflared PID $createdPid but the process handle was missing."
     }
     Write-DevSpaceSupervisorLog "Started quick tunnel PID=$($process.Id)."
     try { Protect-DevSpaceSupervisorProcess -ProcessId $process.Id } catch {}

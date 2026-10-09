@@ -56,6 +56,7 @@ $script:probeClientFile = Join-Path $env:USERPROFILE ".devspace\setup-probe-clie
 $script:setupLockFile = Join-Path $env:USERPROFILE ".devspace\setup.lock"
 $script:setupLockHeld = $false
 $script:previousDistDirectory = $null
+$script:recycleMutationsAuthorized = $false
 
 $PublicProxyBase = "https://devspace-proxy.kitlongku.workers.dev"
 $LocalHost = "127.0.0.1"
@@ -702,37 +703,43 @@ function Save-RuntimeState {
 }
 
 function Stop-DevSpaceRuntime {
-    Write-SetupLog "Stopping DevSpace runtime..."
-    $pids = @()
-    if (Test-Path $script:runtimePidFile) {
-        try {
-            $state = Get-Content $script:runtimePidFile -Raw | ConvertFrom-Json
-            if ($state.devspacePid) { $pids += [int]$state.devspacePid }
-            if ($state.cloudflaredPid) { $pids += [int]$state.cloudflaredPid }
-        } catch {}
+    Write-SetupLog "[STOP] Cleaning up remembered runtime custody (no global process sweeps)."
+    $state = Read-DevSpaceRuntimeState
+    if ($null -eq $state) {
+        Write-SetupLog "[STOP] No valid runtime custody record; skipping unverified processes." "WARN"
+        return
     }
-    foreach ($procId in $pids) {
-        try {
-            Stop-Process -Id $procId -Force -ErrorAction SilentlyContinue
-            Write-SetupLog "  Stopped PID $procId"
-        } catch {}
+
+    # This query has a hard deadline. A failed query must not be interpreted as
+    # an empty port, nor be an excuse to kill arbitrary processes.
+    $listeners = @(Get-DevSpaceTcpListeners -Ports @($LocalPort, $DeviceProofPort))
+    $nodePid = if ($state.devspacePid) { [int]$state.devspacePid } else { 0 }
+    $owners = @($listeners | Select-Object -ExpandProperty OwningProcess -Unique)
+    foreach ($ownerPid in $owners) {
+        if ($ownerPid -ne $nodePid -or -not (Get-DevSpaceProcessRecordByPid -ProcessId $ownerPid -ExpectedName "node.exe")) {
+            Write-SetupLog "[STOP] Port owner PID $ownerPid is unverified; leaving it alone." "WARN"
+            continue
+        }
+        Stop-Process -Id $ownerPid -Force -ErrorAction Stop
+        Write-SetupLog "[STOP] Stopped remembered origin PID $ownerPid."
     }
-    # Port-based sweep for orphans
-    foreach ($port in @($LocalPort, $DeviceProofPort)) {
-        try {
-            Get-NetTCPConnection -LocalPort $port -State Listen -ErrorAction SilentlyContinue | ForEach-Object {
-                Stop-Process -Id $_.OwningProcess -Force -ErrorAction SilentlyContinue
-                Write-SetupLog "  Freed port $port (PID $($_.OwningProcess))"
-            }
-        } catch {}
+
+    $tunnelPid = if ($state.cloudflaredPid) { [int]$state.cloudflaredPid } else { 0 }
+    if ($tunnelPid -gt 0 -and (Get-DevSpaceProcessRecordByPid -ProcessId $tunnelPid -ExpectedName "cloudflared.exe")) {
+        Stop-Process -Id $tunnelPid -Force -ErrorAction Stop
+        Write-SetupLog "[STOP] Stopped remembered cloudflared PID $tunnelPid."
     }
-    Get-Process -Name "cloudflared", "ngrok" -ErrorAction SilentlyContinue | ForEach-Object {
-        Stop-Process -Id $_.Id -Force -ErrorAction SilentlyContinue
+
+    if ((Test-PortOpen $LocalHost $LocalPort 200) -or (Test-PortOpen $LocalHost $DeviceProofPort 200)) {
+        Write-SetupLog "[STOP] DevSpace ports remain occupied; preserving runtime custody for investigation." "WARN"
+        return
     }
-    if (Test-Path $script:runtimePidFile) {
-        Remove-Item $script:runtimePidFile -Force -ErrorAction SilentlyContinue
+    if ($tunnelPid -gt 0 -and (Get-Process -Id $tunnelPid -ErrorAction SilentlyContinue)) {
+        Write-SetupLog "[STOP] Remembered tunnel PID remains alive; preserving runtime custody." "WARN"
+        return
     }
-    Write-SetupLog "Stop complete."
+    Remove-Item -LiteralPath $script:runtimePidFile -Force -ErrorAction SilentlyContinue
+    Write-SetupLog "[STOP] Runtime custody cleanup complete."
 }
 
 function Find-DevSpaceServeProcess {
@@ -741,14 +748,17 @@ function Find-DevSpaceServeProcess {
     if ($null -ne $state -and $state.devspacePid) {
         $rememberedPid = [int]$state.devspacePid
     }
+    Write-SetupLog "[CHECK] Looking up origin listener on port $LocalPort (bounded native netstat)."
+    $listen = @(Get-DevSpaceTcpListeners -Ports @($LocalPort))
     $listenerPid = 0
-    try {
-        $listen = @(Get-NetTCPConnection -LocalPort $LocalPort -State Listen -ErrorAction SilentlyContinue)
-        if ($listen.Count -gt 0 -and $listen[0].OwningProcess) {
-            $listenerPid = [int]$listen[0].OwningProcess
+    if ($listen.Count -gt 0) {
+        $owners = @($listen | Select-Object -ExpandProperty OwningProcess -Unique)
+        if ($owners.Count -ne 1) {
+            throw "Port $LocalPort has multiple listener PIDs; refusing ambiguous origin custody."
         }
-    } catch {
+        $listenerPid = [int]$owners[0]
     }
+    Write-SetupLog "[CHECK] Origin listener PID=$listenerPid."
 
     if ($listenerPid -gt 0) {
         $owner = Get-DevSpaceProcessRecordByPid -ProcessId $listenerPid -ExpectedName "node.exe"
@@ -779,39 +789,57 @@ function Find-DevSpaceServeProcess {
 }
 
 function Stop-DevSpaceRelatedProcesses {
-    Write-Host "Stopping existing cloudflared, ngrok, and any process holding DevSpace ports..."
+    param([switch]$ForceRecycle)
 
-    Get-Process -Name "cloudflared", "ngrok" -ErrorAction SilentlyContinue | ForEach-Object {
-        Write-Host "  Stopping PID $($_.Id): $($_.ProcessName)"
-        Stop-Process -Id $_.Id -Force -ErrorAction SilentlyContinue
-        if (Get-Process -Id $_.Id -ErrorAction SilentlyContinue) {
-            Write-SetupLog "PID $($_.Id) ($($_.ProcessName)) survived Stop-Process; it may be SYSTEM-protected." "WARN"
-        }
+    Write-SetupLog "[RECYCLE] Preflight: verifying port owners before stopping any process."
+    $listeners = @(Get-DevSpaceTcpListeners -Ports @($LocalPort, $DeviceProofPort))
+    $state = Read-DevSpaceRuntimeState
+    $knownNodePids = @()
+    if ($null -ne $script:devspaceProcess) {
+        $knownNodePids += [int]$script:devspaceProcess.Id
+    }
+    if ($null -ne $state -and $state.devspacePid) {
+        $knownNodePids += [int]$state.devspacePid
+    }
+    Assert-DevSpaceVerifiedListenerOwners -Listeners $listeners -KnownNodePids $knownNodePids
+    $nodeOwners = New-Object 'System.Collections.Generic.HashSet[int]'
+    foreach ($listener in $listeners) {
+        [void]$nodeOwners.Add([int]$listener.OwningProcess)
     }
 
-    # Always free listeners on MCP / device-proof ports (catches unknown binaries).
-    foreach ($port in @($LocalPort, $DeviceProofPort)) {
-        try {
-            $listeners = Get-NetTCPConnection -LocalPort $port -State Listen -ErrorAction SilentlyContinue
-            foreach ($listener in $listeners) {
-                $owner = $listener.OwningProcess
-                if ($owner -and $owner -ne $PID) {
-                    Write-Host "  Freeing port $port (PID $owner)"
-                    Stop-Process -Id $owner -Force -ErrorAction SilentlyContinue
-                }
-            }
-        } catch {
+    # Recheck immediately before the first destructive operation, not only at
+    # initial heal-decision time. A transient /healthz failure is not permission
+    # to recycle an origin that has already recovered.
+    Assert-DevSpaceRecycleSafe -LocalHealthy (Test-LocalDevSpaceHealthy) -ForceRecycle:$ForceRecycle
+
+    $tunnelPids = New-Object 'System.Collections.Generic.HashSet[int]'
+    if ($null -ne $script:cloudflaredProcess) {
+        [void]$tunnelPids.Add([int]$script:cloudflaredProcess.Id)
+    }
+    if ($null -ne $state -and $state.cloudflaredPid) {
+        [void]$tunnelPids.Add([int]$state.cloudflaredPid)
+    }
+    foreach ($tunnelPid in $tunnelPids) {
+        if (-not (Get-DevSpaceProcessRecordByPid -ProcessId $tunnelPid -ExpectedName "cloudflared.exe")) {
+            Write-SetupLog "[RECYCLE] Skipping stale cloudflared PID $tunnelPid." "WARN"
+            continue
         }
+        Write-SetupLog "[RECYCLE] Stopping known cloudflared PID $tunnelPid."
+        Stop-Process -Id $tunnelPid -Force -ErrorAction Stop
+    }
+    foreach ($ownerPid in $nodeOwners) {
+        Write-SetupLog "[RECYCLE] Stopping verified origin PID $ownerPid."
+        Stop-Process -Id $ownerPid -Force -ErrorAction Stop
     }
 
     Start-Sleep -Milliseconds 800
-
-    if (Test-PortOpen $LocalHost $LocalPort 200) {
-        throw "Port $LocalPort is still in use after cleanup. Close the process using it and retry."
+    foreach ($port in @($LocalPort, $DeviceProofPort)) {
+        if (Test-PortOpen $LocalHost $port 200) {
+            throw "Port $port is still in use after cleanup. Close the owning process with appropriate privileges and retry."
+        }
     }
-    if (Test-PortOpen $LocalHost $DeviceProofPort 200) {
-        throw "Port $DeviceProofPort is still in use after cleanup. Close the process using it and retry."
-    }
+    $script:recycleMutationsAuthorized = $true
+    Write-SetupLog "[RECYCLE] Verified port cleanup complete."
 }
 
 function Test-CloudflaredEdgeRegistered([string]$logPath) {
@@ -1150,14 +1178,9 @@ function Start-DevSpaceServer([string]$devspaceCli, [string]$tunnelHost) {
     )
     Set-Content -Path $launcherCmd -Value ($cmdLines -join "`r`n") -Encoding ASCII
 
-    $create = Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{
-        CommandLine      = "cmd.exe /c `"$launcherCmd`""
-        CurrentDirectory = $PSScriptRoot
-    }
-    if ($create.ReturnValue -ne 0 -or -not $create.ProcessId) {
-        throw "Failed to start DevSpace launcher via WMI (ReturnValue=$($create.ReturnValue))."
-    }
-    Write-SetupLog "Launcher PID=$($create.ProcessId) ($launcherCmd)"
+    Write-SetupLog "[START] Requesting detached WMI launcher with 12-second hard timeout."
+    $launcherPid = Invoke-DevSpaceDetachedWmiLauncher -LauncherCmd $launcherCmd -CurrentDirectory $PSScriptRoot
+    Write-SetupLog "Launcher PID=$launcherPid ($launcherCmd)"
 
     $proc = $null
     for ($i = 0; $i -lt 30; $i++) {
@@ -1402,16 +1425,17 @@ function Stop-DevSpaceCloudflaredOnly {
     if ($null -ne $state -and $state.cloudflaredPid) {
         [void]$targets.Add([int]$state.cloudflaredPid)
     }
-    Get-Process -Name "cloudflared" -ErrorAction SilentlyContinue | ForEach-Object {
-        [void]$targets.Add([int]$_.Id)
-    }
+    # Other cloudflared installations are not ours to terminate.
     foreach ($procId in $targets) {
-        Stop-Process -Id $procId -Force -ErrorAction SilentlyContinue
-        if (Get-Process -Id $procId -ErrorAction SilentlyContinue) {
-            Write-SetupLog "  cloudflared PID $procId survived Stop-Process (likely SYSTEM-protected)." "WARN"
-        } else {
-            Write-SetupLog "  Stopped cloudflared PID $procId"
+        if (-not (Get-DevSpaceProcessRecordByPid -ProcessId $procId -ExpectedName "cloudflared.exe")) {
+            Write-SetupLog "Skipping stale cloudflared PID $procId." "WARN"
+            continue
         }
+        Stop-Process -Id $procId -Force -ErrorAction Stop
+        if (Get-Process -Id $procId -ErrorAction SilentlyContinue) {
+            throw "cloudflared PID $procId survived Stop-Process; retry with an authorized operator."
+        }
+        Write-SetupLog "Stopped cloudflared PID $procId"
     }
     $script:cloudflaredProcess = $null
     Start-Sleep -Seconds 1
@@ -1447,17 +1471,11 @@ function Start-CloudflaredQuickTunnel {
         -LogFile $logFile
     # WMI Create runs outside this PowerShell job object. Start-Process -NoNewWindow
     # children are force-killed with ExitCode=null (console/job teardown).
-    $cfCreate = Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{
-        CommandLine      = $commandLine
-        CurrentDirectory = $PSScriptRoot
-    }
-    if ($cfCreate.ReturnValue -ne 0 -or -not $cfCreate.ProcessId) {
-        throw "cloudflared failed to start via WMI (ReturnValue=$($cfCreate.ReturnValue)). Job-affined Start-Process is not used because it is force-killed with ExitCode=null."
-    }
-    Write-SetupLog "cloudflared WMI PID=$($cfCreate.ProcessId) logfile=$logFile"
-    $script:cloudflaredProcess = Get-Process -Id $cfCreate.ProcessId -ErrorAction SilentlyContinue
+    $cloudflaredPid = Invoke-DevSpaceDetachedWmiLauncher -LauncherCmd $commandLine -CurrentDirectory $PSScriptRoot -DirectProcess
+    Write-SetupLog "cloudflared WMI PID=$cloudflaredPid logfile=$logFile"
+    $script:cloudflaredProcess = Get-Process -Id $cloudflaredPid -ErrorAction SilentlyContinue
     if ($null -eq $script:cloudflaredProcess) {
-        throw "cloudflared WMI PID $($cfCreate.ProcessId) started but no process handle was returned."
+        throw "cloudflared WMI PID $cloudflaredPid started but no process handle was returned."
     }
 
     $tunnelUrl = $null
@@ -1790,7 +1808,14 @@ if (!(Test-Path $authFile)) {
     Write-Host "Using existing auth.json configuration."
 }
 
+Write-SetupLog "[CHECK] Checking local origin /healthz."
 $localOk = Test-LocalDevSpaceHealthy
+if (-not $localOk) {
+    Write-SetupLog "[CHECK] First local health probe failed; retrying before selecting recycle." "WARN"
+    Start-Sleep -Milliseconds 400
+    $localOk = Test-LocalDevSpaceHealthy
+}
+Write-SetupLog "[CHECK] Local origin healthy=$localOk."
 $workerOk = Test-WorkerDevSpaceHealthy
 $tunnelAlive = Test-DevSpaceQuickTunnelAlive
 $decision = Get-DevSpaceHealDecision `
@@ -1802,8 +1827,11 @@ $decision = Get-DevSpaceHealDecision `
 Write-SetupLog "Heal decision: action=$($decision.Action) preserveNode=$($decision.PreserveNode) preserveDist=$($decision.PreserveActiveDist) preserveTunnelHost=$($decision.PreserveTunnelHostname)"
 
 $preNodePid = $null
+Write-SetupLog "[CHECK] Calculating dist fingerprint."
 $preDistFingerprint = Get-DevSpaceDistFingerprint -CliPath $devspaceCli
+Write-SetupLog "[CHECK] Dist fingerprint completed."
 if ($localOk) {
+    Write-SetupLog "[CHECK] Binding healthy origin PID."
     Bind-DevSpaceOriginProcess | Out-Null
     if ($script:devspaceProcess) {
         $preNodePid = $script:devspaceProcess.Id
@@ -1861,9 +1889,12 @@ switch ($decision.Action) {
         Invoke-DevSpaceWorkerRepair -TunnelUrl $tunnelUrl -AuthToken $authToken -DetectedProxy $detectedProxy -TunnelHost $tunnelHost
     }
     "staged-recycle" {
+        Write-SetupLog "[RECYCLE] Checking pinned source status."
         Assert-DevSpaceSourceCleanForRecycle -Repository $devspaceSourceDir -AllowDirty:$AllowDirty -Pin $pin
-        Write-SetupLog "Staged recycle selected; stopping existing DevSpace processes before staged build."
-        Stop-DevSpaceRelatedProcesses
+        Write-SetupLog "[RECYCLE] Rechecking origin health before staged recycle."
+        Assert-DevSpaceRecycleSafe -LocalHealthy (Test-LocalDevSpaceHealthy) -ForceRecycle:$ForceRecycle
+        Write-SetupLog "Staged recycle selected; stopping verified DevSpace processes before staged build."
+        Stop-DevSpaceRelatedProcesses -ForceRecycle:$ForceRecycle
         Start-Sleep -Seconds 2
         Write-Host "Preparing local DevSpace build (staged snapshot, then build)..."
         & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $prepareLaunchScript -RepositoryRoot $devspaceSourceDir -PreviousDistDirectory $script:previousDistDirectory
@@ -1982,12 +2013,25 @@ Finish-DevSpaceBackgroundOrMonitor -TunnelUrl $tunnelUrl -DevSpaceCli $devspaceC
         }
     }
 } finally {
+    # Failed preflight is not permission to kill preexisting origin/tunnel PIDs.
+    # Only a completed recycle preflight or an explicit operator stop authorizes
+    # destructive cleanup; all other setup failures preserve runtime custody.
+    if ($exitCode -ne 0 -and -not $script:intentionalStop -and -not $script:recycleMutationsAuthorized) {
+        $script:leaveRunning = $true
+        Write-SetupLog "Setup failed before authorized recycle; leaving existing processes untouched." "WARN"
+    }
+    # A slow or transient health probe must never let error cleanup destroy an
+    # origin that recovered while the catch/finally path was being evaluated.
+    if (-not $script:intentionalStop -and -not $script:leaveRunning -and (Test-LocalDevSpaceHealthy)) {
+        $script:leaveRunning = $true
+        Write-SetupLog "Origin recovered during cleanup; preserving the running processes." "WARN"
+    }
     if ($script:leaveRunning) {
         Write-Host "`nLeaving DevSpace + cloudflared running in background."
     } else {
         Write-Host "`nStopping DevSpace and Cloudflare Tunnel..."
         Stop-TrackedProcesses
-        try { Stop-DevSpaceRuntime } catch {}
+        try { Stop-DevSpaceRuntime } catch { Write-SetupLog "[STOP] Cleanup was incomplete: $($_.Exception.Message)" "WARN" }
     }
     if ($script:setupLockHeld) {
         Exit-DevSpaceSetupLock -LockPath $script:setupLockFile
