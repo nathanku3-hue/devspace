@@ -1,5 +1,5 @@
-import { randomBytes } from "node:crypto";
-import { rm, stat } from "node:fs/promises";
+import { createHash, randomBytes } from "node:crypto";
+import { lstat, readFile, rm, stat as fileStat } from "node:fs/promises";
 import { isAbsolute, relative, resolve, sep } from "node:path";
 import { git } from "./git.js";
 import { isPathInsideRoot, resolveAllowedPath } from "./roots.js";
@@ -13,6 +13,8 @@ export interface PublishGitChangesInput {
   remote?: string;
   branch?: string;
   push?: boolean;
+  // Optional physical-byte expectations for close-time session-owned paths.
+  expectedHashes?: Record<string, string | null>;
 }
 
 export interface PublishGitChangesResult {
@@ -81,7 +83,7 @@ function assertLiteralFilePath(path: string): void {
 
 async function assertNotDirectory(path: string, originalPath: string): Promise<void> {
   try {
-    if ((await stat(path)).isDirectory()) {
+    if ((await fileStat(path)).isDirectory()) {
       throw new Error(`Directories are not accepted as explicit Git publication paths: ${originalPath}`);
     }
   } catch (error) {
@@ -153,6 +155,30 @@ export async function publishGitChanges(
 
   const { staged, stat } = await withPrivateIndex(gitRoot, async (env) => {
     await git(gitRoot, ["--literal-pathspecs", "add", "--", ...repositoryPaths], { env });
+
+    if (input.expectedHashes) {
+      for (const path of repositoryPaths) {
+        if (!Object.hasOwn(input.expectedHashes, path)) {
+          throw new Error(`Missing expected session hash for ${path}`);
+        }
+        const expected = input.expectedHashes[path];
+        const absolute = resolve(gitRoot, path);
+        let actual: string | null;
+        try {
+          const info = await lstat(absolute);
+          if (!info.isFile() || info.isSymbolicLink()) {
+            throw new Error(`Not a regular non-symlink file: ${path}`);
+          }
+          actual = createHash("sha256").update(await readFile(absolute)).digest("hex");
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+          actual = null;
+        }
+        if (actual !== expected) {
+          throw new Error(`Session artifact changed before commit: ${path}`);
+        }
+      }
+    }
 
     const staged = await stagedPaths(gitRoot, env);
     const unexpected = staged.filter((path) => !allowedPaths.has(pathKey(path)));

@@ -22,6 +22,30 @@ export const workspaceSessions = sqliteTable(
   ],
 );
 
+export const sessionGitBaselines = sqliteTable("session_git_baselines", {
+  workspaceSessionId: text("workspace_session_id").primaryKey()
+    .references(() => workspaceSessions.id, { onDelete: "cascade" }),
+  repositoryRoot: text("repository_root"),
+  statusJson: text("status_json").notNull(),
+});
+
+export const sessionArtifacts = sqliteTable(
+  "session_artifacts",
+  {
+    workspaceSessionId: text("workspace_session_id").notNull()
+      .references(() => workspaceSessions.id, { onDelete: "cascade" }),
+    repositoryRoot: text("repository_root").notNull(),
+    path: text("path").notNull(),
+    expectedSha256: text("expected_sha256"),
+    state: text("state").notNull(),
+    reason: text("reason"),
+    updatedAt: text("updated_at").notNull(),
+  },
+  (table) => [
+    primaryKey({ columns: [table.workspaceSessionId, table.repositoryRoot, table.path] }),
+  ],
+);
+
 export const loadedAgentFiles = sqliteTable(
   "loaded_agent_files",
   {

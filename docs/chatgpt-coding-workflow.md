@@ -269,3 +269,25 @@ from a private index, leaves unrelated already-staged files untouched, runs the
 cached whitespace check, creates a normal commit, and pushes the checked-out
 branch without force. Do not unstage or reset another slice's index to make a
 partial commit.
+
+## Session close and local Git coverage
+
+`close_workspace` now checks the durable per-workspace ledger of DevSpace
+`write`, `edit`, and `safe_rename_file` operations, locally commits exactly
+the uncommitted session-owned paths with a private index, and verifies that
+the current file hashes match Git HEAD before retiring the workspace.
+It never pushes. Previously committed identical paths require no new commit.
+
+A baseline of non-ignored dirty documentation files is captured on workspace
+open. Newly changed documents without a DevSpace-owned write record cause
+`CLOSE_INCOMPLETE`, rather than being silently added or declared archived.
+The baseline also preserves unrelated pre-existing dirty documents. Ignored,
+protected, and disposable files (including `.scratch`) are excluded and
+reported, not committed. A failed close leaves the workspace open; it may
+have already created a subset of safe local commits if subsequent verification
+failed, and retry reconciles against Git HEAD.
+
+This is a bounded guarantee for native DevSpace mutations and observed dirty
+documentation, not a general-purpose shell provenance oracle. Do not call
+this complete custody for arbitrary shell-generated binary/data artifacts,
+changes in ignored folders, or work created by another workspace session.

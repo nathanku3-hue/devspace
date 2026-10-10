@@ -6,6 +6,7 @@ import { loadProjectContextFiles } from "@earendil-works/pi-coding-agent";
 import type { ServerConfig } from "./config.js";
 import { createManagedWorktree, removeManagedWorktree } from "./git-worktrees.js";
 import { git } from "./git.js";
+import { captureSessionBaseline, commitSessionArtifacts, finishArtifact, prepareArtifact, type ArtifactCoverage } from "./session-artifacts.js";
 import { assertAllowedPath, isPathInsideRoot, resolveAllowedPath } from "./roots.js";
 import {
   loadWorkspaceSkills,
@@ -75,6 +76,7 @@ export interface ClosedWorkspace {
   staleMetadataPruned: boolean;
   headSha?: string;
   branch?: string;
+  artifactCoverage?: ArtifactCoverage;
 }
 
 export class WorkspaceRegistry {
@@ -82,6 +84,8 @@ export class WorkspaceRegistry {
   private readonly checkoutByRoot = new Map<string, Workspace>();
   private readonly checkoutOpening = new Map<string, Promise<WorkspaceContext>>();
   private readonly lastAccessMs = new Map<string, number>();
+  private readonly closingWorkspaces = new Set<string>();
+  private readonly activeMutations = new Map<string, number>();
 
   constructor(
     private readonly config: ServerConfig,
@@ -148,7 +152,55 @@ export class WorkspaceRegistry {
     return restoredWorkspace;
   }
 
+  async withTrackedMutation<T>(
+    workspaceId: string,
+    paths: string[],
+    action: () => Promise<T>,
+    didWrite: (result: T) => boolean = () => true,
+  ): Promise<T> {
+    if (this.closingWorkspaces.has(workspaceId)) {
+      throw new Error("Workspace is closing; no new writes are accepted");
+    }
+    this.activeMutations.set(workspaceId, (this.activeMutations.get(workspaceId) ?? 0) + 1);
+    try {
+      const workspace = this.getWorkspace(workspaceId);
+      const artifacts = this.store
+        ? await Promise.all(paths.map(async (path) => {
+            const absolutePath = this.resolvePath(workspace, path);
+            const artifact = await prepareArtifact(this.store!, workspaceId, workspace.root, absolutePath);
+            return { artifact, absolutePath };
+          }))
+        : [];
+      const result = await action();
+      if (didWrite(result) && this.store) {
+        for (const { artifact, absolutePath } of artifacts) {
+          await finishArtifact(this.store, artifact, absolutePath);
+        }
+      }
+      return result;
+    } finally {
+      const remaining = (this.activeMutations.get(workspaceId) ?? 1) - 1;
+      if (remaining > 0) this.activeMutations.set(workspaceId, remaining);
+      else this.activeMutations.delete(workspaceId);
+    }
+  }
+
   async closeWorkspace(input: {
+    workspaceId: string;
+    pruneStaleMetadata?: boolean;
+  }): Promise<ClosedWorkspace> {
+    if (this.closingWorkspaces.has(input.workspaceId) || (this.activeMutations.get(input.workspaceId) ?? 0) > 0) {
+      throw new Error("CLOSE_INCOMPLETE: workspace has an active close or file mutation");
+    }
+    this.closingWorkspaces.add(input.workspaceId);
+    try {
+      return await this.closeWorkspaceVerified(input);
+    } finally {
+      this.closingWorkspaces.delete(input.workspaceId);
+    }
+  }
+
+  private async closeWorkspaceVerified(input: {
     workspaceId: string;
     pruneStaleMetadata?: boolean;
   }): Promise<ClosedWorkspace> {
@@ -166,6 +218,9 @@ export class WorkspaceRegistry {
     let staleMetadataPruned = false;
     let headSha = workspace?.worktree?.baseSha ?? session?.headSha ?? session?.baseSha;
     let branch = workspace?.worktree?.branch ?? session?.branch;
+    const artifactCoverage = this.store
+      ? await commitSessionArtifacts(this.store, input.workspaceId, root)
+      : undefined;
 
     if (mode === "worktree" && managed) {
       if (!sourceRoot) {
@@ -203,6 +258,7 @@ export class WorkspaceRegistry {
       staleMetadataPruned,
       headSha,
       branch,
+      artifactCoverage,
     };
   }
 
@@ -352,6 +408,9 @@ export class WorkspaceRegistry {
       branch: workspace.worktree?.branch,
       managed: workspace.worktree?.managed,
     });
+    if (this.store) {
+      await captureSessionBaseline(this.store, workspace.id, workspace.root);
+    }
     this.workspaces.set(workspace.id, workspace);
     this.lastAccessMs.set(workspace.id, Date.now());
     return this.workspaceContext(workspace);

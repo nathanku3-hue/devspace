@@ -32,6 +32,16 @@ const migrations: Migration[] = [
     name: "workspace-head-metadata",
     up: migrateWorkspaceHeadMetadata,
   },
+  {
+    version: 6,
+    name: "session-artifact-intents",
+    up: migrateSessionArtifactIntents,
+  },
+  {
+    version: 7,
+    name: "session-git-baseline",
+    up: migrateSessionGitBaseline,
+  },
 ];
 
 export function migrateDatabase(sqlite: Database.Database): void {
@@ -166,6 +176,35 @@ function migrateWorkspaceBranchMetadata(sqlite: Database.Database): void {
 
 function migrateWorkspaceHeadMetadata(sqlite: Database.Database): void {
   addColumnIfMissing(sqlite, "workspace_sessions", "head_sha", "text");
+}
+
+function migrateSessionArtifactIntents(sqlite: Database.Database): void {
+  sqlite.exec(`
+    create table if not exists session_artifacts (
+      workspace_session_id text not null,
+      repository_root text not null,
+      path text not null,
+      expected_sha256 text,
+      state text not null,
+      reason text,
+      updated_at text not null,
+      primary key (workspace_session_id, repository_root, path),
+      foreign key (workspace_session_id)
+        references workspace_sessions(id) on delete cascade
+    );
+  `);
+}
+
+function migrateSessionGitBaseline(sqlite: Database.Database): void {
+  sqlite.exec(`
+    create table if not exists session_git_baselines (
+      workspace_session_id text primary key,
+      repository_root text,
+      status_json text not null,
+      foreign key (workspace_session_id)
+        references workspace_sessions(id) on delete cascade
+    );
+  `);
 }
 
 function addColumnIfMissing(

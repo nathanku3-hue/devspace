@@ -368,7 +368,7 @@ function serverInstructions(config: ServerConfig, toolNames: ToolNames): string 
       ? " After creating, editing, or overwriting files, call show_changes once after the related file changes are complete so the user can see the aggregate diff."
       : "";
 
-  return `Use DevSpace as a local coding workspace. Call ${toolNames.openWorkspace} once to open an existing project directory or checkout and obtain a workspaceId; it does not create missing folders. Use ${toolNames.createWorktreeWorkspace} only when an isolated managed Git worktree is actually needed. Reuse the returned workspaceId for all later file, search, edit, write, show-changes, shell, and Git publication tools in that folder; do not reopen the same folder unless the workspaceId is rejected as unknown, the user explicitly asks to reopen, or you intentionally switch to a different folder/worktree. For Meta-Harness repositories, use metaStartup as the authoritative startup-loading state. READY means metaStartup.lines is the canonical repo-declared startup projection; do not reconstruct project state from chat history or undeclared legacy context files. BLOCKED means do not invoke continuation or fall back to undeclared context; treat the listed blockers as recoverable repository-context gaps rather than an owner gate. UNDECLARED means Meta-Harness was detected but inspect returned legacy meta-entry/v1 without repo-declared startup context: do not claim startup context is loaded and do not reconstruct it from chat history. INSPECTION_FAILED is a recoverable host diagnostic, not a product stop. When metaContinuation.status=BLOCKED, do not invoke continue_meta_harness and do not synthesize Meta-Harness decision-plane state from DevSpace. A concrete task in the user's current turn is the velocity-first path: use the returned startup context and execute that task directly instead of invoking continuation merely because metaEntry.action=CONTINUE. Opening a workspace is also a complete user action, not implicit resume intent. Invoke continue_meta_harness only when the user explicitly asks to resume/continue retained Meta-Harness work. Automatically invoke it at most once per user turn. If continue_meta_harness returns STOPPED or BLOCKED, or the call errors, do not retry it automatically in the same turn; continue the user's concrete task with scoped tools when possible, otherwise surface the controller result. When metaEntry.action=IDLE, do not invoke continuation. Close managed worktree sessions with ${toolNames.closeWorkspace}; it refuses dirty worktrees and removes clean worktrees through Git. When the user explicitly requests one fresh ChatGPT Web conversation with a supplied prompt, invoke web_launch; do not infer this trigger from text typed in another composer. WEB-LAUNCH-0 returns only launch acknowledgement and does not capture assistant output or continue the spawned conversation. When the user explicitly requests one bounded independent PRODUCT or SAW-role review, invoke review_start with exact candidate and evidence manifest bytes plus their SHA-256 digests, retain the returned reviewId, and later invoke review_status with that reviewId. For a post-phase SAW A/B/C gate, invoke saw_review_start once and use saw_review_status with the returned batchId; each reviewer receives an independent fresh-conversation challenge and must not receive another reviewer output. Do not invoke review_submit directly unless the current launched conversation contains the exact REVIEW-RETURN-2 one-time challenge. ${agentsMd}${skills}${inspection}Batch known context reads with ${toolNames.readBatch} to reduce host approval prompts. Prefer ${toolNames.edit} for targeted modifications, ${toolNames.write} only for new files or complete rewrites, and ${toolNames.shell} for tests, builds, Git inspection, package scripts, and commands that are better executed by the shell. Shell commands that wait more than ${formatDurationMs(FAST_PATH_QUEUE_WAIT_MS)} for an execution slot, or run more than ${formatDurationMs(FAST_PATH_EXECUTION_MS)} after admission, continue in the background and return an operationId; poll long_task_status to inspect progress or cancel_long_task to terminate them. For commands expected to exceed 60 seconds, you may also invoke start_long_task directly. When the user explicitly requests a commit or push, use publish_git_changes with the existing workspaceId, a workingDirectory relative to the workspace root, and exact file paths. Do not construct /mnt paths, Windows absolute paths, or shell cd commands for workspace navigation; use the workingDirectory field. Do not use ${toolNames.shell} to edit working-tree contents or mutate the Git index, history, remotes, or branches. Avoid shell redirection, heredocs, tee, sed -i, perl -i, node/python/ruby scripts, generated scripts, or other commands whose purpose is to write project files. Use ${toolNames.edit} or ${toolNames.write} for content changes.${showChanges}`;
+  return `Use DevSpace as a local coding workspace. Call ${toolNames.openWorkspace} once to open an existing project directory or checkout and obtain a workspaceId; it does not create missing folders. Use ${toolNames.createWorktreeWorkspace} only when an isolated managed Git worktree is actually needed. Reuse the returned workspaceId for all later file, search, edit, write, show-changes, shell, and Git publication tools in that folder; do not reopen the same folder unless the workspaceId is rejected as unknown, the user explicitly asks to reopen, or you intentionally switch to a different folder/worktree. For Meta-Harness repositories, use metaStartup as the authoritative startup-loading state. READY means metaStartup.lines is the canonical repo-declared startup projection; do not reconstruct project state from chat history or undeclared legacy context files. BLOCKED means do not invoke continuation or fall back to undeclared context; treat the listed blockers as recoverable repository-context gaps rather than an owner gate. UNDECLARED means Meta-Harness was detected but inspect returned legacy meta-entry/v1 without repo-declared startup context: do not claim startup context is loaded and do not reconstruct it from chat history. INSPECTION_FAILED is a recoverable host diagnostic, not a product stop. When metaContinuation.status=BLOCKED, do not invoke continue_meta_harness and do not synthesize Meta-Harness decision-plane state from DevSpace. A concrete task in the user's current turn is the velocity-first path: use the returned startup context and execute that task directly instead of invoking continuation merely because metaEntry.action=CONTINUE. Opening a workspace is also a complete user action, not implicit resume intent. Invoke continue_meta_harness only when the user explicitly asks to resume/continue retained Meta-Harness work. Automatically invoke it at most once per user turn. If continue_meta_harness returns STOPPED or BLOCKED, or the call errors, do not retry it automatically in the same turn; continue the user's concrete task with scoped tools when possible, otherwise surface the controller result. When metaEntry.action=IDLE, do not invoke continuation. When the user says close for an open DevSpace workspace, call ${toolNames.closeWorkspace}; it verifies and locally commits exact recorded session writes before retiring the workspace, never pushes, and refuses incomplete document coverage. Do not equate a no-change result or a text claim with successful session artifact coverage. It refuses dirty managed worktrees and removes clean managed worktrees through Git. When the user explicitly requests one fresh ChatGPT Web conversation with a supplied prompt, invoke web_launch; do not infer this trigger from text typed in another composer. WEB-LAUNCH-0 returns only launch acknowledgement and does not capture assistant output or continue the spawned conversation. When the user explicitly requests one bounded independent PRODUCT or SAW-role review, invoke review_start with exact candidate and evidence manifest bytes plus their SHA-256 digests, retain the returned reviewId, and later invoke review_status with that reviewId. For a post-phase SAW A/B/C gate, invoke saw_review_start once and use saw_review_status with the returned batchId; each reviewer receives an independent fresh-conversation challenge and must not receive another reviewer output. Do not invoke review_submit directly unless the current launched conversation contains the exact REVIEW-RETURN-2 one-time challenge. ${agentsMd}${skills}${inspection}Batch known context reads with ${toolNames.readBatch} to reduce host approval prompts. Prefer ${toolNames.edit} for targeted modifications, ${toolNames.write} only for new files or complete rewrites, and ${toolNames.shell} for tests, builds, Git inspection, package scripts, and commands that are better executed by the shell. Shell commands that wait more than ${formatDurationMs(FAST_PATH_QUEUE_WAIT_MS)} for an execution slot, or run more than ${formatDurationMs(FAST_PATH_EXECUTION_MS)} after admission, continue in the background and return an operationId; poll long_task_status to inspect progress or cancel_long_task to terminate them. For commands expected to exceed 60 seconds, you may also invoke start_long_task directly. When the user explicitly requests a commit or push, use publish_git_changes with the existing workspaceId, a workingDirectory relative to the workspace root, and exact file paths. Do not construct /mnt paths, Windows absolute paths, or shell cd commands for workspace navigation; use the workingDirectory field. Do not use ${toolNames.shell} to edit working-tree contents or mutate the Git index, history, remotes, or branches. Avoid shell redirection, heredocs, tee, sed -i, perl -i, node/python/ruby scripts, generated scripts, or other commands whose purpose is to write project files. Use ${toolNames.edit} or ${toolNames.write} for content changes.${showChanges}`;
 }
 function resultOutputSchema(extra: z.ZodRawShape = {}): z.ZodRawShape {
   return {
@@ -1165,7 +1165,7 @@ export function createMcpServer(
     {
       title: "Close workspace",
       description:
-        "Close a workspace session. Checkout sessions are retired without deleting files. Clean managed worktrees are removed through git worktree remove; dirty managed worktrees are refused. If a managed directory is already missing, stale Git metadata is pruned only when Git marks it prunable and pruneStaleMetadata=true is explicitly supplied.",
+        "Verify and locally commit recorded session-owned writes with exact paths before retiring the workspace (never push). Incomplete or altered artifacts refuse close. Checkout sessions are retired without deleting files. Clean managed worktrees are removed through Git; dirty managed worktrees are refused. The guarantee covers DevSpace write/edit/rename operations, not untracked shell-created files.",
       inputSchema: {
         workspaceId: z
           .string()
@@ -1185,6 +1185,12 @@ export function createMcpServer(
         staleMetadataPruned: z.boolean(),
         headSha: z.string().optional(),
         branch: z.string().optional(),
+        artifactCoverage: z.object({
+          status: z.enum(["COVERED", "NO_RECORDED_WRITES"]),
+          coveredPaths: z.array(z.string()),
+          commits: z.array(z.string()),
+          excludedPaths: z.array(z.string()),
+        }).optional(),
       },
       _meta: {},
       annotations: CLOSE_WORKSPACE_TOOL_ANNOTATIONS,
@@ -1210,6 +1216,9 @@ export function createMcpServer(
               `Mode: ${closed.mode}`,
               closed.removed ? "Managed worktree removed through Git." : undefined,
               closed.staleMetadataPruned ? "Validated stale Git worktree metadata pruned." : undefined,
+              closed.artifactCoverage?.status === "COVERED"
+                ? `Recorded session artifacts covered: ${closed.artifactCoverage.coveredPaths.length}; local commits: ${closed.artifactCoverage.commits.length}; excluded: ${closed.artifactCoverage.excludedPaths.length}.`
+                : "No session writes recorded by native DevSpace mutation tools; external shell-generated files are not attested.",
             ].filter(Boolean).join("\n"),
           },
         ],
@@ -1447,11 +1456,16 @@ export function createMcpServer(
       const startedAt = performance.now();
       const workspace = workspaces.getWorkspace(workspaceId);
       workspaces.resolvePath(workspace, input.path);
-      const response = await writeFileTool(input, {
-        cwd: workspace.root,
-        root: workspace.root,
-        allowedRoots: [workspace.root],
-      });
+      const response = await workspaces.withTrackedMutation(
+        workspaceId,
+        [input.path],
+        () => writeFileTool(input, {
+          cwd: workspace.root,
+          root: workspace.root,
+          allowedRoots: [workspace.root],
+        }),
+        (value) => !value.isError,
+      );
 
       if (response.isError) {
         logFailedToolResponse(config, {
@@ -1535,11 +1549,16 @@ export function createMcpServer(
       const startedAt = performance.now();
       const workspace = workspaces.getWorkspace(workspaceId);
       workspaces.resolvePath(workspace, input.path);
-      const response = await editFileTool(input, {
-        cwd: workspace.root,
-        root: workspace.root,
-        allowedRoots: [workspace.root],
-      });
+      const response = await workspaces.withTrackedMutation(
+        workspaceId,
+        [input.path],
+        () => editFileTool(input, {
+          cwd: workspace.root,
+          root: workspace.root,
+          allowedRoots: [workspace.root],
+        }),
+        (value) => !value.isError,
+      );
 
       if (response.isError) {
         logFailedToolResponse(config, {
@@ -2645,7 +2664,11 @@ export function createMcpServer(
       const workspace = workspaces.getWorkspace(workspaceId);
 
       try {
-        await safeRenameFile(workspace.root, sourcePath, targetPath);
+        await workspaces.withTrackedMutation(
+          workspaceId,
+          [sourcePath, targetPath],
+          () => safeRenameFile(workspace.root, sourcePath, targetPath),
+        );
       } catch (err: unknown) {
         logFailedToolResponse(
           config,
