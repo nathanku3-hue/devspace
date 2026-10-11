@@ -161,4 +161,54 @@ await withServer(
   },
 );
 
+for (const mode of ["stateless", "stateful"] as const) {
+  await withServer(mode, async (origin, accessToken) => {
+    const request = async (method: string, params: Record<string, unknown>, authorized = true) => (
+      fetch(`${origin}/mcp`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Accept: "application/json, text/event-stream",
+          "MCP-Protocol-Version": "2026-07-28",
+          "MCP-Method": method,
+          ...(typeof params.name === "string" ? { "MCP-Name": params.name } : {}),
+          ...(authorized ? { Authorization: `Bearer ${accessToken}` } : {}),
+        },
+        body: JSON.stringify({
+          jsonrpc: "2.0", id: "modern-probe", method,
+          params: {
+            ...params,
+            _meta: {
+              "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+              "io.modelcontextprotocol/clientCapabilities": {},
+            },
+          },
+        }),
+      })
+    );
+
+    const denied = await request("server/discover", {}, false);
+    assert.equal(denied.status, 401, "new protocol cannot bypass bearer authentication");
+
+    const discover = await request("server/discover", {});
+    assert.equal(discover.status, 200, await discover.clone().text());
+    const discovery = await discover.json() as { result?: { supportedVersions?: string[] } };
+    assert.ok(discovery.result?.supportedVersions?.includes("2026-07-28"));
+
+    const listed = await request("tools/list", {});
+    assert.equal(listed.status, 200, await listed.clone().text());
+    const tools = await listed.json() as { result?: { tools?: Array<{ name?: string }> } };
+    for (const name of ["open_workspace", "commit_and_close", "detach_workspace", "devspace_runtime_identity"]) {
+      assert.ok(tools.result?.tools?.some((tool) => tool.name === name), `missing modern MCP tool: ${name}`);
+    }
+
+    const identity = await request("tools/call", {
+      name: "devspace_runtime_identity",
+      arguments: {},
+    });
+    assert.equal(identity.status, 200, await identity.clone().text());
+    assert.match(await identity.text(), /devspace-runtime\/v1|runtime identity/i);
+  });
+}
+
 console.log("mcp transport mode tests passed");

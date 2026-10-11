@@ -60,6 +60,10 @@ async function testDatabaseConfiguration(stateDir: string): Promise<void> {
       { version: 3, name: "oauth-device-bound-tokens" },
       { version: 4, name: "workspace-branch-metadata" },
       { version: 5, name: "workspace-head-metadata" },
+      { version: 6, name: "session-artifact-intents" },
+      { version: 7, name: "session-git-baseline" },
+      { version: 8, name: "execution-custody" },
+      { version: 9, name: "workspace-closure-receipts" },
     ]);
   } finally {
     database.close();

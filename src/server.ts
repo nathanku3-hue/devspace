@@ -3,6 +3,8 @@ import { readFileSync } from "node:fs";
 import { access, realpath } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { createMcpHandler } from "@modelcontextprotocol/server";
+import { toNodeHandler } from "@modelcontextprotocol/node";
 
 import { mcpAuthRouter, createOAuthMetadata, getOAuthProtectedResourceMetadataUrl } from "@modelcontextprotocol/sdk/server/auth/router.js";
 import { requireBearerAuth } from "@modelcontextprotocol/sdk/server/auth/middleware/bearerAuth.js";
@@ -49,8 +51,17 @@ import {
 } from "./read-files.js";
 import { createWorkspaceStore } from "./workspace-store.js";
 import { formatAgentsPath, WorkspaceRegistry } from "./workspaces.js";
+import { isPathInsideRoot } from "./roots.js";
 import { globalShellExecutionLimiter } from "./shell-execution-limiter.js";
 import { killTrackedShellProcesses } from "./shell-runtime.js";
+import { SqliteLongTaskJournal } from "./long-task-journal.js";
+import { getRuntimeIdentity } from "./runtime-identity.js";
+import {
+  compileMcpRegistrationSurface,
+  createModernMcpServerAdapter,
+  modernMcpAdapterErrorLogFields,
+  type McpRegistrationTarget,
+} from "./mcp-modern-server.js";
 import { WebLaunchBrowserController } from "./web-launch-browser.js";
 import { registerWebLaunchTool } from "./web-launch-tools.js";
 import { AuditReturnController } from "./audit-return.js";
@@ -368,7 +379,7 @@ function serverInstructions(config: ServerConfig, toolNames: ToolNames): string 
       ? " After creating, editing, or overwriting files, call show_changes once after the related file changes are complete so the user can see the aggregate diff."
       : "";
 
-  return `Use DevSpace as a local coding workspace. Call ${toolNames.openWorkspace} once to open an existing project directory or checkout and obtain a workspaceId; it does not create missing folders. Use ${toolNames.createWorktreeWorkspace} only when an isolated managed Git worktree is actually needed. Reuse the returned workspaceId for all later file, search, edit, write, show-changes, shell, and Git publication tools in that folder; do not reopen the same folder unless the workspaceId is rejected as unknown, the user explicitly asks to reopen, or you intentionally switch to a different folder/worktree. For Meta-Harness repositories, use metaStartup as the authoritative startup-loading state. READY means metaStartup.lines is the canonical repo-declared startup projection; do not reconstruct project state from chat history or undeclared legacy context files. BLOCKED means do not invoke continuation or fall back to undeclared context; treat the listed blockers as recoverable repository-context gaps rather than an owner gate. UNDECLARED means Meta-Harness was detected but inspect returned legacy meta-entry/v1 without repo-declared startup context: do not claim startup context is loaded and do not reconstruct it from chat history. INSPECTION_FAILED is a recoverable host diagnostic, not a product stop. When metaContinuation.status=BLOCKED, do not invoke continue_meta_harness and do not synthesize Meta-Harness decision-plane state from DevSpace. A concrete task in the user's current turn is the velocity-first path: use the returned startup context and execute that task directly instead of invoking continuation merely because metaEntry.action=CONTINUE. Opening a workspace is also a complete user action, not implicit resume intent. Invoke continue_meta_harness only when the user explicitly asks to resume/continue retained Meta-Harness work. Automatically invoke it at most once per user turn. If continue_meta_harness returns STOPPED or BLOCKED, or the call errors, do not retry it automatically in the same turn; continue the user's concrete task with scoped tools when possible, otherwise surface the controller result. When metaEntry.action=IDLE, do not invoke continuation. When the user says close for an open DevSpace workspace, call ${toolNames.closeWorkspace}; it verifies and locally commits exact recorded session writes before retiring the workspace, never pushes, and refuses incomplete document coverage. Do not equate a no-change result or a text claim with successful session artifact coverage. It refuses dirty managed worktrees and removes clean managed worktrees through Git. When the user explicitly requests one fresh ChatGPT Web conversation with a supplied prompt, invoke web_launch; do not infer this trigger from text typed in another composer. WEB-LAUNCH-0 returns only launch acknowledgement and does not capture assistant output or continue the spawned conversation. When the user explicitly requests one bounded independent PRODUCT or SAW-role review, invoke review_start with exact candidate and evidence manifest bytes plus their SHA-256 digests, retain the returned reviewId, and later invoke review_status with that reviewId. For a post-phase SAW A/B/C gate, invoke saw_review_start once and use saw_review_status with the returned batchId; each reviewer receives an independent fresh-conversation challenge and must not receive another reviewer output. Do not invoke review_submit directly unless the current launched conversation contains the exact REVIEW-RETURN-2 one-time challenge. ${agentsMd}${skills}${inspection}Batch known context reads with ${toolNames.readBatch} to reduce host approval prompts. Prefer ${toolNames.edit} for targeted modifications, ${toolNames.write} only for new files or complete rewrites, and ${toolNames.shell} for tests, builds, Git inspection, package scripts, and commands that are better executed by the shell. Shell commands that wait more than ${formatDurationMs(FAST_PATH_QUEUE_WAIT_MS)} for an execution slot, or run more than ${formatDurationMs(FAST_PATH_EXECUTION_MS)} after admission, continue in the background and return an operationId; poll long_task_status to inspect progress or cancel_long_task to terminate them. For commands expected to exceed 60 seconds, you may also invoke start_long_task directly. When the user explicitly requests a commit or push, use publish_git_changes with the existing workspaceId, a workingDirectory relative to the workspace root, and exact file paths. Do not construct /mnt paths, Windows absolute paths, or shell cd commands for workspace navigation; use the workingDirectory field. Do not use ${toolNames.shell} to edit working-tree contents or mutate the Git index, history, remotes, or branches. Avoid shell redirection, heredocs, tee, sed -i, perl -i, node/python/ruby scripts, generated scripts, or other commands whose purpose is to write project files. Use ${toolNames.edit} or ${toolNames.write} for content changes.${showChanges}`;
+  return `Use DevSpace as a local coding workspace. Call ${toolNames.openWorkspace} once to open an existing project directory or checkout and obtain a workspaceId; it does not create missing folders. Use ${toolNames.createWorktreeWorkspace} only when an isolated managed Git worktree is actually needed. Reuse the returned workspaceId for all later file, search, edit, write, show-changes, shell, and Git publication tools in that folder; do not reopen the same folder unless the workspaceId is rejected as unknown, the user explicitly asks to reopen, or you intentionally switch to a different folder/worktree. For Meta-Harness repositories, use metaStartup as the authoritative startup-loading state. READY means metaStartup.lines is the canonical repo-declared startup projection; do not reconstruct project state from chat history or undeclared legacy context files. BLOCKED means do not invoke continuation or fall back to undeclared context; treat the listed blockers as recoverable repository-context gaps rather than an owner gate. UNDECLARED means Meta-Harness was detected but inspect returned legacy meta-entry/v1 without repo-declared startup context: do not claim startup context is loaded and do not reconstruct it from chat history. INSPECTION_FAILED is a recoverable host diagnostic, not a product stop. When metaContinuation.status=BLOCKED, do not invoke continue_meta_harness and do not synthesize Meta-Harness decision-plane state from DevSpace. A concrete task in the user's current turn is the velocity-first path: use the returned startup context and execute that task directly instead of invoking continuation merely because metaEntry.action=CONTINUE. Opening a workspace is also a complete user action, not implicit resume intent. Invoke continue_meta_harness only when the user explicitly asks to resume/continue retained Meta-Harness work. Automatically invoke it at most once per user turn. If continue_meta_harness returns STOPPED or BLOCKED, or the call errors, do not retry it automatically in the same turn; continue the user's concrete task with scoped tools when possible, otherwise surface the controller result. When metaEntry.action=IDLE, do not invoke continuation. When the user explicitly asks to save and close, call commit_and_close (or legacy ${toolNames.closeWorkspace}); verified local Git custody is required and no push occurs. When the user requests read-only exit or a no-commit detach, call detach_workspace and explicitly report unresolved artifacts. Neither operation confers Meta-Harness product authority. Do not equate a no-change result or a text claim with successful session artifact coverage. It refuses dirty managed worktrees and removes clean managed worktrees through Git. When the user explicitly requests one fresh ChatGPT Web conversation with a supplied prompt, invoke web_launch; do not infer this trigger from text typed in another composer. WEB-LAUNCH-0 returns only launch acknowledgement and does not capture assistant output or continue the spawned conversation. When the user explicitly requests one bounded independent PRODUCT or SAW-role review, invoke review_start with exact candidate and evidence manifest bytes plus their SHA-256 digests, retain the returned reviewId, and later invoke review_status with that reviewId. For a post-phase SAW A/B/C gate, invoke saw_review_start once and use saw_review_status with the returned batchId; each reviewer receives an independent fresh-conversation challenge and must not receive another reviewer output. Do not invoke review_submit directly unless the current launched conversation contains the exact REVIEW-RETURN-2 one-time challenge. ${agentsMd}${skills}${inspection}Batch known context reads with ${toolNames.readBatch} to reduce host approval prompts. Prefer ${toolNames.edit} for targeted modifications, ${toolNames.write} only for new files or complete rewrites, and ${toolNames.shell} for tests, builds, Git inspection, package scripts, and commands that are better executed by the shell. Shell commands that wait more than ${formatDurationMs(FAST_PATH_QUEUE_WAIT_MS)} for an execution slot, or run more than ${formatDurationMs(FAST_PATH_EXECUTION_MS)} after admission, continue in the background and return an operationId; poll long_task_status to inspect progress or cancel_long_task to terminate them. For commands expected to exceed 60 seconds, you may also invoke start_long_task directly. When the user explicitly requests a commit or push, use publish_git_changes with the existing workspaceId, a workingDirectory relative to the workspace root, and exact file paths. Do not construct /mnt paths, Windows absolute paths, or shell cd commands for workspace navigation; use the workingDirectory field. Do not use ${toolNames.shell} to edit working-tree contents or mutate the Git index, history, remotes, or branches. Avoid shell redirection, heredocs, tee, sed -i, perl -i, node/python/ruby scripts, generated scripts, or other commands whose purpose is to write project files. Use ${toolNames.edit} or ${toolNames.write} for content changes.${showChanges}`;
 }
 function resultOutputSchema(extra: z.ZodRawShape = {}): z.ZodRawShape {
   return {
@@ -407,6 +418,7 @@ const longTaskOperationOutputSchema = {
     "succeeded",
     "failed",
     "cancelled",
+    "unknown",
   ]),
   createdAt: z.string(),
   startedAt: z.string().optional(),
@@ -753,9 +765,10 @@ export function createMcpServer(
     reviewReturnController?: ReviewReturnController;
   },
   fastPathQueueWaitMs: number = FAST_PATH_QUEUE_WAIT_MS,
+  registrationTarget?: McpRegistrationTarget,
 ): McpServer {
   const toolNames = toolNamesFor(config);
-  const server = new McpServer(
+  const server = registrationTarget ? registrationTarget as McpServer : new McpServer(
     {
       name: "devspace",
       title: "DevSpace",
@@ -821,6 +834,8 @@ export function createMcpServer(
     workspaceId: z.string(),
     root: z.string(),
     mode: z.enum(["checkout", "worktree"]),
+    writeScope: z.enum(["GIT_ROOT", "READ_ONLY_DISCOVERY"]),
+    repositoryHeadSha: z.string().optional(),
     sourceRoot: z.string().optional(),
     worktree: z
       .object({
@@ -855,6 +870,8 @@ export function createMcpServer(
   ) {
     const startedAt = performance.now();
     const { workspace, agentsFiles, availableAgentsFiles } = await workspaces.openWorkspace(request);
+    const writableIdentity = await workspaces.assertWritableWorkspace(workspace.id).catch(() => null);
+    const writeScope = writableIdentity ? "GIT_ROOT" as const : "READ_ONLY_DISCOVERY" as const;
     if (config.widgets === "changes") {
       void reviewCheckpoints.initializeWorkspace({
         workspaceId: workspace.id,
@@ -945,7 +962,10 @@ export function createMcpServer(
           : metaInspectionFailed
             ? "Meta-Harness continuation inspection failed. Treat this as a recoverable host diagnostic, not as a product blocker or owner gate. Continue the accepted task through available scoped tools or a fresh supported Meta-Harness route; do not infer internal lifecycle authority."
             : null;
-    const instruction = [baseInstruction, startupInstruction, metaInstruction].filter(Boolean).join(" ");
+    const scopeInstruction = writableIdentity
+      ? "This workspace is an exact Git checkout. Native writes are guarded; shell commands are NOT a filesystem sandbox."
+      : "This is a read-only discovery workspace, not a Git write authority. For write/edit/shell, open the exact Git repository root; to leave without commit use detach_workspace.";
+    const instruction = [baseInstruction, scopeInstruction, startupInstruction, metaInstruction].filter(Boolean).join(" ");
     const startupText = metaStartup
       ? [
           `Meta-Harness startup state: ${metaStartup.status}`,
@@ -968,6 +988,7 @@ export function createMcpServer(
           `Opened workspace ${workspace.id}`,
           `Root: ${workspace.root}`,
           `Mode: ${workspace.mode}`,
+          `Write scope: ${writeScope}`,
           loadedAgentsFiles.length > 0
             ? `Loaded project instructions: ${loadedAgentsFiles.map((file) => file.path).join(", ")}`
             : undefined,
@@ -1011,6 +1032,8 @@ export function createMcpServer(
         workspaceId: workspace.id,
         root: workspace.root,
         mode: workspace.mode,
+        writeScope,
+        repositoryHeadSha: writableIdentity?.headSha,
         sourceRoot: workspace.sourceRoot,
         worktree: workspace.worktree,
         agentsFiles: loadedAgentsFiles,
@@ -1161,70 +1184,151 @@ export function createMcpServer(
 
   registerAppTool(
     server,
+    "devspace_runtime_identity",
+    {
+      title: "DevSpace running build identity",
+      description: "Read the source/compiled-disk tool-schema identity. UNVERIFIED or STALE_RUNTIME forbids claims that the live connector has the latest code. It is a build checksum, not a remote signature.",
+      inputSchema: {},
+      outputSchema: {
+        schemaVersion: z.literal("devspace-runtime/v1"),
+        toolSchemaRevision: z.literal("repo-custody-1"),
+        sourceHeadSha: z.string().nullable(),
+        sourceDirty: z.boolean(),
+        binaryDigestSha256: z.string().nullable(),
+        filesHashed: z.number().int(),
+        builtAt: z.string().nullable(),
+        runtimeStartedAt: z.string(),
+        receiptDigestSha256: z.string(),
+        status: z.enum(["DISK_BUILD_VERIFIED", "STALE_RUNTIME", "UNVERIFIED"]),
+      },
+      _meta: {},
+      annotations: READ_ONLY_TOOL_ANNOTATIONS,
+    },
+    async () => {
+      const result = getRuntimeIdentity();
+      return {
+        content: [textBlock(`DevSpace runtime identity: ${result.status}; schema: ${result.toolSchemaRevision}; build: ${result.binaryDigestSha256 ?? "unverified"}`)],
+        structuredContent: { ...result },
+      };
+    },
+  );
+
+  const coverageSchema = z.object({
+    status: z.enum(["COVERED", "NO_RECORDED_WRITES"]),
+    coveredPaths: z.array(z.string()),
+    commits: z.array(z.string()),
+    excludedPaths: z.array(z.string()),
+    proof: z.array(z.object({
+      path: z.string(),
+      sha256: z.string().nullable(),
+      gitBlobOid: z.string().nullable(),
+      headSha: z.string(),
+    })),
+  });
+  const closureOutputSchema = {
+    workspaceId: z.string(),
+    root: z.string(),
+    sourceRoot: z.string().optional(),
+    mode: z.enum(["checkout", "worktree"]),
+    managed: z.boolean(),
+    removed: z.boolean(),
+    staleMetadataPruned: z.boolean(),
+    headSha: z.string().optional(),
+    branch: z.string().optional(),
+    closure: z.enum(["COMMITTED_AND_CLOSED", "DETACHED_WITH_UNRESOLVED_ARTIFACTS"]),
+    artifactCoverage: coverageSchema.optional(),
+    custodyReceipt: z.object({
+      schemaVersion: z.literal("devspace-custody/v1"),
+      authority: z.literal("PHYSICAL_CUSTODY_ONLY"),
+      workspaceId: z.string(),
+      gitRoot: z.string().nullable(),
+      baselineHeadSha: z.string().nullable(),
+      finalHeadSha: z.string().nullable(),
+      status: z.enum(["COMMITTED_AND_CLOSED", "DETACHED_WITH_UNRESOLVED_ARTIFACTS"]),
+      coverage: coverageSchema.nullable(),
+      unresolvedPaths: z.array(z.string()),
+      runtime: z.object({
+        buildDigestSha256: z.string().nullable(),
+        schemaRevision: z.string(),
+        status: z.string(),
+      }),
+      digestSha256: z.string(),
+    }),
+  };
+  const closeInputSchema = {
+    workspaceId: z.string().describe("Workspace identifier returned by open_workspace."),
+    pruneStaleMetadata: z.boolean().optional().describe("Only for git-verified stale worktree metadata."),
+  };
+  async function returnWorkspaceClosure(
+    toolName: string,
+    workspaceId: string,
+    detach: boolean,
+    pruneStaleMetadata?: boolean,
+  ) {
+    const startedAt = performance.now();
+    const closed = detach
+      ? await workspaces.detachWorkspace({ workspaceId })
+      : await workspaces.closeWorkspace({ workspaceId, pruneStaleMetadata });
+    reviewCheckpoints.forgetWorkspace(workspaceId);
+    logToolCall(config, {
+      tool: toolName,
+      workspaceId,
+      path: closed.root,
+      success: true,
+      durationMs: Math.round(performance.now() - startedAt),
+    });
+    return {
+      content: [textBlock(
+        `${closed.closure}; workspace ${workspaceId}; physical custody only. ` +
+        `Final HEAD: ${closed.custodyReceipt.finalHeadSha ?? "none"}; ` +
+        `covered: ${closed.artifactCoverage?.coveredPaths.length ?? 0}; ` +
+        `unresolved: ${closed.custodyReceipt.unresolvedPaths.length}; no push.`
+      )],
+      structuredContent: { ...closed },
+    };
+  }
+
+  registerAppTool(
+    server,
     toolNames.closeWorkspace,
     {
-      title: "Close workspace",
-      description:
-        "Verify and locally commit recorded session-owned writes with exact paths before retiring the workspace (never push). Incomplete or altered artifacts refuse close. Checkout sessions are retired without deleting files. Clean managed worktrees are removed through Git; dirty managed worktrees are refused. The guarantee covers DevSpace write/edit/rename operations, not untracked shell-created files.",
-      inputSchema: {
-        workspaceId: z
-          .string()
-          .describe("Workspace identifier returned by open_workspace."),
-        pruneStaleMetadata: z
-          .boolean()
-          .optional()
-          .describe("Explicitly allow pruning Git-validated stale metadata when the managed worktree directory is already missing. Defaults to false."),
-      },
-      outputSchema: {
-        workspaceId: z.string(),
-        root: z.string(),
-        sourceRoot: z.string().optional(),
-        mode: z.enum(["checkout", "worktree"]),
-        managed: z.boolean(),
-        removed: z.boolean(),
-        staleMetadataPruned: z.boolean(),
-        headSha: z.string().optional(),
-        branch: z.string().optional(),
-        artifactCoverage: z.object({
-          status: z.enum(["COVERED", "NO_RECORDED_WRITES"]),
-          coveredPaths: z.array(z.string()),
-          commits: z.array(z.string()),
-          excludedPaths: z.array(z.string()),
-        }).optional(),
-      },
+      title: "Close workspace (commit-verified legacy alias)",
+      description: "Legacy alias for commit_and_close. Commits only verified native session artifacts locally, never pushes, refuses unowned changes and non-Git workspaces.",
+      inputSchema: closeInputSchema,
+      outputSchema: closureOutputSchema,
       _meta: {},
       annotations: CLOSE_WORKSPACE_TOOL_ANNOTATIONS,
     },
-    async ({ workspaceId, pruneStaleMetadata }) => {
-      const startedAt = performance.now();
-      const closed = await workspaces.closeWorkspace({ workspaceId, pruneStaleMetadata });
-      reviewCheckpoints.forgetWorkspace(workspaceId);
-      logToolCall(config, {
-        tool: toolNames.closeWorkspace,
-        workspaceId,
-        path: closed.root,
-        success: true,
-        durationMs: Math.round(performance.now() - startedAt),
-      });
-      return {
-        content: [
-          {
-            type: "text" as const,
-            text: [
-              `Closed workspace ${workspaceId}`,
-              `Root: ${closed.root}`,
-              `Mode: ${closed.mode}`,
-              closed.removed ? "Managed worktree removed through Git." : undefined,
-              closed.staleMetadataPruned ? "Validated stale Git worktree metadata pruned." : undefined,
-              closed.artifactCoverage?.status === "COVERED"
-                ? `Recorded session artifacts covered: ${closed.artifactCoverage.coveredPaths.length}; local commits: ${closed.artifactCoverage.commits.length}; excluded: ${closed.artifactCoverage.excludedPaths.length}.`
-                : "No session writes recorded by native DevSpace mutation tools; external shell-generated files are not attested.",
-            ].filter(Boolean).join("\n"),
-          },
-        ],
-        structuredContent: { ...closed },
-      };
+    async ({ workspaceId, pruneStaleMetadata }) =>
+      returnWorkspaceClosure(toolNames.closeWorkspace, workspaceId, false, pruneStaleMetadata),
+  );
+  registerAppTool(
+    server,
+    "commit_and_close",
+    {
+      title: "Commit verified artifacts and close",
+      description: "Explicit verified local commit/close (no push): exact Git root, full unignored file coverage, SHA/blob/HEAD receipt. No authority over product acceptance.",
+      inputSchema: closeInputSchema,
+      outputSchema: closureOutputSchema,
+      _meta: {},
+      annotations: CLOSE_WORKSPACE_TOOL_ANNOTATIONS,
     },
+    async ({ workspaceId, pruneStaleMetadata }) =>
+      returnWorkspaceClosure("commit_and_close", workspaceId, false, pruneStaleMetadata),
+  );
+  registerAppTool(
+    server,
+    "detach_workspace",
+    {
+      title: "Detach workspace without Git custody",
+      description: "Retire a discovery or working session without committing or removing its files/worktree. Returns unresolved paths, never represents a verified commit.",
+      inputSchema: { workspaceId: z.string() },
+      outputSchema: closureOutputSchema,
+      _meta: {},
+      annotations: CLOSE_WORKSPACE_TOOL_ANNOTATIONS,
+    },
+    async ({ workspaceId }) =>
+      returnWorkspaceClosure("detach_workspace", workspaceId, true),
   );
 
   registerAppTool(
@@ -1946,9 +2050,10 @@ export function createMcpServer(
       const startedAt = performance.now();
       const workspace = workspaces.getWorkspace(workspaceId);
       const cwd = workspaces.resolveWorkingDirectory(workspace, workingDirectory);
+      await workspaces.assertWritableWorkspace(workspaceId);
 
       try {
-        const result = await publishGitChanges({
+        const result = await workspaces.withWorkspaceWrite(workspaceId, () => publishGitChanges({
           cwd,
           workspaceRoot: workspace.root,
           allowedRoots: [workspace.root],
@@ -1957,7 +2062,7 @@ export function createMcpServer(
           remote,
           branch,
           push,
-        });
+        }));
         const resultText = [
           `Created commit ${result.commit} on ${result.branch}.`,
           result.pushed
@@ -2062,6 +2167,10 @@ export function createMcpServer(
         workspace,
         workingDirectory,
       );
+      const writable = await workspaces.assertWritableWorkspace(workspaceId);
+      if (!isPathInsideRoot(await realpath(cwd), writable.root)) {
+        throw new Error("WRITE_SCOPE_ESCAPE: shell working directory resolves outside Git repository");
+      }
 
       if (extra.signal?.aborted) {
         const content = [textBlock("Shell request was cancelled before execution.")];
@@ -2117,14 +2226,14 @@ export function createMcpServer(
           markExecutionStarted();
 
           try {
-            const response = await runShellTool(
+            const response = await workspaces.withWorkspaceWrite(workspaceId, () => runShellTool(
               input,
               {
                 cwd,
                 root: workspace.root,
               },
               context.signal,
-            );
+            ));
             const output = contentText(response.content);
             if (response.isError) {
               const error = new Error(output || "Command exited with error");
@@ -2357,7 +2466,7 @@ export function createMcpServer(
     {
       title: "Start long task",
       description:
-        "Start shell work or native-task validation asynchronously and return an operationId immediately. Validation without a command returns UNVERIFIED. Results are retained in memory only for the current DevSpace runtime and are not recoverable after runtime restart.",
+        "Start shell work or native-task validation asynchronously and return an operationId. The durable journal preserves terminal status; after origin restart, interrupted effects become UNKNOWN and raw output is not retained. Never blindly retry UNKNOWN operations.",
       inputSchema: {
         workspaceId: z
           .string()
@@ -2395,6 +2504,10 @@ export function createMcpServer(
           throw new Error("command is required for kind=shell");
         }
         const cwd = workspaces.resolveWorkingDirectory(workspace, workingDirectory);
+        const writable = await workspaces.assertWritableWorkspace(workspaceId);
+        if (!isPathInsideRoot(await realpath(cwd), writable.root)) {
+          throw new Error("WRITE_SCOPE_ESCAPE: shell working directory resolves outside Git repository");
+        }
 
         op = longTaskOperations.start(
           "shell",
@@ -2406,11 +2519,11 @@ export function createMcpServer(
             });
             try {
               context.update("running", `Executing: ${normalizedCommand.slice(0, 80)}`);
-              const response = await runShellTool(
+              const response = await workspaces.withWorkspaceWrite(workspaceId, () => runShellTool(
                 { command: normalizedCommand, timeout: timeout ?? 300 },
                 { cwd, root: workspace.root },
                 context.signal,
-              );
+              ));
               const output = contentText(response.content);
               if (response.isError) {
                 const error = new Error(output || "Command exited with error");
@@ -2430,6 +2543,7 @@ export function createMcpServer(
           );
         }
         const normalizedCommand = command?.trim();
+        if (normalizedCommand) await workspaces.assertWritableWorkspace(workspaceId);
         op = longTaskOperations.start(
           "validation",
           workspaceId,
@@ -2441,11 +2555,11 @@ export function createMcpServer(
               });
               try {
                 context.update("running", `Validating: ${normalizedCommand.slice(0, 80)}`);
-                const response = await runShellTool(
+                const response = await workspaces.withWorkspaceWrite(workspaceId, () => runShellTool(
                   { command: normalizedCommand, timeout: 300 },
                   { cwd: workspace.root, root: workspace.root },
                   context.signal,
-                );
+                ));
                 const output = contentText(response.content);
                 return {
                   output,
@@ -2527,7 +2641,7 @@ export function createMcpServer(
     {
       title: "Long task status",
       description:
-        "Return in-memory progress and terminal output for an operationId. Unknown, evicted, or pre-restart IDs return status=failed with error=operation_not_found.",
+        "Return live progress or a durable status receipt. After restart, interrupted operations have status=unknown; terminal output is not persisted. Unknown IDs return operation_not_found.",
       inputSchema: {
         operationId: z
           .string()
@@ -2583,7 +2697,7 @@ export function createMcpServer(
     {
       title: "Cancel long task",
       description:
-        "Cancel a queued or running operation. Terminal operations are unchanged; unknown, evicted, or pre-restart IDs return operation_not_found.",
+        "Cancel a queued or running operation. Terminal/recovered operations remain unchanged; unknown IDs return operation_not_found.",
       inputSchema: {
         operationId: z.string().trim().min(1).describe("Operation identifier to cancel."),
       },
@@ -2712,9 +2826,11 @@ export function createMcpServer(
     },
   );
 
-  server.server.oninitialized = () => {
-    server.sendToolListChanged();
-  };
+  if (!registrationTarget) {
+    server.server.oninitialized = () => {
+      server.sendToolListChanged();
+    };
+  }
 
   return server;
 }
@@ -2772,6 +2888,11 @@ export function createServer(
   });
   const workspaceStore = createWorkspaceStore(config.stateDir);
   const workspaces = new WorkspaceRegistry(config, workspaceStore);
+  const operationJournal = options?.longTaskOperations
+    ? undefined
+    : new SqliteLongTaskJournal<LongTaskToolResult>(config.stateDir);
+  const retainedOperations = options?.longTaskOperations ??
+    new LongTaskOperationManager<LongTaskToolResult>(100, operationJournal);
   const reviewCheckpoints = createReviewCheckpointManager();
   const webLaunchBrowser = new WebLaunchBrowserController(config.allowedRoots, {
     sessionProvider: config.chatSessionProvider,
@@ -2795,14 +2916,14 @@ export function createServer(
     options?.mcpTransportMode ?? resolveMcpTransportMode(process.env.DEVSPACE_MCP_TRANSPORT_MODE);
   const maxMcpSessions = options?.maxMcpSessions ?? MAX_MCP_SESSIONS;
   const mcpSessionIdleMs = options?.mcpSessionIdleMs ?? MCP_SESSION_IDLE_MS;
-  const makeMcpServer = () =>
+  const makeMcpServer = (registrationTarget?: McpRegistrationTarget) =>
     createMcpServer(
       config,
       workspaces,
       reviewCheckpoints,
       webLaunchBrowser,
       defaultMetaHarnessHost,
-      options?.longTaskOperations ?? globalLongTaskOperations,
+      retainedOperations,
       options?.fastPathTimeoutMs ?? FAST_PATH_EXECUTION_MS,
       {
         auditReturnController,
@@ -2810,7 +2931,29 @@ export function createServer(
         reviewReturnController,
       },
       options?.fastPathQueueWaitMs ?? FAST_PATH_QUEUE_WAIT_MS,
+      registrationTarget,
     );
+
+  // Share the same registrations, including Repo Custody, between MCP v1 and v2.
+  const bindModernSurface = compileMcpRegistrationSurface((target) => {
+    makeMcpServer(target);
+  });
+  const modernHandler = createMcpHandler(() => {
+    const adapter = createModernMcpServerAdapter(
+      { name: "devspace", title: "DevSpace", version: "0.1.0" },
+      { instructions: serverInstructions(config, toolNamesFor(config)) },
+    );
+    bindModernSurface(adapter.registrationTarget);
+    return adapter.server;
+  }, {
+    legacy: "stateless",
+    onerror: (error) => logEvent(config.logging, "error", "mcp_modern_handler_error",
+      modernMcpAdapterErrorLogFields(error)),
+  });
+  const modernNodeHandler = toNodeHandler(modernHandler, {
+    onerror: (error) => logEvent(config.logging, "error", "mcp_modern_adapter_error",
+      modernMcpAdapterErrorLogFields(error)),
+  });
 
   if (config.logging.trustProxy) {
     app.set("trust proxy", () => true);
@@ -2927,43 +3070,20 @@ export function createServer(
       transportMode: mcpTransportMode,
     });
 
-    if (mcpTransportMode === "stateless") {
-      if (req.method !== "POST") {
-        sendJsonRpcError(res, 405, -32000, "Method not allowed");
-        return;
-      }
-
-      const transport = new StreamableHTTPServerTransport({
-        sessionIdGenerator: undefined,
-      });
-      const server = makeMcpServer();
-      let cleanedUp = false;
-      const cleanup = () => {
-        if (cleanedUp) return;
-        cleanedUp = true;
-        void server.close().catch((error) => {
-          logEvent(config.logging, "warn", "mcp_stateless_cleanup_error", {
-            requestId,
-            error: error instanceof Error ? error.message : String(error),
-          });
-        });
-      };
-      res.once("finish", cleanup);
-      res.once("close", cleanup);
-
+    // v2 requests use per-request handling. Keep the existing v1 stateful
+    // transport intact for clients that still depend on MCP session IDs.
+    const modernRequest = req.header("mcp-protocol-version") === "2026-07-28"
+      || (req.body && typeof req.body === "object"
+        && "method" in req.body && req.body.method === "server/discover");
+    if (mcpTransportMode === "stateless" || modernRequest) {
       try {
-        await server.connect(transport);
-        await transport.handleRequest(req, res, req.body);
+        await modernNodeHandler(req, res, req.body);
       } catch (error) {
-        cleanup();
-        logEvent(config.logging, "error", "mcp_request_error", {
+        logEvent(config.logging, "error", "mcp_modern_request_error", {
           requestId,
-          transportMode: mcpTransportMode,
           error: error instanceof Error ? error.message : String(error),
         });
-        if (!res.headersSent) {
-          sendJsonRpcError(res, 500, -32603, "Internal server error");
-        }
+        if (!res.headersSent) sendJsonRpcError(res, 500, -32603, "Internal server error");
       }
       return;
     }
@@ -3105,10 +3225,12 @@ export function createServer(
       await Promise.allSettled([...transports.values()].map((transport) => transport.close()));
       transports.clear();
       transportActivity.clear();
+      await modernHandler.close();
       reviewReturnController.close();
       await webLaunchBrowser.close();
       oauthProvider.close();
       workspaceStore.close?.();
+      operationJournal?.close();
     },
   };
 }
