@@ -5,7 +5,16 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
-import { loadConfig } from "./config.js";
+import { loadConfig as loadProductionConfig } from "./config.js";
+
+// These tests construct a complete isolated env instead of inheriting process.env.
+// Supply an explicit non-production OAuth secret on every CI platform.
+function loadConfig(env: NodeJS.ProcessEnv) {
+  return loadProductionConfig({
+    DEVSPACE_OAUTH_OWNER_TOKEN: "devspace-long-task-ci-fixture-token",
+    ...env,
+  });
+}
 import { git } from "./git.js";
 import { WorkspaceRegistry } from "./workspaces.js";
 import { createReviewCheckpointManager } from "./review-checkpoints.js";

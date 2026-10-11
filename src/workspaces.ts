@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import type { WorkspaceMode, WorkspaceStore } from "./workspace-store.js";
 import { realpathSync } from "node:fs";
-import { opendir, stat } from "node:fs/promises";
+import { opendir, realpath, stat } from "node:fs/promises";
 import { dirname, join, relative, resolve, sep } from "node:path";
 import { loadProjectContextFiles } from "@earendil-works/pi-coding-agent";
 import type { ServerConfig } from "./config.js";
@@ -654,6 +654,11 @@ function contextPathKey(path: string): string {
 async function findGitContextFiles(root: string): Promise<string[] | undefined> {
   try {
     const gitRoot = (await git(root, ["rev-parse", "--show-toplevel"])).stdout.trim();
+    const [physicalRoot, physicalGitRoot] = await Promise.all([realpath(root), realpath(gitRoot)]);
+    if (!isPathInsideRoot(physicalRoot, physicalGitRoot)) return undefined;
+    // Git's canonical path may differ from the caller's /var or Windows 8.3
+    // alias. Map discovered relative paths back into the workspace namespace.
+    const lexicalGitRoot = resolve(root, relative(physicalRoot, physicalGitRoot));
     const { stdout } = await git(
       gitRoot,
       ["ls-files", "-z", "-c", "-o", "--exclude-standard", "--", ...CONTEXT_GIT_PATHS],
@@ -666,7 +671,7 @@ async function findGitContextFiles(root: string): Promise<string[] | undefined> 
           .split("\0")
           .filter(Boolean)
           .filter((path) => !path.split(/[\\/]/u).includes(".worktrees"))
-          .map((path) => resolve(gitRoot, path))
+          .map((path) => resolve(lexicalGitRoot, path))
           .filter((path) => isPathInsideRoot(path, root))
           .map((path) => [contextPathKey(path), path] as const),
       ).values(),

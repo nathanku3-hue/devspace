@@ -1,9 +1,18 @@
 $here = Split-Path -Parent $MyInvocation.MyCommand.Path
-$supportScript = Join-Path $here "setup-devspace-support.ps1"
-$lifecycleScript = Join-Path $here "setup-devspace-lifecycle.ps1"
-. $supportScript
-. $lifecycleScript
-. (Join-Path $here "devspace-supervisor.ps1") -LibraryOnly
+if ((Get-Module Pester).Version.Major -ge 5) {
+    # Pester 5 separates discovery from execution. Imports at file scope do
+    # not populate the It scope; register them for the run phase instead.
+    BeforeAll {
+        $here = $PSScriptRoot
+        . (Join-Path $here "setup-devspace-support.ps1")
+        . (Join-Path $here "setup-devspace-lifecycle.ps1")
+        . (Join-Path $here "devspace-supervisor.ps1") -LibraryOnly
+    }
+} else {
+    . (Join-Path $here "setup-devspace-support.ps1")
+    . (Join-Path $here "setup-devspace-lifecycle.ps1")
+    . (Join-Path $here "devspace-supervisor.ps1") -LibraryOnly
+}
 
 Describe "DevSpace setup script syntax" {
     It "parses the production setup script without PowerShell syntax errors" {

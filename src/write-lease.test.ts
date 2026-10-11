@@ -51,5 +51,7 @@ try {
   storeA.close();
   storeB.close();
 } finally {
-  await rm(dir, { recursive: true, force: true });
+  // Windows may briefly retain SQLite WAL handles after close(). Retry only
+  // transient filesystem cleanup instead of masking a persistent lock.
+  await rm(dir, { recursive: true, force: true, maxRetries: 20, retryDelay: 200 });
 }

@@ -37,12 +37,17 @@ export async function assertWritableRepository(workspaceRoot: string): Promise<W
  * This is a native-file-tool guard, NOT an OS sandbox for arbitrary shell code.
  */
 export async function assertNativeWritePath(workspaceRoot: string, targetPath: string): Promise<void> {
+  const lexicalBase = resolve(workspaceRoot);
   const base = await realpath(workspaceRoot);
   const target = resolve(targetPath);
-  if (!isPathInsideRoot(target, workspaceRoot) || !isPathInsideRoot(target, base)) {
+  // /var -> /private/var on macOS and short-path aliases on Windows can
+  // make a valid lexical child differ from the canonical checkout prefix.
+  // Determine the suffix lexically, then inspect every component under the
+  // physical root so symlinks *inside* the checkout remain forbidden.
+  if (!isPathInsideRoot(target, lexicalBase)) {
     throw new Error("WRITE_SCOPE_ESCAPE: file resolves outside repository");
   }
-  const suffix = relative(base, target);
+  const suffix = relative(lexicalBase, target);
   if (!suffix || suffix === "." || isAbsolute(suffix)) {
     throw new Error("WRITE_SCOPE_ESCAPE: a file path, not the repository directory, is required");
   }

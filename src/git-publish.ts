@@ -1,5 +1,5 @@
 import { createHash, randomBytes } from "node:crypto";
-import { lstat, readFile, rm, stat as fileStat } from "node:fs/promises";
+import { lstat, readFile, realpath, rm, stat as fileStat } from "node:fs/promises";
 import { isAbsolute, relative, resolve, sep } from "node:path";
 import { git } from "./git.js";
 import { isPathInsideRoot, resolveAllowedPath } from "./roots.js";
@@ -111,9 +111,18 @@ export async function publishGitChanges(
 
   const allowedRoots = input.allowedRoots ?? [input.workspaceRoot];
   const gitRoot = (await git(input.cwd, ["rev-parse", "--show-toplevel"])).stdout.trim();
-  if (!allowedRoots.some((root) => isPathInsideRoot(gitRoot, root))) {
+  const [physicalGitRoot, physicalCwd, ...physicalAllowedRoots] = await Promise.all([
+    realpath(gitRoot),
+    realpath(input.cwd),
+    ...allowedRoots.map((root) => realpath(root).catch(() => null)),
+  ]);
+  if (!physicalAllowedRoots.some((root) => root && isPathInsideRoot(physicalGitRoot, root))) {
     throw new Error("Git repository is outside the allowed roots");
   }
+  // Git may report a canonical /private/var path while the caller uses /var.
+  // Keep the relative Git path in the caller's lexical namespace, after
+  // checking the repository's actual location against canonical allowed roots.
+  const lexicalGitRoot = resolve(input.cwd, relative(physicalCwd, physicalGitRoot));
 
   const repositoryPaths = Array.from(
     new Map(
@@ -121,11 +130,11 @@ export async function publishGitChanges(
         assertLiteralFilePath(path);
         const absolutePath = resolveAllowedPath(path, input.cwd, allowedRoots);
         await assertNotDirectory(absolutePath, path);
-        if (!isPathInsideRoot(absolutePath, gitRoot)) {
+        if (!isPathInsideRoot(absolutePath, lexicalGitRoot)) {
           throw new Error(`Path is outside the current Git repository: ${path}`);
         }
 
-        const repositoryPath = normalizeRepositoryPath(relative(gitRoot, absolutePath));
+        const repositoryPath = normalizeRepositoryPath(relative(lexicalGitRoot, absolutePath));
         if (!repositoryPath || repositoryPath === ".") {
           throw new Error("Repository root cannot be staged as an explicit path");
         }
