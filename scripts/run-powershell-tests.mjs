@@ -11,7 +11,9 @@ const scriptDirectory = path.dirname(fileURLToPath(import.meta.url));
 const testPath = path.join(scriptDirectory, "setup-devspace.Tests.ps1");
 const escapedTestPath = testPath.replaceAll("'", "''");
 const command = [
-  "Import-Module Pester -MinimumVersion 3.4 -ErrorAction Stop",
+  // This suite uses Pester 3 assertion/mocking syntax. Pin the built-in
+  // Windows PowerShell version instead of silently selecting CI's Pester 5.
+  "Import-Module Pester -RequiredVersion 3.4.0 -ErrorAction Stop",
   "$version = (Get-Module Pester).Version.Major",
   `if ($version -ge 5) { $result = Invoke-Pester -Path '${escapedTestPath}' -PassThru } else { $result = Invoke-Pester -Script '${escapedTestPath}' -PassThru }`,
   "if ($result.FailedCount -gt 0) { exit 1 }",

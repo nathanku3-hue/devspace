@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import { createReadStream } from "node:fs";
-import { lstat, readlink } from "node:fs/promises";
-import { relative, sep } from "node:path";
+import { lstat, readlink, realpath } from "node:fs/promises";
+import { relative, resolve, sep } from "node:path";
 import { getGitEligibility, git } from "./git.js";
 import { publishGitChanges } from "./git-publish.js";
 import { isPathInsideRoot } from "./roots.js";
@@ -66,6 +66,7 @@ async function workingBlob(root: string, path: string): Promise<string | null> {
 }
 
 async function gitDirtySnapshot(root: string, workspaceRoot: string): Promise<Record<string, string>> {
+  const [physicalRoot, physicalWorkspaceRoot] = await Promise.all([realpath(root), realpath(workspaceRoot)]);
   const porcelain = (await git(root, [
     "status", "--porcelain=v1", "--no-renames", "-z", "--untracked-files=all",
   ])).stdout;
@@ -75,9 +76,10 @@ async function gitDirtySnapshot(root: string, workspaceRoot: string): Promise<Re
     // Protected tracked files MUST be visible to the audit even when they
     // are forbidden for automatic publication. Only disposable directories
     // are omitted from this comparison.
+    const physicalPath = physicalRoot + sep + path.split("/").join(sep);
     if (path.split("/").some((part) => EXCLUDED_SEGMENTS.has(part.toLowerCase()))
-        || !isPathInsideRoot(root + sep + path.split("/").join(sep), workspaceRoot)) continue;
-    const hash = await snapshotContentHash(root + sep + path.split("/").join(sep));
+        || !isPathInsideRoot(physicalPath, physicalWorkspaceRoot)) continue;
+    const hash = await snapshotContentHash(physicalPath);
     snapshot[path] = line.slice(0, 2) + ":" + (hash ?? "deleted");
   }
   return snapshot;
@@ -90,7 +92,7 @@ export async function captureSessionBaseline(
 ): Promise<void> {
   const eligibility = await getGitEligibility(workspaceRoot);
   const gitRoot = eligibility.gitRoot;
-  if (!eligibility.ok || !gitRoot || !isPathInsideRoot(gitRoot, workspaceRoot)) {
+  if (!eligibility.ok || !gitRoot || !isPathInsideRoot(await realpath(gitRoot), await realpath(workspaceRoot))) {
     store.putBaseline(workspaceId, null, {});
     return;
   }
@@ -125,7 +127,9 @@ export async function prepareArtifact(
 ): Promise<SessionArtifact> {
   const eligibility = await getGitEligibility(workspaceRoot);
   const root = eligibility.gitRoot ?? workspaceRoot;
-  const path = repoPath(root, absolutePath);
+  const [physicalWorkspaceRoot, physicalRoot] = await Promise.all([realpath(workspaceRoot), realpath(root)]);
+  const logicalRoot = resolve(workspaceRoot, relative(physicalWorkspaceRoot, physicalRoot));
+  const path = repoPath(logicalRoot, absolutePath);
   const previous = store.getArtifact(workspaceId, root, path);
   const artifact: SessionArtifact = {
     workspaceSessionId: workspaceId,
@@ -136,7 +140,8 @@ export async function prepareArtifact(
     reason: null,
   };
 
-  if (!eligibility.ok || !isPathInsideRoot(root, workspaceRoot)) {
+  if (!eligibility.ok || !isPathInsideRoot(physicalRoot, physicalWorkspaceRoot)
+      || !isPathInsideRoot(absolutePath, logicalRoot)) {
     artifact.state = "unsafe";
     artifact.reason = eligibility.message ?? "repository root is outside workspace";
   } else if (PROTECTED_NAMES.has((path.split("/").at(-1) ?? "").toUpperCase())) {
@@ -244,8 +249,9 @@ export async function commitSessionArtifacts(
       unsafe.map((item) => item.path + " (" + (item.reason ?? item.state) + ")").join(", "));
   }
   const repositories = new Map<string, SessionArtifact[]>();
+  const physicalWorkspaceRoot = await realpath(workspaceRoot);
   for (const item of eligible) {
-    if (!isPathInsideRoot(item.repositoryRoot, workspaceRoot)) {
+    if (!isPathInsideRoot(await realpath(item.repositoryRoot), physicalWorkspaceRoot)) {
       throw new Error("CLOSE_INCOMPLETE: repository escaped workspace boundary");
     }
     const items = repositories.get(item.repositoryRoot) ?? [];

@@ -4,7 +4,7 @@ import { lstat, mkdir, realpath, rm, stat } from "node:fs/promises";
 import { basename, dirname, join, relative, resolve } from "node:path";
 import { promisify } from "node:util";
 import type { ServerConfig } from "./config.js";
-import { assertAllowedPath, isPathInsideRoot } from "./roots.js";
+import { isPathInsideRoot } from "./roots.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -70,8 +70,12 @@ export async function createManagedWorktree(input: {
   createBranch?: boolean;
   config: ServerConfig;
 }): Promise<ManagedWorktree> {
-  const sourcePath = assertAllowedPath(input.sourcePath, input.config.allowedRoots);
+  const sourcePath = resolve(input.sourcePath);
   await assertDirectory(sourcePath, input.sourcePath);
+  // A managed worktree can be returned under the canonical /private/var
+  // prefix while the configured macOS temporary root uses /var. Enforce
+  // physical allowed-root containment before resolving repository ownership.
+  await assertCanonicalAllowed(await realpath(sourcePath), input.config.allowedRoots);
 
   const sourceRoot = await resolveOwningRepositoryRoot(sourcePath, input.config.allowedRoots);
   const branch = normalizeBranch(input.branch);
