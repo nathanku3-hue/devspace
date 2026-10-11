@@ -20,6 +20,9 @@ Describe "DevSpace setup script syntax" {
         $tokens = $null
         $errors = $null
         [void][System.Management.Automation.Language.Parser]::ParseFile($setupScript, [ref]$tokens, [ref]$errors)
+        if (@($errors).Count -gt 0) {
+            throw ('Setup script parse diagnostics: ' + (($errors | ForEach-Object { $_.Message + ' at line ' + $_.Extent.StartLineNumber }) -join '; '))
+        }
         @($errors).Count | Should Be 0
     }
 }

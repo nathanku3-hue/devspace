@@ -249,7 +249,19 @@ try {
 
   const secondStore = new SqliteWorkspaceStore(stateDir);
   const restoredRegistry = new WorkspaceRegistry(config, secondStore);
-  assert.equal(restoredRegistry.getWorkspace(persistentWorkspace.workspace.id).mode, "checkout");
+  try {
+    assert.equal(restoredRegistry.getWorkspace(persistentWorkspace.workspace.id).mode, "checkout");
+  } catch (error) {
+    // Do not suppress a failed authorization decision: preserve the resolved
+    // paths so a Windows runner alias mismatch can be fixed precisely.
+    console.error("[workspace-restore-paths]", JSON.stringify({
+      sessionRoot: persistentWorkspace.workspace.root,
+      physicalRoot: await realpath(persistentWorkspace.workspace.root).catch(() => null),
+      allowedRoots: config.allowedRoots,
+      physicalAllowedRoots: await Promise.all(config.allowedRoots.map((entry) => realpath(entry).catch(() => null))),
+    }));
+    throw error;
+  }
   const restoredWorktree = restoredRegistry.getWorkspace(persistentWorktree.workspace.id);
   assert.equal(restoredWorktree.sourceRoot, await realpath(gitRoot));
   assert.equal(restoredWorktree.worktree?.branch, "persistent-worktree-branch");

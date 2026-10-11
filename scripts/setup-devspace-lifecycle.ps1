@@ -455,7 +455,18 @@ function Get-DevSpaceDistFingerprint {
     if ([string]::IsNullOrWhiteSpace($CliPath) -or -not (Test-Path -LiteralPath $CliPath -PathType Leaf)) {
         return $null
     }
-    return (Get-FileHash -LiteralPath $CliPath -Algorithm SHA256).Hash.ToLowerInvariant()
+    # Use .NET directly: a constrained Pester/PowerShell session may not
+    # auto-load Microsoft.PowerShell.Utility's Get-FileHash command.
+    $stream = [System.IO.File]::OpenRead($CliPath)
+    $sha256 = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        $digest = $sha256.ComputeHash($stream)
+        return [System.BitConverter]::ToString($digest).Replace('-', '').ToLowerInvariant()
+    }
+    finally {
+        $sha256.Dispose()
+        $stream.Dispose()
+    }
 }
 
 function Copy-DevSpaceDistSnapshot {
