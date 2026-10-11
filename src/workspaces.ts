@@ -563,11 +563,19 @@ export class WorkspaceRegistry {
       if (!sourceRoot) {
         throw new Error(`Stored worktree workspace is missing sourceRoot: ${root}`);
       }
-      assertAllowedPath(sourceRoot, this.config.allowedRoots);
-      return assertAllowedPath(root, [join(sourceRoot, ".worktrees")]);
+      this.assertPhysicalWorkspaceAllowed(sourceRoot);
+      const managedRoot = realpathSync(join(sourceRoot, ".worktrees"));
+      if (!isPathInsideRoot(realpathSync(root), managedRoot)
+          || realpathSync(root) === managedRoot) {
+        throw new Error("WORKSPACE_ROOT_ESCAPE: linked worktree is outside its managed root");
+      }
+      return root;
     }
 
-    return assertAllowedPath(root, this.config.allowedRoots);
+    // Physical allowed-root containment was established above. Avoid a
+    // second lexical check, which rejects equivalent /var and /private/var
+    // paths (and Windows 8.3 aliases) when restoring a session.
+    return root;
   }
 
   private loadInitialAgentsFiles(root: string): LoadedAgentsFile[] {

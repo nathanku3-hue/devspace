@@ -2,7 +2,8 @@ import { createHash, randomBytes } from "node:crypto";
 import { lstat, readFile, realpath, rm, stat as fileStat } from "node:fs/promises";
 import { isAbsolute, relative, resolve, sep } from "node:path";
 import { git } from "./git.js";
-import { isPathInsideRoot, resolveAllowedPath } from "./roots.js";
+import { isPathInsideRoot } from "./roots.js";
+import { assertNativeWritePath } from "./write-scope.js";
 
 export interface PublishGitChangesInput {
   cwd: string;
@@ -128,13 +129,19 @@ export async function publishGitChanges(
     new Map(
       await Promise.all(input.paths.map(async (path) => {
         assertLiteralFilePath(path);
-        const absolutePath = resolveAllowedPath(path, input.cwd, allowedRoots);
-        await assertNotDirectory(absolutePath, path);
-        if (!isPathInsideRoot(absolutePath, lexicalGitRoot)) {
+        const requestedPath = resolve(input.cwd, path);
+        // Translate lexical aliases such as macOS /var -> /private/var to
+        // the checked physical checkout before enforcing path containment.
+        const absolutePath = isPathInsideRoot(requestedPath, lexicalGitRoot)
+          ? resolve(physicalGitRoot, relative(lexicalGitRoot, requestedPath))
+          : requestedPath;
+        if (!isPathInsideRoot(absolutePath, physicalGitRoot)) {
           throw new Error(`Path is outside the current Git repository: ${path}`);
         }
+        await assertNotDirectory(absolutePath, path);
+        await assertNativeWritePath(physicalGitRoot, absolutePath);
 
-        const repositoryPath = normalizeRepositoryPath(relative(lexicalGitRoot, absolutePath));
+        const repositoryPath = normalizeRepositoryPath(relative(physicalGitRoot, absolutePath));
         if (!repositoryPath || repositoryPath === ".") {
           throw new Error("Repository root cannot be staged as an explicit path");
         }
