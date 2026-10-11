@@ -1,9 +1,12 @@
-import { eq } from "drizzle-orm";
+import { randomUUID } from "node:crypto";
+import { and, eq } from "drizzle-orm";
 import { openDatabase, type DatabaseHandle } from "./db/client.js";
 import {
   sessionArtifacts,
   sessionGitBaselines,
   workspaceSessions,
+  repositoryWriteLeases,
+  workspaceClosureReceipts,
   type WorkspaceSessionRow,
 } from "./db/schema.js";
 
@@ -48,11 +51,18 @@ export interface WorkspaceStore {
   getSession(id: string): WorkspaceSession | undefined;
   touchSession(id: string): void;
   closeSession(id: string, headSha?: string): void;
+  getClosureReceipt(id: string): string | undefined;
+  finalizeSession(id: string, headSha: string | undefined, receiptJson: string, repositoryRoot?: string): void;
   getArtifact(id: string, repositoryRoot: string, path: string): SessionArtifact | undefined;
   putArtifact(artifact: SessionArtifact): void;
   listArtifacts(id: string): SessionArtifact[];
   putBaseline(id: string, repositoryRoot: string | null, snapshot: Record<string, string>): void;
   getBaseline(id: string): { repositoryRoot: string | null; snapshot: Record<string, string> } | undefined;
+  acquireWriteLease(repositoryRoot: string, workspaceSessionId: string): string;
+  hasWriteLease(repositoryRoot: string, workspaceSessionId: string): boolean;
+  assertWriteLease(repositoryRoot: string, workspaceSessionId: string, token: string): void;
+  releaseWriteLease(repositoryRoot: string, workspaceSessionId: string, token: string): void;
+  releaseWriteLeaseForSession(repositoryRoot: string, workspaceSessionId: string): void;
   close?(): void;
 }
 
@@ -143,6 +153,42 @@ export class SqliteWorkspaceStore implements WorkspaceStore {
       .run();
   }
 
+  getClosureReceipt(id: string): string | undefined {
+    return this.database.db.select().from(workspaceClosureReceipts)
+      .where(eq(workspaceClosureReceipts.workspaceSessionId, id)).get()?.receiptJson;
+  }
+
+  finalizeSession(id: string, headSha: string | undefined, receiptJson: string, repositoryRoot?: string): void {
+    this.database.sqlite.transaction(() => {
+      const existingReceipt = this.getClosureReceipt(id);
+      if (existingReceipt) {
+        if (existingReceipt !== receiptJson) throw new Error("CLOSE_RECEIPT_CONFLICT: existing sealed receipt differs");
+        return;
+      }
+      const session = this.getSession(id);
+      if (!session || session.status !== "active") {
+        throw new Error("CLOSE_INCOMPLETE: session missing or no longer active");
+      }
+      if (repositoryRoot) {
+        const lease = this.database.db.select().from(repositoryWriteLeases)
+          .where(eq(repositoryWriteLeases.repositoryRoot, repositoryRoot)).get();
+        if (lease && lease.workspaceSessionId !== id) {
+          throw new Error("CLOSE_INCOMPLETE: checkout write lease belongs to a different session");
+        }
+        this.database.db.delete(repositoryWriteLeases).where(and(
+          eq(repositoryWriteLeases.repositoryRoot, repositoryRoot),
+          eq(repositoryWriteLeases.workspaceSessionId, id),
+        )).run();
+      }
+      this.database.db.insert(workspaceClosureReceipts).values({
+        workspaceSessionId: id,
+        receiptJson,
+        recordedAt: new Date().toISOString(),
+      }).run();
+      this.closeSession(id, headSha);
+    }).immediate();
+  }
+
   getArtifact(id: string, repositoryRoot: string, path: string): SessionArtifact | undefined {
     const row = this.database.db.select().from(sessionArtifacts).where(
       eq(sessionArtifacts.workspaceSessionId, id),
@@ -185,6 +231,51 @@ export class SqliteWorkspaceStore implements WorkspaceStore {
     const row = this.database.db.select().from(sessionGitBaselines)
       .where(eq(sessionGitBaselines.workspaceSessionId, id)).get();
     return row ? { repositoryRoot: row.repositoryRoot, snapshot: JSON.parse(row.statusJson) } : undefined;
+  }
+
+  acquireWriteLease(repositoryRoot: string, workspaceSessionId: string): string {
+    const token = randomUUID();
+    const transaction = this.database.sqlite.transaction(() => {
+      const existing = this.database.db.select().from(repositoryWriteLeases)
+        .where(eq(repositoryWriteLeases.repositoryRoot, repositoryRoot)).get();
+      if (existing) {
+        if (existing.workspaceSessionId !== workspaceSessionId) {
+          throw new Error("WRITE_LEASE_CONFLICT: checkout already owned by " + existing.workspaceSessionId);
+        }
+        return existing.leaseToken;
+      }
+      this.database.db.insert(repositoryWriteLeases).values({
+        repositoryRoot, workspaceSessionId, leaseToken: token, acquiredAt: new Date().toISOString(),
+      }).run();
+      return token;
+    });
+    return transaction.immediate();
+  }
+
+  hasWriteLease(repositoryRoot: string, workspaceSessionId: string): boolean {
+    return this.database.db.select().from(repositoryWriteLeases)
+      .where(eq(repositoryWriteLeases.repositoryRoot, repositoryRoot)).get()?.workspaceSessionId === workspaceSessionId;
+  }
+
+  assertWriteLease(repositoryRoot: string, workspaceSessionId: string, token: string): void {
+    const existing = this.database.db.select().from(repositoryWriteLeases)
+      .where(eq(repositoryWriteLeases.repositoryRoot, repositoryRoot)).get();
+    if (!existing || existing.workspaceSessionId !== workspaceSessionId || existing.leaseToken !== token) {
+      throw new Error("WRITE_LEASE_LOST: execution is no longer authorized to write");
+    }
+  }
+
+  releaseWriteLease(repositoryRoot: string, workspaceSessionId: string, token: string): void {
+    this.assertWriteLease(repositoryRoot, workspaceSessionId, token);
+    this.database.db.delete(repositoryWriteLeases)
+      .where(eq(repositoryWriteLeases.repositoryRoot, repositoryRoot)).run();
+  }
+
+  releaseWriteLeaseForSession(repositoryRoot: string, workspaceSessionId: string): void {
+    this.database.db.delete(repositoryWriteLeases).where(and(
+      eq(repositoryWriteLeases.repositoryRoot, repositoryRoot),
+      eq(repositoryWriteLeases.workspaceSessionId, workspaceSessionId),
+    )).run();
   }
 
   close(): void {

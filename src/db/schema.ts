@@ -29,6 +29,25 @@ export const sessionGitBaselines = sqliteTable("session_git_baselines", {
   statusJson: text("status_json").notNull(),
 });
 
+export const repositoryWriteLeases = sqliteTable("repository_write_leases", {
+  repositoryRoot: text("repository_root").primaryKey(),
+  workspaceSessionId: text("workspace_session_id").notNull(),
+  leaseToken: text("lease_token").notNull(),
+  acquiredAt: text("acquired_at").notNull(),
+});
+
+export const workspaceClosureReceipts = sqliteTable("workspace_closure_receipts", {
+  workspaceSessionId: text("workspace_session_id").primaryKey(),
+  receiptJson: text("receipt_json").notNull(),
+  recordedAt: text("recorded_at").notNull(),
+});
+
+export const durableOperations = sqliteTable("durable_operations", {
+  operationId: text("operation_id").primaryKey(),
+  snapshotJson: text("snapshot_json").notNull(),
+  updatedAt: text("updated_at").notNull(),
+});
+
 export const sessionArtifacts = sqliteTable(
   "session_artifacts",
   {

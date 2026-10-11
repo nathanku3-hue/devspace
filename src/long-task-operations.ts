@@ -7,7 +7,13 @@ export type LongTaskStatus =
   | "cancelling"
   | "succeeded"
   | "failed"
-  | "cancelled";
+  | "cancelled"
+  | "unknown";
+
+export interface LongTaskJournal<TResult> {
+  save(record: LongTaskOperationSnapshot<TResult>): void;
+  find(operationId: string): LongTaskOperationSnapshot<TResult> | undefined;
+}
 
 export interface LongTaskRunContext {
   signal: AbortSignal;
@@ -48,7 +54,7 @@ function abortError(): Error {
 }
 
 function isTerminal(status: LongTaskStatus): boolean {
-  return status === "succeeded" || status === "failed" || status === "cancelled";
+  return status === "succeeded" || status === "failed" || status === "cancelled" || status === "unknown";
 }
 
 function snapshot<TResult>(
@@ -72,7 +78,7 @@ function snapshot<TResult>(
 export class LongTaskOperationManager<TResult = unknown> {
   readonly #operations = new Map<string, LongTaskOperationRecord<TResult>>();
 
-  constructor(readonly maxRetained = 100) {
+  constructor(readonly maxRetained = 100, private readonly journal?: LongTaskJournal<TResult>) {
     if (!Number.isInteger(maxRetained) || maxRetained < 1) {
       throw new Error("maxRetained must be a positive integer");
     }
@@ -103,6 +109,7 @@ export class LongTaskOperationManager<TResult = unknown> {
       resolveCompletion,
       completion,
     };
+    this.journal?.save(snapshot(record));
     this.#operations.set(operationId, record);
 
     queueMicrotask(() => {
@@ -124,7 +131,7 @@ export class LongTaskOperationManager<TResult = unknown> {
 
   tryGet(operationId: string): LongTaskOperationSnapshot<TResult> | undefined {
     const record = this.#operations.get(operationId);
-    return record ? snapshot(record) : undefined;
+    return record ? snapshot(record) : this.journal?.find(operationId);
   }
 
   getCompletion(operationId: string): Promise<LongTaskOperationSnapshot<TResult>> {
@@ -140,6 +147,7 @@ export class LongTaskOperationManager<TResult = unknown> {
     const record = this.#operations.get(operationId);
     if (!record) throw new Error(`Unknown long-task operation: ${operationId}`);
     record.diagnostics = { ...record.diagnostics, ...fields };
+    this.journal?.save(snapshot(record));
     return snapshot(record);
   }
 
@@ -161,11 +169,12 @@ export class LongTaskOperationManager<TResult = unknown> {
 
   tryCancel(operationId: string): LongTaskOperationSnapshot<TResult> | undefined {
     const record = this.#operations.get(operationId);
-    if (!record) return undefined;
+    if (!record) return this.journal?.find(operationId);
     if (isTerminal(record.status)) return snapshot(record);
 
     record.status = "cancelling";
     record.progress = "Cancellation requested; terminating the managed process tree.";
+    this.journal?.save(snapshot(record));
     record.controller.abort(abortError());
     return snapshot(record);
   }
@@ -185,9 +194,11 @@ export class LongTaskOperationManager<TResult = unknown> {
             record.startedAt = new Date().toISOString();
           }
           record.progress = progress;
+          this.journal?.save(snapshot(record));
         },
         updateDiagnostics: (fields) => {
           record.diagnostics = { ...record.diagnostics, ...fields };
+          this.journal?.save(snapshot(record));
         },
       });
       if (record.controller.signal.aborted) throw abortError();
@@ -208,7 +219,14 @@ export class LongTaskOperationManager<TResult = unknown> {
       }
     } finally {
       record.completedAt = new Date().toISOString();
-      record.resolveCompletion(snapshot(record));
+      try {
+        this.journal?.save(snapshot(record));
+      } catch (error) {
+        record.status = "unknown";
+        record.error = "durable_operation_journal_failed: " + String(error);
+      } finally {
+        record.resolveCompletion(snapshot(record));
+      }
     }
   }
 

@@ -1,13 +1,16 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import type { WorkspaceMode, WorkspaceStore } from "./workspace-store.js";
+import { realpathSync } from "node:fs";
 import { opendir, stat } from "node:fs/promises";
 import { dirname, join, relative, resolve, sep } from "node:path";
 import { loadProjectContextFiles } from "@earendil-works/pi-coding-agent";
 import type { ServerConfig } from "./config.js";
 import { createManagedWorktree, removeManagedWorktree } from "./git-worktrees.js";
 import { git } from "./git.js";
-import { captureSessionBaseline, commitSessionArtifacts, finishArtifact, prepareArtifact, type ArtifactCoverage } from "./session-artifacts.js";
+import { captureSessionBaseline, collectUnresolvedSessionPaths, commitSessionArtifacts, finishArtifact, prepareArtifact, type ArtifactCoverage } from "./session-artifacts.js";
 import { assertAllowedPath, isPathInsideRoot, resolveAllowedPath } from "./roots.js";
+import { assertNativeWritePath, assertWritableRepository, type WritableRepository } from "./write-scope.js";
+import { getRuntimeIdentity } from "./runtime-identity.js";
 import {
   loadWorkspaceSkills,
   markSkillActivated,
@@ -77,6 +80,20 @@ export interface ClosedWorkspace {
   headSha?: string;
   branch?: string;
   artifactCoverage?: ArtifactCoverage;
+  closure: "COMMITTED_AND_CLOSED" | "DETACHED_WITH_UNRESOLVED_ARTIFACTS";
+  custodyReceipt: {
+    schemaVersion: "devspace-custody/v1";
+    authority: "PHYSICAL_CUSTODY_ONLY";
+    workspaceId: string;
+    gitRoot: string | null;
+    baselineHeadSha: string | null;
+    finalHeadSha: string | null;
+    status: "COMMITTED_AND_CLOSED" | "DETACHED_WITH_UNRESOLVED_ARTIFACTS";
+    coverage: ArtifactCoverage | null;
+    unresolvedPaths: string[];
+    runtime: { buildDigestSha256: string | null; schemaRevision: string; status: string };
+    digestSha256: string;
+  };
 }
 
 export class WorkspaceRegistry {
@@ -86,6 +103,7 @@ export class WorkspaceRegistry {
   private readonly lastAccessMs = new Map<string, number>();
   private readonly closingWorkspaces = new Set<string>();
   private readonly activeMutations = new Map<string, number>();
+  private readonly writeLeaseTokens = new Map<string, { repositoryRoot: string; token: string }>();
 
   constructor(
     private readonly config: ServerConfig,
@@ -111,6 +129,7 @@ export class WorkspaceRegistry {
   getWorkspace(workspaceId: string): Workspace {
     const workspace = this.workspaces.get(workspaceId);
     if (workspace) {
+      this.assertPhysicalWorkspaceAllowed(workspace.root);
       this.store?.touchSession(workspaceId);
       this.lastAccessMs.set(workspaceId, Date.now());
       return workspace;
@@ -152,49 +171,88 @@ export class WorkspaceRegistry {
     return restoredWorkspace;
   }
 
+  async assertWritableWorkspace(workspaceId: string): Promise<WritableRepository> {
+    return assertWritableRepository(this.getWorkspace(workspaceId).root);
+  }
+
+  /**
+   * One writer per physical checkout, not just per shell queue. The SQLite
+   * lease is retained until close/detach, so a second registry cannot claim
+   * the checkout while an earlier session still owns its unsealed work.
+   */
+  async withWorkspaceWrite<T>(workspaceId: string, action: () => Promise<T>): Promise<T> {
+    const workspace = this.getWorkspace(workspaceId);
+    if (this.closingWorkspaces.has(workspaceId) || (this.activeMutations.get(workspaceId) ?? 0) !== 0) {
+      throw new Error("WRITE_LEASE_CONFLICT: workspace is closing or already has an active writer");
+    }
+    this.activeMutations.set(workspaceId, 1);
+    try {
+      const writable = await assertWritableRepository(workspace.root);
+      if (this.store) {
+        const existing = this.writeLeaseTokens.get(workspaceId);
+        const session = this.store.getSession(workspaceId);
+        if (!existing && !this.store.hasWriteLease(writable.root, workspaceId)
+            && session?.headSha && session.headSha !== writable.headSha) {
+          throw new Error("WRITE_BASELINE_STALE: checkout HEAD changed since session open; reopen against current Git identity");
+        }
+        const token = existing?.token ?? this.store.acquireWriteLease(writable.root, workspaceId);
+        this.store.assertWriteLease(writable.root, workspaceId, token);
+        this.writeLeaseTokens.set(workspaceId, { repositoryRoot: writable.root, token });
+      }
+      return await action();
+    } finally {
+      this.activeMutations.delete(workspaceId);
+    }
+  }
+
   async withTrackedMutation<T>(
     workspaceId: string,
     paths: string[],
     action: () => Promise<T>,
     didWrite: (result: T) => boolean = () => true,
   ): Promise<T> {
-    if (this.closingWorkspaces.has(workspaceId)) {
-      throw new Error("Workspace is closing; no new writes are accepted");
-    }
-    this.activeMutations.set(workspaceId, (this.activeMutations.get(workspaceId) ?? 0) + 1);
-    try {
+    return this.withWorkspaceWrite(workspaceId, async () => {
       const workspace = this.getWorkspace(workspaceId);
-      const artifacts = this.store
-        ? await Promise.all(paths.map(async (path) => {
-            const absolutePath = this.resolvePath(workspace, path);
-            const artifact = await prepareArtifact(this.store!, workspaceId, workspace.root, absolutePath);
-            return { artifact, absolutePath };
-          }))
-        : [];
+      const artifacts = await Promise.all(paths.map(async (path) => {
+        const absolutePath = this.resolvePath(workspace, path);
+        await assertNativeWritePath(workspace.root, absolutePath);
+        const artifact = this.store
+          ? await prepareArtifact(this.store, workspaceId, workspace.root, absolutePath)
+          : undefined;
+        return { artifact, absolutePath };
+      }));
       const result = await action();
-      if (didWrite(result) && this.store) {
+      if (didWrite(result)) {
         for (const { artifact, absolutePath } of artifacts) {
-          await finishArtifact(this.store, artifact, absolutePath);
+          await assertNativeWritePath(workspace.root, absolutePath);
+          if (artifact && this.store) await finishArtifact(this.store, artifact, absolutePath);
         }
       }
       return result;
-    } finally {
-      const remaining = (this.activeMutations.get(workspaceId) ?? 1) - 1;
-      if (remaining > 0) this.activeMutations.set(workspaceId, remaining);
-      else this.activeMutations.delete(workspaceId);
-    }
+    });
   }
 
   async closeWorkspace(input: {
     workspaceId: string;
     pruneStaleMetadata?: boolean;
   }): Promise<ClosedWorkspace> {
+    return this.finishWorkspace(input, true);
+  }
+
+  async detachWorkspace(input: { workspaceId: string }): Promise<ClosedWorkspace> {
+    return this.finishWorkspace(input, false);
+  }
+
+  private async finishWorkspace(
+    input: { workspaceId: string; pruneStaleMetadata?: boolean },
+    commit: boolean,
+  ): Promise<ClosedWorkspace> {
     if (this.closingWorkspaces.has(input.workspaceId) || (this.activeMutations.get(input.workspaceId) ?? 0) > 0) {
       throw new Error("CLOSE_INCOMPLETE: workspace has an active close or file mutation");
     }
     this.closingWorkspaces.add(input.workspaceId);
     try {
-      return await this.closeWorkspaceVerified(input);
+      return await this.closeWorkspaceVerified(input, commit);
     } finally {
       this.closingWorkspaces.delete(input.workspaceId);
     }
@@ -203,7 +261,20 @@ export class WorkspaceRegistry {
   private async closeWorkspaceVerified(input: {
     workspaceId: string;
     pruneStaleMetadata?: boolean;
-  }): Promise<ClosedWorkspace> {
+  }, commit: boolean): Promise<ClosedWorkspace> {
+    const receipt = this.store?.getClosureReceipt(input.workspaceId);
+    if (receipt) {
+      const closed = JSON.parse(receipt) as ClosedWorkspace;
+      if (!closed.custodyReceipt || closed.custodyReceipt.workspaceId !== input.workspaceId) {
+        throw new Error("CLOSE_RECEIPT_CORRUPT: identity mismatch");
+      }
+      const { digestSha256, ...boundPayload } = closed.custodyReceipt;
+      const actual = createHash("sha256").update(JSON.stringify(boundPayload)).digest("hex");
+      if (actual !== digestSha256) {
+        throw new Error("CLOSE_RECEIPT_CORRUPT: checksum mismatch");
+      }
+      return closed;
+    }
     const workspace = this.workspaces.get(input.workspaceId);
     const session = this.store?.getSession(input.workspaceId);
     if (!workspace && (!session || session.status !== "active")) {
@@ -218,11 +289,27 @@ export class WorkspaceRegistry {
     let staleMetadataPruned = false;
     let headSha = workspace?.worktree?.baseSha ?? session?.headSha ?? session?.baseSha;
     let branch = workspace?.worktree?.branch ?? session?.branch;
-    const artifactCoverage = this.store
+    const gitIdentity = await assertWritableRepository(root).catch(() => null);
+    // Preserve the managed-worktree-specific stale-metadata refusal path.
+    // The manager validates whether the directory really went missing and
+    // requires an explicit prune flag. Never bypass this when artifacts exist.
+    const staleWorktreeCandidate = commit && !gitIdentity && mode === "worktree" && managed
+      && (this.store?.listArtifacts(input.workspaceId).length ?? 0) === 0;
+    if (commit && !gitIdentity && !staleWorktreeCandidate) {
+      throw new Error("CLOSE_INCOMPLETE: a verified commit close requires an exact Git repository workspace; use detach_workspace for discovery");
+    }
+    if (commit && !this.store) {
+      throw new Error("CLOSE_INCOMPLETE: durable artifact ledger is unavailable");
+    }
+    const artifactCoverage = commit && this.store && gitIdentity
       ? await commitSessionArtifacts(this.store, input.workspaceId, root)
       : undefined;
+    if (gitIdentity) {
+      headSha = (await git(root, ["rev-parse", "HEAD"])).stdout.trim();
+      branch = gitIdentity.branch;
+    }
 
-    if (mode === "worktree" && managed) {
+    if (commit && mode === "worktree" && managed) {
       if (!sourceRoot) {
         throw new Error(`Managed worktree workspace is missing sourceRoot: ${input.workspaceId}`);
       }
@@ -238,28 +325,50 @@ export class WorkspaceRegistry {
       branch = result.branch ?? branch;
     }
 
+    const closure: ClosedWorkspace["closure"] = commit && gitIdentity
+      ? "COMMITTED_AND_CLOSED" : "DETACHED_WITH_UNRESOLVED_ARTIFACTS";
+    const unresolvedPaths = commit ? [] : await collectUnresolvedSessionPaths(this.store, input.workspaceId, root);
+    const runtimeIdentity = getRuntimeIdentity();
+    const payload = {
+      schemaVersion: "devspace-custody/v1" as const,
+      authority: "PHYSICAL_CUSTODY_ONLY" as const,
+      workspaceId: input.workspaceId,
+      gitRoot: gitIdentity?.root ?? null,
+      baselineHeadSha: session?.headSha ?? session?.baseSha ?? null,
+      finalHeadSha: gitIdentity ? headSha ?? null : null,
+      status: closure as ClosedWorkspace["closure"],
+      coverage: artifactCoverage ?? null,
+      unresolvedPaths,
+      runtime: {
+        buildDigestSha256: runtimeIdentity.binaryDigestSha256,
+        schemaRevision: runtimeIdentity.toolSchemaRevision,
+        status: runtimeIdentity.status,
+      },
+    };
+    const digestSha256 = createHash("sha256").update(JSON.stringify(payload)).digest("hex");
+    const result: ClosedWorkspace = {
+      workspaceId: input.workspaceId, root, mode, managed,
+      removed, staleMetadataPruned, closure,
+      ...(sourceRoot === undefined ? {} : { sourceRoot }),
+      ...(headSha === undefined ? {} : { headSha }),
+      ...(branch === undefined ? {} : { branch }),
+      ...(artifactCoverage === undefined ? {} : { artifactCoverage }),
+      custodyReceipt: { ...payload, digestSha256 },
+    };
+    // Persist the exact replayable receipt and terminal state in one
+    // transaction, then retire in-memory handles. Lost HTTP responses can
+    // retrieve this receipt without issuing a second commit.
+    this.store?.finalizeSession(input.workspaceId, headSha, JSON.stringify(result), gitIdentity?.root);
     this.workspaces.delete(input.workspaceId);
     this.lastAccessMs.delete(input.workspaceId);
+    this.writeLeaseTokens.delete(input.workspaceId);
     if (mode === "checkout") {
       const key = contextPathKey(root);
       if (this.checkoutByRoot.get(key)?.id === input.workspaceId) {
         this.checkoutByRoot.delete(key);
       }
     }
-    this.store?.closeSession(input.workspaceId, headSha);
-
-    return {
-      workspaceId: input.workspaceId,
-      root,
-      sourceRoot,
-      mode,
-      managed,
-      removed,
-      staleMetadataPruned,
-      headSha,
-      branch,
-      artifactCoverage,
-    };
+    return result;
   }
 
   evictInactiveMemory(maxIdleMs: number, now = Date.now()): string[] {
@@ -325,6 +434,7 @@ export class WorkspaceRegistry {
     const key = contextPathKey(root);
     const existing = this.checkoutByRoot.get(key);
     if (existing) {
+      this.assertPhysicalWorkspaceAllowed(existing.root);
       this.lastAccessMs.set(existing.id, Date.now());
       this.store?.touchSession(existing.id);
       return this.workspaceContext(existing);
@@ -346,6 +456,7 @@ export class WorkspaceRegistry {
       if (!rootStats.isDirectory()) {
         throw new Error(`Workspace root must be a directory: ${path}`);
       }
+      this.assertPhysicalWorkspaceAllowed(root);
 
       const context = await this.createWorkspaceContext({ root, mode: "checkout" });
       this.checkoutByRoot.set(key, context.workspace);
@@ -397,6 +508,7 @@ export class WorkspaceRegistry {
       activatedSkillDirs: new Set(),
     };
 
+    const gitAtOpen = await assertWritableRepository(workspace.root).catch(() => null);
     this.store?.createSession({
       id: workspace.id,
       root: workspace.root,
@@ -404,7 +516,7 @@ export class WorkspaceRegistry {
       sourceRoot: workspace.sourceRoot,
       baseRef: workspace.worktree?.baseRef,
       baseSha: workspace.worktree?.baseSha,
-      headSha: workspace.worktree?.baseSha,
+      headSha: gitAtOpen?.headSha ?? workspace.worktree?.baseSha,
       branch: workspace.worktree?.branch,
       managed: workspace.worktree?.managed,
     });
@@ -430,7 +542,23 @@ export class WorkspaceRegistry {
     };
   }
 
+  private assertPhysicalWorkspaceAllowed(root: string): void {
+    let physicalRoot: string;
+    try {
+      physicalRoot = realpathSync(root);
+    } catch {
+      throw new Error("WORKSPACE_ROOT_ESCAPE: workspace path does not resolve to an existing physical root");
+    }
+    const canonicalAllowed = this.config.allowedRoots.flatMap((entry) => {
+      try { return [realpathSync(entry)]; } catch { return []; }
+    });
+    if (!canonicalAllowed.some((allowed) => isPathInsideRoot(physicalRoot, allowed))) {
+      throw new Error("WORKSPACE_ROOT_ESCAPE: canonical workspace root is outside configured allowed roots");
+    }
+  }
+
   private assertWorkspaceRootAllowed(root: string, mode: WorkspaceMode, sourceRoot: string | undefined): string {
+    this.assertPhysicalWorkspaceAllowed(root);
     if (mode === "worktree") {
       if (!sourceRoot) {
         throw new Error(`Stored worktree workspace is missing sourceRoot: ${root}`);

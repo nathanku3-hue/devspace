@@ -108,10 +108,16 @@ endpoint, but the tunnel URL should not be treated as a secret.
 The shell tool is powerful by design. It is meant for tests, builds, git, and
 package scripts.
 
-Filesystem path containment applies to DevSpace file tools. Shell commands run
-as local commands and can do what your user account can do. This is why the MCP
-client and the local machine must be trusted, and authentication material must
-stay private.
+DevSpace native reads and writes verify canonical path containment, including
+symlink/junction escape checks. Write-capable sessions must open the exact Git
+checkout root; non-Git parent folders remain discovery-only.
+
+Shell commands still run with the local user's filesystem privileges and can
+write beyond their declared repository. A working-directory check and
+post-run Git-visible artifact audit **do not** provide OS isolation. This is
+why the MCP client and local machine must be trusted, and authentication
+material must stay private. See [Repository Scope & Custody v1](repo-custody-v1.md)
+for precise commit, detach, lease, receipt and limitation semantics.
 
 ## Worktrees
 

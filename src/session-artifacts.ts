@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
-import { lstat, readFile } from "node:fs/promises";
+import { createReadStream } from "node:fs";
+import { lstat, readlink } from "node:fs/promises";
 import { relative, sep } from "node:path";
 import { getGitEligibility, git } from "./git.js";
 import { publishGitChanges } from "./git-publish.js";
@@ -8,12 +9,6 @@ import type { SessionArtifact, WorkspaceStore } from "./workspace-store.js";
 
 const EXCLUDED_SEGMENTS = new Set([".git", ".scratch", "node_modules"]);
 const PROTECTED_NAMES = new Set(["PRODUCT.md", "AGENTS.md"]);
-const DOCUMENT_EXTENSIONS = /\.(?:md|mdx|txt|rst|adoc|pdf|docx?|rtf|html?)$/i;
-
-function isDocument(path: string): boolean {
-  return DOCUMENT_EXTENSIONS.test(path);
-}
-
 function repoPath(root: string, absolutePath: string): string {
   return relative(root, absolutePath).split(sep).join("/");
 }
@@ -28,7 +23,24 @@ async function contentHash(absolutePath: string): Promise<string | null> {
   try {
     const info = await lstat(absolutePath);
     if (!info.isFile() || info.isSymbolicLink()) throw new Error("not a regular file");
-    return createHash("sha256").update(await readFile(absolutePath)).digest("hex");
+    const digest = createHash("sha256");
+    for await (const chunk of createReadStream(absolutePath)) digest.update(chunk);
+    return digest.digest("hex");
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
+    throw error;
+  }
+}
+
+async function snapshotContentHash(path: string): Promise<string | null> {
+  try {
+    const metadata = await lstat(path);
+    if (metadata.isSymbolicLink()) {
+      const target = await readlink(path);
+      return "symlink:" + createHash("sha256").update(target).digest("hex");
+    }
+    if (!metadata.isFile()) return "nonregular:" + metadata.mode.toString(8);
+    return await contentHash(path);
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
     throw error;
@@ -53,16 +65,19 @@ async function workingBlob(root: string, path: string): Promise<string | null> {
   }
 }
 
-async function documentDirtySnapshot(root: string, workspaceRoot: string): Promise<Record<string, string>> {
+async function gitDirtySnapshot(root: string, workspaceRoot: string): Promise<Record<string, string>> {
   const porcelain = (await git(root, [
     "status", "--porcelain=v1", "--no-renames", "-z", "--untracked-files=all",
   ])).stdout;
   const snapshot: Record<string, string> = {};
   for (const line of porcelain.split("\0").filter(Boolean)) {
     const path = line.slice(3);
-    if (!isDocument(path) || excluded(path)
+    // Protected tracked files MUST be visible to the audit even when they
+    // are forbidden for automatic publication. Only disposable directories
+    // are omitted from this comparison.
+    if (path.split("/").some((part) => EXCLUDED_SEGMENTS.has(part.toLowerCase()))
         || !isPathInsideRoot(root + sep + path.split("/").join(sep), workspaceRoot)) continue;
-    const hash = await contentHash(root + sep + path.split("/").join(sep));
+    const hash = await snapshotContentHash(root + sep + path.split("/").join(sep));
     snapshot[path] = line.slice(0, 2) + ":" + (hash ?? "deleted");
   }
   return snapshot;
@@ -79,10 +94,10 @@ export async function captureSessionBaseline(
     store.putBaseline(workspaceId, null, {});
     return;
   }
-  store.putBaseline(workspaceId, gitRoot, await documentDirtySnapshot(gitRoot, workspaceRoot));
+  store.putBaseline(workspaceId, gitRoot, await gitDirtySnapshot(gitRoot, workspaceRoot));
 }
 
-async function assertNoUnattributedDocuments(
+async function assertNoUnattributedChanges(
   store: WorkspaceStore,
   workspaceId: string,
   workspaceRoot: string,
@@ -91,14 +106,14 @@ async function assertNoUnattributedDocuments(
   const baseline = store.getBaseline(workspaceId);
   if (!baseline) throw new Error("CLOSE_INCOMPLETE: missing durable session Git baseline");
   if (!baseline.repositoryRoot) return;
-  const current = await documentDirtySnapshot(baseline.repositoryRoot, workspaceRoot);
+  const current = await gitDirtySnapshot(baseline.repositoryRoot, workspaceRoot);
   const owned = new Set(artifacts.map((item) => item.repositoryRoot + "\0" + item.path));
-  const changed = Object.entries(current).filter(([path, fingerprint]) =>
-    baseline.snapshot[path] !== fingerprint
+  const changed = [...new Set([...Object.keys(baseline.snapshot), ...Object.keys(current)])]
+    .filter((path) => baseline.snapshot[path] !== current[path]
       && !owned.has(baseline.repositoryRoot + "\0" + path));
   if (changed.length) {
-    throw new Error("CLOSE_INCOMPLETE: unattributed documents changed since session open: " +
-      changed.map(([path]) => path).join(", "));
+    throw new Error("CLOSE_INCOMPLETE: unattributed files changed since session open: " +
+      changed.join(", "));
   }
 }
 
@@ -124,9 +139,12 @@ export async function prepareArtifact(
   if (!eligibility.ok || !isPathInsideRoot(root, workspaceRoot)) {
     artifact.state = "unsafe";
     artifact.reason = eligibility.message ?? "repository root is outside workspace";
+  } else if (PROTECTED_NAMES.has((path.split("/").at(-1) ?? "").toUpperCase())) {
+    artifact.state = "unsafe";
+    artifact.reason = "protected path requires separate explicit custody";
   } else if (excluded(path)) {
     artifact.state = "excluded";
-    artifact.reason = "protected or disposable path";
+    artifact.reason = "disposable path";
   } else {
     try {
       await git(root, ["check-ignore", "-q", "--", path]);
@@ -152,7 +170,13 @@ export async function prepareArtifact(
       }
     }
   }
-  // Persist intent BEFORE touching file bytes. A crash leaves an observable pending/unsafe record.
+  // Never mutate a protected, previously dirty or unattributed path.
+  // A denied write was not performed, so do not poison the session ledger
+  // with an unsafe entry for work that never happened.
+  if (artifact.state === "unsafe") {
+    throw new Error("WRITE_NOT_AUTHORIZED: " + path + " (" + (artifact.reason ?? "unsafe") + ")");
+  }
+  // Persist intent BEFORE touching file bytes. A crash leaves a pending record.
   store.putArtifact(artifact);
   return artifact;
 }
@@ -170,11 +194,36 @@ export async function finishArtifact(
   });
 }
 
+/**
+ * Detach preserves every file and makes no commit claim. Return both native
+ * recorded intents and Git-visible changes since the session baseline,
+ * including shell-generated non-document files.
+ */
+export async function collectUnresolvedSessionPaths(
+  store: WorkspaceStore | undefined,
+  workspaceId: string,
+  workspaceRoot: string,
+): Promise<string[]> {
+  if (!store) return [];
+  const unresolved = new Set(
+    store.listArtifacts(workspaceId).filter((item) => item.state !== "excluded").map((item) => item.path),
+  );
+  const baseline = store.getBaseline(workspaceId);
+  if (baseline?.repositoryRoot) {
+    const current = await gitDirtySnapshot(baseline.repositoryRoot, workspaceRoot);
+    for (const path of new Set([...Object.keys(baseline.snapshot), ...Object.keys(current)])) {
+      if (baseline.snapshot[path] !== current[path]) unresolved.add(path);
+    }
+  }
+  return [...unresolved].sort();
+}
+
 export interface ArtifactCoverage {
   status: "COVERED" | "NO_RECORDED_WRITES";
   coveredPaths: string[];
   commits: string[];
   excludedPaths: string[];
+  proof: Array<{ path: string; sha256: string | null; gitBlobOid: string | null; headSha: string }>;
 }
 
 export async function commitSessionArtifacts(
@@ -183,9 +232,9 @@ export async function commitSessionArtifacts(
   workspaceRoot: string,
 ): Promise<ArtifactCoverage> {
   const artifacts = store.listArtifacts(workspaceId);
-  await assertNoUnattributedDocuments(store, workspaceId, workspaceRoot, artifacts);
+  await assertNoUnattributedChanges(store, workspaceId, workspaceRoot, artifacts);
   if (artifacts.length === 0) {
-    return { status: "NO_RECORDED_WRITES", coveredPaths: [], commits: [], excludedPaths: [] };
+    return { status: "NO_RECORDED_WRITES", coveredPaths: [], commits: [], excludedPaths: [], proof: [] };
   }
   const excludedPaths = artifacts.filter((item) => item.state === "excluded").map((item) => item.path);
   const eligible = artifacts.filter((item) => item.state !== "excluded");
@@ -206,6 +255,7 @@ export async function commitSessionArtifacts(
 
   const coveredPaths: string[] = [];
   const commits: string[] = [];
+  const proof: ArtifactCoverage["proof"] = [];
   for (const [root, items] of repositories) {
     const pending: SessionArtifact[] = [];
     for (const item of items) {
@@ -240,7 +290,11 @@ export async function commitSessionArtifacts(
         throw new Error("CLOSE_INCOMPLETE: artifact absent from final Git HEAD: " + item.path);
       }
       coveredPaths.push(item.path);
+      proof.push({
+        path: item.path, sha256: item.expectedSha256, gitBlobOid: committed,
+        headSha: (await git(root, ["rev-parse", "HEAD"])).stdout.trim(),
+      });
     }
   }
-  return { status: "COVERED", coveredPaths, commits, excludedPaths };
+  return { status: "COVERED", coveredPaths, commits, excludedPaths, proof };
 }

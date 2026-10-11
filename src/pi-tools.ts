@@ -16,7 +16,7 @@ import {
   type WriteToolInput,
   type AgentToolResult,
 } from "@earendil-works/pi-coding-agent";
-import { resolveAllowedPath } from "./roots.js";
+import { assertCanonicalReadPath, resolveAllowedPath } from "./roots.js";
 import { evaluateBashRuntimePolicy, loadRuntimePolicyContext } from "./bash-runtime-policy.js";
 import { resolveWorkspaceShell, type WorkspaceShellKind } from "./workspace-shell.js";
 import { createGuardedBashOperations } from "./shell-runtime.js";
@@ -71,7 +71,9 @@ async function runTool<TInput, TDetails = unknown>(
 }
 
 export async function readFileTool(input: ReadToolInput, context: ToolContext): Promise<ToolResponse> {
-  const path = resolveAllowedPath(input.path, context.cwd, context.readRoots ?? [context.root]);
+  const readRoots = context.readRoots ?? [context.root];
+  const path = resolveAllowedPath(input.path, context.cwd, readRoots);
+  await assertCanonicalReadPath(path, readRoots);
   const tool = createReadTool(context.cwd);
 
   return runTool((params) => tool.execute("read_file", params), {
@@ -105,7 +107,11 @@ export async function grepFilesTool(
   input: GrepToolInput & { include?: string },
   context: ToolContext,
 ): Promise<ToolResponse> {
-  if (input.path) resolveAllowedPath(input.path, context.cwd, context.allowedRoots ?? [context.root]);
+  if (input.path) {
+    const roots = context.allowedRoots ?? [context.root];
+    const path = resolveAllowedPath(input.path, context.cwd, roots);
+    await assertCanonicalReadPath(path, roots);
+  }
   const tool = createGrepTool(context.cwd);
   const { include, ...rest } = input;
 
@@ -116,14 +122,22 @@ export async function grepFilesTool(
 }
 
 export async function findFilesTool(input: FindToolInput, context: ToolContext): Promise<ToolResponse> {
-  if (input.path) resolveAllowedPath(input.path, context.cwd, context.allowedRoots ?? [context.root]);
+  if (input.path) {
+    const roots = context.allowedRoots ?? [context.root];
+    const path = resolveAllowedPath(input.path, context.cwd, roots);
+    await assertCanonicalReadPath(path, roots);
+  }
   const tool = createFindTool(context.cwd);
 
   return runTool((params) => tool.execute("find_files", params), input, context);
 }
 
 export async function listDirectoryTool(input: LsToolInput, context: ToolContext): Promise<ToolResponse> {
-  if (input.path) resolveAllowedPath(input.path, context.cwd, context.allowedRoots ?? [context.root]);
+  if (input.path) {
+    const roots = context.allowedRoots ?? [context.root];
+    const path = resolveAllowedPath(input.path, context.cwd, roots);
+    await assertCanonicalReadPath(path, roots);
+  }
   const tool = createLsTool(context.cwd);
 
   return runTool((params) => tool.execute("list_directory", params), input, context);

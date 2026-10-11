@@ -69,6 +69,8 @@ try {
   );
   assert.deepEqual(closed.artifactCoverage?.excludedPaths, [".scratch/diagnostic.json"]);
   assert.equal(closed.artifactCoverage?.commits.length, 1);
+  assert.deepEqual(await registry.closeWorkspace({ workspaceId: session }), closed,
+    "lost-response retries must replay the exact durable receipt, not re-commit");
   assert.equal((await git(root, ["show", "HEAD:sprint1.md"])).stdout, "sprint one\n");
   assert.equal((await git(root, ["show", "HEAD:sprint2.md"])).stdout, "sprint two\n");
   assert.equal((await git(root, ["show", "HEAD:old.md"])).stdout, "revised by session\n");
@@ -120,11 +122,13 @@ try {
   const dirtyRepo = await anotherRepo("dirty");
   await writeFile(join(dirtyRepo, "old.md"), "other user's dirty text\n");
   const dirty = (await registry.openWorkspace(dirtyRepo)).workspace.id;
-  await mutate(dirty, "old.md", "overwritten after foreign dirt\n", dirtyRepo);
   await assert.rejects(
-    () => registry.closeWorkspace({ workspaceId: dirty }),
-    /CLOSE_INCOMPLETE: unverified session paths: old.md/,
+    () => mutate(dirty, "old.md", "overwritten after foreign dirt\n", dirtyRepo),
+    /WRITE_NOT_AUTHORIZED: old.md \(path was dirty before the first session write\)/,
   );
+  assert.equal((await readFile(join(dirtyRepo, "old.md"), "utf8")), "other user's dirty text\n");
+  const untouchedDirty = await registry.closeWorkspace({ workspaceId: dirty });
+  assert.equal(untouchedDirty.artifactCoverage?.status, "NO_RECORDED_WRITES");
 
   // A persisted pending write after a crash must not be incorrectly declared covered.
   const pendingRepo = await anotherRepo("pending");
@@ -145,6 +149,7 @@ try {
   const restoredRegistry = new WorkspaceRegistry(config, restoredStore);
   const recovered = await restoredRegistry.closeWorkspace({ workspaceId: recovering });
   assert.deepEqual(recovered.artifactCoverage?.coveredPaths, ["survives-restart.md"]);
+  assert.deepEqual(await restoredRegistry.closeWorkspace({ workspaceId: recovering }), recovered);
   assert.equal((await git(recoveryRepo, ["show", "HEAD:survives-restart.md"])).stdout, "durable ledger\n");
   restoredStore.close();
 
@@ -153,8 +158,23 @@ try {
   await writeFile(join(unknownRepo, "generated-by-shell.md"), "not in ledger\n");
   await assert.rejects(
     () => registry.closeWorkspace({ workspaceId: unknown }),
-    /CLOSE_INCOMPLETE: unattributed documents changed since session open: generated-by-shell.md/,
+    /CLOSE_INCOMPLETE: unattributed files changed since session open: generated-by-shell.md/,
   );
+
+  // Every Git-visible file type matters, not only documents.
+  const jsonRepo = await anotherRepo("unattributed-json");
+  const jsonSession = (await registry.openWorkspace(jsonRepo)).workspace.id;
+  await writeFile(join(jsonRepo, "generated-by-test.json"), "{\"new\":true}\n");
+  await assert.rejects(
+    () => registry.closeWorkspace({ workspaceId: jsonSession }),
+    /CLOSE_INCOMPLETE: unattributed files changed since session open: generated-by-test.json/,
+  );
+  const jsonDetached = await registry.detachWorkspace({ workspaceId: jsonSession });
+  assert.equal(jsonDetached.closure, "DETACHED_WITH_UNRESOLVED_ARTIFACTS");
+  assert.equal(jsonDetached.custodyReceipt.authority, "PHYSICAL_CUSTODY_ONLY");
+  assert.deepEqual(jsonDetached.custodyReceipt.unresolvedPaths, ["generated-by-test.json"]);
+  assert.deepEqual(await registry.detachWorkspace({ workspaceId: jsonSession }), jsonDetached);
+  assert.equal((await readFile(join(jsonRepo, "generated-by-test.json"), "utf8")), "{\"new\":true}\n");
 
   const existingRepo = await anotherRepo("existing-dirty");
   await writeFile(join(existingRepo, "old.md"), "prior dirty docs\n");

@@ -1,4 +1,5 @@
 import { homedir } from "node:os";
+import { realpath } from "node:fs/promises";
 import { isAbsolute, relative, resolve, sep } from "node:path";
 
 export class AccessDeniedError extends Error {
@@ -57,6 +58,22 @@ export function assertAllowedPath(path: string, allowedRoots: string[]): string 
   }
 
   throw new AccessDeniedError(`Path is outside allowed roots: ${path}`);
+}
+
+/**
+ * Native file inspection must not follow a symlink/junction from an allowed
+ * lexical path to a target outside the authorized physical roots.
+ */
+export async function assertCanonicalReadPath(path: string, roots: string[]): Promise<string> {
+  const physicalPath = await realpath(path);
+  const authorized = await Promise.all(roots.map(async (root) => {
+    try { return await realpath(root); }
+    catch { return null; }
+  }));
+  if (!authorized.some((root) => root && isPathInsideRoot(physicalPath, root))) {
+    throw new AccessDeniedError("READ_SCOPE_ESCAPE: canonical file target is outside allowed read roots");
+  }
+  return physicalPath;
 }
 
 export function resolveAllowedPath(inputPath: string, cwd: string, allowedRoots: string[]): string {

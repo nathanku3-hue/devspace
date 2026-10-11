@@ -8,5 +8,6 @@ nul
 data/chatshare-agentic/
 jobs.jsonl
 tmp/
+test-results/
 *.tgz
 上海大都市圈*.md

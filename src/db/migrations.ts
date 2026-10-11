@@ -42,6 +42,16 @@ const migrations: Migration[] = [
     name: "session-git-baseline",
     up: migrateSessionGitBaseline,
   },
+  {
+    version: 8,
+    name: "execution-custody",
+    up: migrateExecutionCustody,
+  },
+  {
+    version: 9,
+    name: "workspace-closure-receipts",
+    up: migrateWorkspaceClosureReceipts,
+  },
 ];
 
 export function migrateDatabase(sqlite: Database.Database): void {
@@ -203,6 +213,32 @@ function migrateSessionGitBaseline(sqlite: Database.Database): void {
       status_json text not null,
       foreign key (workspace_session_id)
         references workspace_sessions(id) on delete cascade
+    );
+  `);
+}
+
+function migrateExecutionCustody(sqlite: Database.Database): void {
+  sqlite.exec(`
+    create table if not exists repository_write_leases (
+      repository_root text primary key,
+      workspace_session_id text not null,
+      lease_token text not null,
+      acquired_at text not null
+    );
+    create table if not exists durable_operations (
+      operation_id text primary key,
+      snapshot_json text not null,
+      updated_at text not null
+    );
+  `);
+}
+
+function migrateWorkspaceClosureReceipts(sqlite: Database.Database): void {
+  sqlite.exec(`
+    create table if not exists workspace_closure_receipts (
+      workspace_session_id text primary key,
+      receipt_json text not null,
+      recorded_at text not null
     );
   `);
 }

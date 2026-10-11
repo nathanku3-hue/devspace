@@ -13,6 +13,7 @@ import { WorkspaceRegistry } from "./workspaces.js";
 const execFileAsync = promisify(execFile);
 const root = await mkdtemp(join(tmpdir(), "devspace-workspace-test-"));
 const legacyGlobalRoot = await mkdtemp(join(tmpdir(), "devspace-legacy-worktree-root-test-"));
+let registryStore: SqliteWorkspaceStore | undefined;
 
 try {
   const agentDir = join(root, ".pi", "agent");
@@ -35,8 +36,15 @@ try {
     DEVSPACE_OAUTH_OWNER_TOKEN: "test-owner-token-that-is-long-enough",
     PORT: "1",
   });
-  const registry = new WorkspaceRegistry(config);
+  registryStore = new SqliteWorkspaceStore(join(root, ".registry-state"));
+  const registry = new WorkspaceRegistry(config, registryStore);
   const { workspace, agentsFiles, availableAgentsFiles } = await registry.openWorkspace(root);
+  await assert.rejects(
+    () => registry.withTrackedMutation(workspace.id, ["accidental.txt"], () =>
+      writeFile(join(root, "accidental.txt"), "not permitted\n")),
+    /READ_ONLY_DISCOVERY/,
+  );
+  assert.equal(await exists(join(root, "accidental.txt")), false);
 
   assert.equal(workspace.mode, "checkout");
   assert.deepEqual(
@@ -189,7 +197,7 @@ try {
   await writeFile(join(dirtyWorktree.workspace.root, "dirty-managed.txt"), "dirty\n");
   await assert.rejects(
     () => registry.closeWorkspace({ workspaceId: dirtyWorktree.workspace.id }),
-    (error: unknown) => error instanceof GitWorktreeError && error.code === "GIT_WORKTREE_DIRTY",
+    (error: unknown) => error instanceof Error && /CLOSE_INCOMPLETE: unattributed files/.test(error.message),
   );
   assert.equal(await exists(dirtyWorktree.workspace.root), true);
   await rm(join(dirtyWorktree.workspace.root, "dirty-managed.txt"));
@@ -277,7 +285,7 @@ try {
       DEVSPACE_OAUTH_OWNER_TOKEN: "test-owner-token-that-is-long-enough",
       PORT: "1",
     });
-    const aliasRegistry = new WorkspaceRegistry(aliasConfig);
+    const aliasRegistry = new WorkspaceRegistry(aliasConfig, registryStore);
     const aliasWorkspace = await aliasRegistry.openWorkspace({
       path: join(aliasRoot, "git-project"),
       mode: "worktree",
@@ -286,8 +294,17 @@ try {
     await aliasRegistry.closeWorkspace({ workspaceId: aliasWorkspace.workspace.id });
   }
 } finally {
-  await rm(root, { recursive: true, force: true });
-  await rm(legacyGlobalRoot, { recursive: true, force: true });
+  registryStore?.close();
+  for (const dir of [root, legacyGlobalRoot]) {
+    try {
+      await rm(dir, { recursive: true, force: true, maxRetries: 2, retryDelay: 100 });
+    } catch (error) {
+      if (process.platform !== "win32" || !["EBUSY", "EPERM"].includes((error as NodeJS.ErrnoException).code ?? "")) {
+        throw error;
+      }
+      console.warn("Windows workspace fixture cleanup deferred: " + dir);
+    }
+  }
 }
 
 async function createTestRepository(path: string): Promise<void> {
