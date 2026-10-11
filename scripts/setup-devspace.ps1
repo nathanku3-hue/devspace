@@ -1698,7 +1698,7 @@ function Finish-DevSpaceBackgroundOrMonitor {
             $eventArgs.Cancel = $true
             $script:intentionalStop = $true
             $script:leaveRunning = $false
-            Write-Host "`nCtrl+C received — shutting down cleanly..."
+            Write-Host "`nCtrl+C received - shutting down cleanly..."
         })
     } catch {}
 
@@ -1725,7 +1725,7 @@ function Finish-DevSpaceBackgroundOrMonitor {
         }
 
         if (-not $cfAlive) {
-            Write-SetupLog "cloudflared not alive — background services may need re-run of setup." "WARN"
+            Write-SetupLog "cloudflared not alive - background services may need re-run of setup." "WARN"
         }
         if (-not $localOk) {
             Write-SetupLog "Local healthz down. Check logs: $script:devspaceStderrLog" "WARN"

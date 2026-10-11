@@ -262,7 +262,18 @@ try {
     }));
     throw error;
   }
-  const restoredWorktree = restoredRegistry.getWorkspace(persistentWorktree.workspace.id);
+  let restoredWorktree: ReturnType<WorkspaceRegistry["getWorkspace"]>;
+  try {
+    restoredWorktree = restoredRegistry.getWorkspace(persistentWorktree.workspace.id);
+  } catch (error) {
+    console.error("[worktree-restore-paths]", JSON.stringify({
+      worktreeRoot: persistentWorktree.workspace.root,
+      physicalWorktreeRoot: await realpath(persistentWorktree.workspace.root).catch(() => null),
+      allowedRoots: config.allowedRoots,
+      physicalAllowedRoots: await Promise.all(config.allowedRoots.map((entry) => realpath(entry).catch(() => null))),
+    }));
+    throw error;
+  }
   assert.equal(restoredWorktree.sourceRoot, await realpath(gitRoot));
   assert.equal(restoredWorktree.worktree?.branch, "persistent-worktree-branch");
   await restoredRegistry.closeWorkspace({ workspaceId: persistentWorktree.workspace.id });

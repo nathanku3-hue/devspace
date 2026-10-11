@@ -545,12 +545,13 @@ export class WorkspaceRegistry {
   private assertPhysicalWorkspaceAllowed(root: string): void {
     let physicalRoot: string;
     try {
-      physicalRoot = realpathSync(root);
+      physicalRoot = process.platform === "win32" ? realpathSync.native(root) : realpathSync(root);
     } catch {
       throw new Error("WORKSPACE_ROOT_ESCAPE: workspace path does not resolve to an existing physical root");
     }
     const canonicalAllowed = this.config.allowedRoots.flatMap((entry) => {
-      try { return [realpathSync(entry)]; } catch { return []; }
+      try { return [process.platform === "win32" ? realpathSync.native(entry) : realpathSync(entry)]; }
+      catch { return []; }
     });
     if (!canonicalAllowed.some((allowed) => isPathInsideRoot(physicalRoot, allowed))) {
       throw new Error("WORKSPACE_ROOT_ESCAPE: canonical workspace root is outside configured allowed roots");
